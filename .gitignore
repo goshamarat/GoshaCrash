@@ -1,0 +1,37 @@
+# Runtime files
+*.log
+*.pid
+*.tmp
+tmp/
+logs/
+run/
+
+# Local lab files
+goshacrash-lab/
+
+# Mihomo sensitive configs
+config.yaml
+*.yaml.bak
+*.yml.bak
+providers/
+subscriptions/
+profiles/
+
+# Secrets
+.env
+*.env
+secret*
+token*
+*.key
+*.pem
+
+# Downloaded binaries and archives
+bin/mihomo
+*.gz
+*.zip
+*.tar
+*.tar.gz
+
+# OS / editor
+.DS_Store
+.vscode/
