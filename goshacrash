@@ -2,30 +2,31 @@
 
 APP_NAME="GoshaCrash"
 APP_BIN="goshacrash"
-APP_VERSION="0.3.0-dev"
+APP_VERSION="0.4.0-simple"
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)"
 
-BASE_DIR="${BASE_DIR:-$HOME/goshacrash-lab}"
+GC_HOME="${GC_HOME:-$HOME/.goshacrash}"
 
-BIN_DIR="$BASE_DIR/bin"
-CONFIG_DIR="$BASE_DIR/config"
-UI_DIR="$BASE_DIR/ui"
-RULESET_DIR="$BASE_DIR/ruleset"
-LOG_DIR="$BASE_DIR/logs"
-RUN_DIR="$BASE_DIR/run"
-TMP_DIR="$BASE_DIR/tmp"
+BIN_DIR="$GC_HOME/bin"
+CONFIG_DIR="$GC_HOME/config"
+UI_DIR="$GC_HOME/ui"
+LOG_DIR="$GC_HOME/logs"
+RUN_DIR="$GC_HOME/run"
+TMP_DIR="$GC_HOME/tmp"
+DATA_DIR="$GC_HOME/data"
+CUSTOM_DIR="$GC_HOME/custom"
+BACKUP_DIR="$GC_HOME/backups"
 
-CUSTOM_DIR="${CUSTOM_DIR:-$SCRIPT_DIR/custom}"
 TEMPLATE_DIR="$SCRIPT_DIR/templates"
-BACKUP_DIR="$CUSTOM_DIR/backups"
 
 ENV_FILE="$CUSTOM_DIR/env.conf"
 DNS_FILE="$CUSTOM_DIR/dns.yaml"
-CUSTOM_CONFIG_FILE="$CUSTOM_DIR/config.yaml"
-TARGET_CONFIG_FILE="$CONFIG_DIR/config.yaml"
+PROFILE_FILE="$CUSTOM_DIR/profile.yaml"
+FINAL_CONFIG="$CONFIG_DIR/config.yaml"
 
-LANG_FILE="$BASE_DIR/lang"
+LANG_FILE="$DATA_DIR/lang"
+
 MIHOMO_BIN="$BIN_DIR/mihomo"
 MIHOMO_PID_FILE="$RUN_DIR/mihomo.pid"
 MIHOMO_LOG_FILE="$LOG_DIR/mihomo.log"
@@ -35,43 +36,29 @@ MIHOMO_API_HOST="${MIHOMO_API_HOST:-127.0.0.1}"
 MIHOMO_API_PORT="${MIHOMO_API_PORT:-9090}"
 MIHOMO_DNS_HOST="${MIHOMO_DNS_HOST:-127.0.0.1}"
 MIHOMO_DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
+
+MIHOMO_ALLOW_LAN="${MIHOMO_ALLOW_LAN:-false}"
+MIHOMO_BIND_ADDRESS="${MIHOMO_BIND_ADDRESS:-127.0.0.1}"
 MIHOMO_SECRET="${MIHOMO_SECRET:-changeme}"
+MIHOMO_MODE="${MIHOMO_MODE:-rule}"
+MIHOMO_LOG_LEVEL="${MIHOMO_LOG_LEVEL:-info}"
+MIHOMO_IPV6="${MIHOMO_IPV6:-false}"
 
-GC_MODE="${GC_MODE:-wsl}"
 GC_EDITOR="${GC_EDITOR:-auto}"
-GC_LANG="${GC_LANG:-}"
+GC_LANGUAGE="${GC_LANGUAGE:-ru}"
 
+MIHOMO_PATTERN="${MIHOMO_PATTERN:-}"
 MIHOMO_REPO_OWNER="${MIHOMO_REPO_OWNER:-MetaCubeX}"
 MIHOMO_REPO_NAME="${MIHOMO_REPO_NAME:-mihomo}"
+
 ZASHBOARD_REPO_OWNER="${ZASHBOARD_REPO_OWNER:-Zephyruso}"
 ZASHBOARD_REPO_NAME="${ZASHBOARD_REPO_NAME:-zashboard}"
-
-color_init() {
-  if [ -t 1 ] && [ -z "$NO_COLOR" ]; then
-    ESC="$(printf '\033')"
-    RESET="${ESC}[0m"
-    BOLD="${ESC}[1m"
-    DIM="${ESC}[2m"
-    RED="${ESC}[31m"
-    GREEN="${ESC}[32m"
-    YELLOW="${ESC}[33m"
-    CYAN="${ESC}[36m"
-  else
-    RESET=""
-    BOLD=""
-    DIM=""
-    RED=""
-    GREEN=""
-    YELLOW=""
-    CYAN=""
-  fi
-}
 
 say() {
   printf '%s\n' "$*"
 }
 
-print() {
+ask() {
   printf '%s' "$*"
 }
 
@@ -80,268 +67,208 @@ has_cmd() {
 }
 
 die() {
-  say "${RED}ERROR:${RESET} $*" >&2
+  say "ERROR: $*" >&2
   exit 1
 }
 
-run_as_root() {
+as_root() {
   if [ "$(id -u 2>/dev/null)" = "0" ]; then
     "$@"
   elif has_cmd sudo; then
     sudo "$@"
   else
-    die "Need root privileges. Install sudo or run as root."
+    die "root or sudo required"
   fi
+}
+
+ensure_dirs() {
+  mkdir -p "$GC_HOME" "$BIN_DIR" "$CONFIG_DIR" "$UI_DIR" "$LOG_DIR" "$RUN_DIR" "$TMP_DIR" "$DATA_DIR" "$CUSTOM_DIR" "$BACKUP_DIR"
+}
+
+load_language() {
+  if [ -f "$LANG_FILE" ]; then
+    GC_LANGUAGE="$(cat "$LANG_FILE" 2>/dev/null | head -n 1)"
+  fi
+
+  case "$GC_LANGUAGE" in
+    ru|en) ;;
+    *) GC_LANGUAGE="ru" ;;
+  esac
+}
+
+save_language() {
+  lang="$1"
+
+  case "$lang" in
+    ru|en) ;;
+    *) die "available languages: ru, en" ;;
+  esac
+
+  ensure_dirs
+  printf '%s\n' "$lang" > "$LANG_FILE"
+  GC_LANGUAGE="$lang"
+}
+
+msg() {
+  key="$1"
+
+  case "$GC_LANGUAGE:$key" in
+    ru:main_menu) printf '%s' "Главное меню" ;;
+    en:main_menu) printf '%s' "Main menu" ;;
+
+    ru:quick_setup) printf '%s' "Быстрая подготовка" ;;
+    en:quick_setup) printf '%s' "Quick setup" ;;
+
+    ru:configs) printf '%s' "Конфиги" ;;
+    en:configs) printf '%s' "Configs" ;;
+
+    ru:mihomo) printf '%s' "Mihomo" ;;
+    en:mihomo) printf '%s' "Mihomo" ;;
+
+    ru:zashboard) printf '%s' "Zashboard" ;;
+    en:zashboard) printf '%s' "Zashboard" ;;
+
+    ru:tools) printf '%s' "Инструменты" ;;
+    en:tools) printf '%s' "Tools" ;;
+
+    ru:language) printf '%s' "Язык" ;;
+    en:language) printf '%s' "Language" ;;
+
+    ru:exit) printf '%s' "Выход" ;;
+    en:exit) printf '%s' "Exit" ;;
+
+    ru:back) printf '%s' "Назад" ;;
+    en:back) printf '%s' "Back" ;;
+
+    ru:choose) printf '%s' "Выбери пункт: " ;;
+    en:choose) printf '%s' "Choose option: " ;;
+
+    ru:done) printf '%s' "Готово" ;;
+    en:done) printf '%s' "Done" ;;
+
+    ru:error) printf '%s' "Ошибка" ;;
+    en:error) printf '%s' "Error" ;;
+
+    ru:unknown) printf '%s' "Неизвестный пункт" ;;
+    en:unknown) printf '%s' "Unknown option" ;;
+
+    ru:press_enter) printf '%s' "Нажми Enter, чтобы продолжить..." ;;
+    en:press_enter) printf '%s' "Press Enter to continue..." ;;
+
+    ru:init_files) printf '%s' "Создать пользовательские файлы" ;;
+    en:init_files) printf '%s' "Create user files" ;;
+
+    ru:edit_settings) printf '%s' "Редактировать настройки" ;;
+    en:edit_settings) printf '%s' "Edit settings" ;;
+
+    ru:edit_dns) printf '%s' "Редактировать DNS" ;;
+    en:edit_dns) printf '%s' "Edit DNS" ;;
+
+    ru:edit_profile) printf '%s' "Редактировать прокси/правила" ;;
+    en:edit_profile) printf '%s' "Edit proxies/rules" ;;
+
+    ru:generate_config) printf '%s' "Собрать итоговый config.yaml" ;;
+    en:generate_config) printf '%s' "Generate final config.yaml" ;;
+
+    ru:show_config) printf '%s' "Показать итоговый config.yaml" ;;
+    en:show_config) printf '%s' "Show final config.yaml" ;;
+
+    ru:install_core) printf '%s' "Установить/обновить Mihomo" ;;
+    en:install_core) printf '%s' "Install/update Mihomo" ;;
+
+    ru:test_config) printf '%s' "Проверить config.yaml" ;;
+    en:test_config) printf '%s' "Test config.yaml" ;;
+
+    ru:start) printf '%s' "Запустить" ;;
+    en:start) printf '%s' "Start" ;;
+
+    ru:stop) printf '%s' "Остановить" ;;
+    en:stop) printf '%s' "Stop" ;;
+
+    ru:restart) printf '%s' "Перезапустить" ;;
+    en:restart) printf '%s' "Restart" ;;
+
+    ru:status) printf '%s' "Статус" ;;
+    en:status) printf '%s' "Status" ;;
+
+    ru:logs) printf '%s' "Логи" ;;
+    en:logs) printf '%s' "Logs" ;;
+
+    ru:install_ui) printf '%s' "Установить/обновить Zashboard" ;;
+    en:install_ui) printf '%s' "Install/update Zashboard" ;;
+
+    ru:doctor) printf '%s' "Диагностика" ;;
+    en:doctor) printf '%s' "Doctor" ;;
+
+    ru:install_editor) printf '%s' "Установить nano" ;;
+    en:install_editor) printf '%s' "Install nano" ;;
+
+    ru:paths) printf '%s' "Пути" ;;
+    en:paths) printf '%s' "Paths" ;;
+
+    ru:lang_saved) printf '%s' "Язык сохранён" ;;
+    en:lang_saved) printf '%s' "Language saved" ;;
+
+    *)
+      printf '%s' "$key"
+      ;;
+  esac
+}
+
+pause() {
+  say ""
+  ask "$(msg press_enter)"
+  IFS= read -r _
+}
+
+header() {
+  say ""
+  say "========================================"
+  say "$APP_NAME $APP_VERSION"
+  say "$1"
+  say "========================================"
 }
 
 download() {
   out="$1"
   url="$2"
 
-  [ -n "$out" ] || die "download: output file is empty"
-  [ -n "$url" ] || die "download: URL is empty"
+  [ -n "$out" ] || die "download output is empty"
+  [ -n "$url" ] || die "download url is empty"
 
   if has_cmd curl; then
-    curl -fL --connect-timeout 20 --retry 2 -o "$out" "$url"
+    curl -fL -o "$out" "$url"
   elif has_cmd wget; then
-    wget --timeout=20 --tries=2 --no-check-certificate -O "$out" "$url"
+    wget -q --no-check-certificate -O "$out" "$url"
   else
     die "curl or wget is required"
   fi
 }
 
-load_lang() {
-  if [ -n "$GC_LANG" ]; then
-    case "$GC_LANG" in
-      ru|en|zh) return 0 ;;
-      *) GC_LANG="ru" ;;
-    esac
-  elif [ -f "$LANG_FILE" ]; then
-    GC_LANG="$(cat "$LANG_FILE" 2>/dev/null | head -n 1)"
-    case "$GC_LANG" in
-      ru|en|zh) ;;
-      *) GC_LANG="ru" ;;
-    esac
-  else
-    GC_LANG="ru"
-  fi
-}
-
-save_lang() {
-  lang="$1"
-
-  case "$lang" in
-    ru|en|zh) ;;
-    *) say "Unsupported language: $lang"; return 1 ;;
-  esac
-
-  mkdir -p "$BASE_DIR"
-  printf '%s\n' "$lang" > "$LANG_FILE"
-  GC_LANG="$lang"
-}
-
-t() {
-  key="$1"
-
-  case "$GC_LANG:$key" in
-    ru:main_menu) say "Главное меню" ;;
-    en:main_menu) say "Main menu" ;;
-    zh:main_menu) say "主菜单" ;;
-
-    ru:config_menu) say "Менеджер конфигов" ;;
-    en:config_menu) say "Config manager" ;;
-    zh:config_menu) say "配置管理器" ;;
-
-    ru:core_menu) say "Mihomo Core" ;;
-    en:core_menu) say "Mihomo Core" ;;
-    zh:core_menu) say "Mihomo Core" ;;
-
-    ru:editor_menu) say "Редактор" ;;
-    en:editor_menu) say "Editor" ;;
-    zh:editor_menu) say "编辑器" ;;
-
-    ru:doctor) say "Диагностика" ;;
-    en:doctor) say "Doctor" ;;
-    zh:doctor) say "诊断" ;;
-
-    ru:language) say "Язык" ;;
-    en:language) say "Language" ;;
-    zh:language) say "语言" ;;
-
-    ru:exit) say "Выход" ;;
-    en:exit) say "Exit" ;;
-    zh:exit) say "退出" ;;
-
-    ru:back) say "Назад" ;;
-    en:back) say "Back" ;;
-    zh:back) say "返回" ;;
-
-    ru:choose) say "Выбери пункт: " ;;
-    en:choose) say "Choose option: " ;;
-    zh:choose) say "请选择: " ;;
-
-    ru:unknown) say "Неизвестный пункт" ;;
-    en:unknown) say "Unknown option" ;;
-    zh:unknown) say "未知选项" ;;
-
-    ru:press_enter) say "Нажми Enter, чтобы продолжить..." ;;
-    en:press_enter) say "Press Enter to continue..." ;;
-    zh:press_enter) say "按 Enter 继续..." ;;
-
-    ru:bye) say "Пока." ;;
-    en:bye) say "Bye." ;;
-    zh:bye) say "再见。" ;;
-
-    *)
-      say "$key"
-      ;;
-  esac
-}
-
-term_width() {
-  cols="${COLUMNS:-}"
-
-  if [ -z "$cols" ] && has_cmd stty; then
-    cols="$(stty size 2>/dev/null | awk '{print $2}' 2>/dev/null)"
-  fi
-
-  case "$cols" in
-    ''|*[!0-9]*) cols=72 ;;
-  esac
-
-  [ "$cols" -lt 60 ] && cols=60
-  [ "$cols" -gt 100 ] && cols=100
-
-  say "$cols"
-}
-
-repeat_char() {
-  char="$1"
-  count="$2"
-  i=0
-
-  while [ "$i" -lt "$count" ]; do
-    print "$char"
-    i=$((i + 1))
-  done
-
-  say ""
-}
-
-hr() {
-  char="${1:-─}"
-  repeat_char "$char" "$(term_width)"
-}
-
-clear_screen() {
-  if has_cmd clear; then
-    clear
-  else
-    printf '\033c'
-  fi
-}
-
-pause() {
-  say ""
-  print "${DIM}$(t press_enter)${RESET}"
-  IFS= read -r _
-}
-
-badge_ok() {
-  printf '%s[ OK ]%s %s\n' "$GREEN" "$RESET" "$*"
-}
-
-badge_no() {
-  printf '%s[ NO ]%s %s\n' "$RED" "$RESET" "$*"
-}
-
-badge_warn() {
-  printf '%s[WARN]%s %s\n' "$YELLOW" "$RESET" "$*"
-}
-
-badge_info() {
-  printf '%s[INFO]%s %s\n' "$CYAN" "$RESET" "$*"
-}
-
-banner() {
-  clear_screen
-  say "${CYAN}"
-  say "   ______           __          ______               __  "
-  say "  / ____/___  _____/ /_  ____ _/ ____/________ _____/ /_ "
-  say " / / __/ __ \/ ___/ __ \/ __ \`/ /   / ___/ __ \`/ ___/ __ \\"
-  say "/ /_/ / /_/ (__  ) / / / /_/ / /___/ /  / /_/ (__  ) / / /"
-  say "\\____/\\____/____/_/ /_/\\__,_/\\____/_/   \\__,_/____/_/ /_/ "
-  say "${RESET}"
-  say " ${BOLD}${APP_NAME}${RESET} ${DIM}${APP_VERSION}${RESET}"
-  say " ${DIM}Mihomo + Zashboard installer/controller${RESET}"
-  say " ${DIM}Language: ${GC_LANG}${RESET}"
-  hr "─"
-}
-
-small_header() {
-  say ""
-  say "${BOLD}${CYAN}$1${RESET}"
-  hr "─"
-}
-
-detect_target() {
-  if has_cmd ipkg; then
-    say "asus-optware"
-  elif has_cmd opkg; then
-    say "asus-entware"
-  elif [ -d /jffs ] || [ -d /tmp/mnt ] || [ -d /opt ]; then
-    say "asus"
-  elif grep -qi microsoft /proc/version 2>/dev/null; then
-    say "wsl"
-  else
-    say "linux"
-  fi
-}
-
-detect_arch() {
-  uname -m 2>/dev/null || say "unknown"
-}
-
-load_env() {
+load_settings() {
   if [ -f "$ENV_FILE" ]; then
     . "$ENV_FILE"
   fi
 }
 
-init_dirs() {
-  mkdir -p "$BIN_DIR" "$CONFIG_DIR" "$UI_DIR" "$RULESET_DIR" "$LOG_DIR" "$RUN_DIR" "$TMP_DIR"
-  mkdir -p "$CUSTOM_DIR" "$BACKUP_DIR"
-}
-
-copy_template_or_create() {
-  template="$1"
-  target="$2"
-  fallback="$3"
-
-  if [ -f "$target" ]; then
-    return 0
-  fi
-
-  if [ -f "$template" ]; then
-    cp "$template" "$target"
-  else
-    eval "$fallback"
-  fi
-}
-
 create_default_env() {
-  cat > "$ENV_FILE" <<'EOF'
+  cat > "$ENV_FILE" <<'EOF_ENV'
 # GoshaCrash user settings
-# This file is shell-compatible.
 
 MIHOMO_MIXED_PORT=7890
 MIHOMO_API_HOST=127.0.0.1
 MIHOMO_API_PORT=9090
 MIHOMO_DNS_HOST=127.0.0.1
 MIHOMO_DNS_PORT=1053
+
+MIHOMO_ALLOW_LAN=false
+MIHOMO_BIND_ADDRESS=127.0.0.1
 MIHOMO_SECRET=changeme
 
-GC_MODE=wsl
+MIHOMO_MODE=rule
+MIHOMO_LOG_LEVEL=info
+MIHOMO_IPV6=false
+
 GC_EDITOR=auto
 
 MIHOMO_PATTERN=
@@ -351,11 +278,11 @@ MIHOMO_REPO_NAME=mihomo
 
 ZASHBOARD_REPO_OWNER=Zephyruso
 ZASHBOARD_REPO_NAME=zashboard
-EOF
+EOF_ENV
 }
 
 create_default_dns() {
-  cat > "$DNS_FILE" <<'EOF'
+  cat > "$DNS_FILE" <<'EOF_DNS'
 dns:
   enable: true
   listen: 127.0.0.1:1053
@@ -384,11 +311,11 @@ dns:
     - "localhost"
     - "router.asus.com"
     - "+.asuscomm.com"
-EOF
+EOF_DNS
 }
 
-create_default_config() {
-  cat > "$CUSTOM_CONFIG_FILE" <<'EOF'
+create_default_profile() {
+  cat > "$PROFILE_FILE" <<'EOF_PROFILE'
 profile:
   store-selected: true
   store-fake-ip: true
@@ -410,36 +337,63 @@ rules:
   - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
   - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
   - MATCH,DIRECT
-EOF
+EOF_PROFILE
 }
 
-ensure_custom_files() {
-  init_dirs
+copy_or_create() {
+  template="$1"
+  target="$2"
+  creator="$3"
 
-  copy_template_or_create "$TEMPLATE_DIR/env.conf" "$ENV_FILE" "create_default_env"
-  copy_template_or_create "$TEMPLATE_DIR/dns.yaml" "$DNS_FILE" "create_default_dns"
-  copy_template_or_create "$TEMPLATE_DIR/config.yaml" "$CUSTOM_CONFIG_FILE" "create_default_config"
+  if [ -f "$target" ]; then
+    return 0
+  fi
+
+  if [ -f "$template" ]; then
+    cp "$template" "$target"
+  else
+    "$creator"
+  fi
 }
 
-init_custom() {
-  ensure_custom_files
-  load_env
+init_files() {
+  ensure_dirs
 
-  banner
-  small_header "Custom files"
-  badge_ok "$ENV_FILE"
-  badge_ok "$DNS_FILE"
-  badge_ok "$CUSTOM_CONFIG_FILE"
+  copy_or_create "$TEMPLATE_DIR/env.conf" "$ENV_FILE" create_default_env
+  copy_or_create "$TEMPLATE_DIR/dns.yaml" "$DNS_FILE" create_default_dns
+  copy_or_create "$TEMPLATE_DIR/profile.yaml" "$PROFILE_FILE" create_default_profile
+
+  load_settings
+
+  header "$(msg init_files)"
+  say "GC_HOME:      $GC_HOME"
+  say "Settings:     $ENV_FILE"
+  say "DNS:          $DNS_FILE"
+  say "Profile:      $PROFILE_FILE"
+}
+
+detect_target() {
+  if has_cmd ipkg; then
+    say "asus-optware"
+  elif has_cmd opkg; then
+    say "asus-entware"
+  elif grep -qi microsoft /proc/version 2>/dev/null; then
+    say "wsl"
+  else
+    say "linux"
+  fi
+}
+
+detect_arch() {
+  uname -m 2>/dev/null || say "unknown"
 }
 
 detect_editor() {
-  load_env
+  load_settings
 
-  if [ "$GC_EDITOR" != "auto" ] && [ -n "$GC_EDITOR" ]; then
-    if has_cmd "$GC_EDITOR"; then
-      say "$GC_EDITOR"
-      return 0
-    fi
+  if [ "$GC_EDITOR" != "auto" ] && [ -n "$GC_EDITOR" ] && has_cmd "$GC_EDITOR"; then
+    say "$GC_EDITOR"
+    return 0
   fi
 
   if [ -n "$EDITOR" ] && has_cmd "$EDITOR"; then
@@ -460,156 +414,88 @@ detect_editor() {
   return 1
 }
 
-check_editor() {
-  banner
-  small_header "Editor"
+open_editor() {
+  file="$1"
 
-  if editor_cmd="$(detect_editor 2>/dev/null)"; then
-    badge_ok "Editor found: $editor_cmd"
-    "$editor_cmd" --version 2>/dev/null | head -n 3 || true
+  init_files >/dev/null 2>&1
+
+  if editor="$(detect_editor 2>/dev/null)"; then
+    "$editor" "$file"
   else
-    badge_warn "Editor not found"
-    say ""
-    say "No vi fallback is used."
+    say "Editor not found."
     say "Run:"
-    say "  ./goshacrash install-editor"
+    say "  goshacrash install-editor"
+    return 1
   fi
 }
 
 install_editor() {
-  banner
-  small_header "Install nano"
+  header "$(msg install_editor)"
 
   if has_cmd nano; then
-    badge_ok "nano already installed: $(command -v nano)"
+    say "nano already installed: $(command -v nano)"
     return 0
   fi
 
   if has_cmd ipkg; then
-    badge_info "Package manager: ipkg"
     ipkg update
     ipkg install nano
   elif has_cmd opkg; then
-    badge_info "Package manager: opkg"
     opkg update
     opkg install nano-full || opkg install nano
   elif has_cmd apt-get; then
-    badge_info "Package manager: apt-get"
-    run_as_root apt-get update
-    run_as_root apt-get install -y nano
+    as_root apt-get update
+    as_root apt-get install -y nano
   elif has_cmd apt; then
-    badge_info "Package manager: apt"
-    run_as_root apt update
-    run_as_root apt install -y nano
+    as_root apt update
+    as_root apt install -y nano
   else
-    badge_no "No apt/opkg/ipkg found"
-    return 1
+    die "no package manager found"
   fi
-
-  if has_cmd nano; then
-    badge_ok "nano installed: $(command -v nano)"
-  else
-    badge_no "nano installation failed"
-    return 1
-  fi
-}
-
-open_editor() {
-  file="$1"
-
-  ensure_custom_files
-  load_env
-
-  [ -f "$file" ] || die "File not found: $file"
-
-  if editor_cmd="$(detect_editor 2>/dev/null)"; then
-    "$editor_cmd" "$file"
-  else
-    badge_warn "Editor not found"
-    say "Run:"
-    say "  ./goshacrash install-editor"
-    return 1
-  fi
-}
-
-show_file() {
-  file="$1"
-  title="$2"
-
-  ensure_custom_files
-
-  banner
-  small_header "$title"
-
-  if [ -f "$file" ]; then
-    cat "$file"
-  else
-    badge_no "File not found: $file"
-  fi
-}
-
-backup_config() {
-  ensure_custom_files
-
-  stamp="$(date +%Y%m%d-%H%M%S 2>/dev/null || date)"
-  dst="$BACKUP_DIR/$stamp"
-  mkdir -p "$dst"
-
-  cp "$ENV_FILE" "$dst/env.conf" 2>/dev/null || true
-  cp "$DNS_FILE" "$dst/dns.yaml" 2>/dev/null || true
-  cp "$CUSTOM_CONFIG_FILE" "$dst/config.yaml" 2>/dev/null || true
-  cp "$TARGET_CONFIG_FILE" "$dst/final-config.yaml" 2>/dev/null || true
-
-  banner
-  small_header "Backup"
-  badge_ok "$dst"
 }
 
 generate_config() {
-  ensure_custom_files
-  load_env
-  mkdir -p "$CONFIG_DIR"
+  init_files >/dev/null 2>&1
+  load_settings
+  ensure_dirs
 
-  if [ -f "$TARGET_CONFIG_FILE" ]; then
+  if [ -f "$FINAL_CONFIG" ]; then
     stamp="$(date +%Y%m%d-%H%M%S 2>/dev/null || date)"
-    cp "$TARGET_CONFIG_FILE" "$TARGET_CONFIG_FILE.bak.$stamp" 2>/dev/null || true
+    cp "$FINAL_CONFIG" "$BACKUP_DIR/config.yaml.$stamp.bak" 2>/dev/null || true
   fi
 
-  cat > "$TARGET_CONFIG_FILE" <<EOF
+  cat > "$FINAL_CONFIG" <<EOF_CONFIG
 mixed-port: $MIHOMO_MIXED_PORT
-allow-lan: false
-bind-address: "127.0.0.1"
+allow-lan: $MIHOMO_ALLOW_LAN
+bind-address: "$MIHOMO_BIND_ADDRESS"
 
-mode: rule
-log-level: info
-ipv6: false
+mode: $MIHOMO_MODE
+log-level: $MIHOMO_LOG_LEVEL
+ipv6: $MIHOMO_IPV6
 
 external-controller: $MIHOMO_API_HOST:$MIHOMO_API_PORT
-external-ui: $UI_DIR
+external-ui: "$UI_DIR"
 secret: "$MIHOMO_SECRET"
 
-EOF
+EOF_CONFIG
 
-  cat "$DNS_FILE" >> "$TARGET_CONFIG_FILE"
-  printf '\n' >> "$TARGET_CONFIG_FILE"
-  cat "$CUSTOM_CONFIG_FILE" >> "$TARGET_CONFIG_FILE"
+  cat "$DNS_FILE" >> "$FINAL_CONFIG"
+  printf '\n' >> "$FINAL_CONFIG"
+  cat "$PROFILE_FILE" >> "$FINAL_CONFIG"
 
-  banner
-  small_header "Generate config"
-  badge_ok "$TARGET_CONFIG_FILE"
+  header "$(msg generate_config)"
+  say "$FINAL_CONFIG"
 }
 
-show_final_config() {
-  banner
-  small_header "Final Mihomo config"
+show_config() {
+  init_files >/dev/null 2>&1
 
-  if [ -f "$TARGET_CONFIG_FILE" ]; then
-    cat "$TARGET_CONFIG_FILE"
-  else
-    badge_warn "Final config not generated yet"
-    say "Run:"
-    say "  ./goshacrash gen-config"
+  if [ ! -f "$FINAL_CONFIG" ]; then
+    generate_config >/dev/null 2>&1
   fi
+
+  header "$(msg show_config)"
+  cat "$FINAL_CONFIG"
 }
 
 release_api_url() {
@@ -618,7 +504,7 @@ release_api_url() {
   say "https://api.github.com/repos/$owner/$repo/releases/latest"
 }
 
-get_release_json() {
+fetch_release_json() {
   owner="$1"
   repo="$2"
   out="$3"
@@ -626,7 +512,7 @@ get_release_json() {
   download "$out" "$(release_api_url "$owner" "$repo")"
 }
 
-list_release_assets() {
+list_assets() {
   json="$1"
 
   grep '"name":' "$json" 2>/dev/null \
@@ -640,8 +526,8 @@ find_asset_url() {
 
   for pattern in $patterns; do
     url="$(grep '"browser_download_url":' "$json" 2>/dev/null \
-      | grep -E "$pattern" \
       | sed 's/.*"browser_download_url": "\(.*\)".*/\1/' \
+      | grep -E "$pattern" \
       | head -n 1)"
 
     if [ -n "$url" ]; then
@@ -653,8 +539,8 @@ find_asset_url() {
   return 1
 }
 
-detect_mihomo_patterns() {
-  load_env
+mihomo_patterns() {
+  load_settings
 
   if [ -n "$MIHOMO_PATTERN" ]; then
     say "$MIHOMO_PATTERN"
@@ -666,37 +552,37 @@ detect_mihomo_patterns() {
 
   case "$arch" in
     x86_64|amd64)
-      say 'mihomo-linux-amd64-v1-.*\.gz$ mihomo-linux-amd64-compatible-.*\.gz$ mihomo-linux-amd64-.*\.gz$'
+      say 'mihomo-linux-amd64-v1.*\.gz$ mihomo-linux-amd64-compatible.*\.gz$ mihomo-linux-amd64.*\.gz$'
       ;;
     aarch64|arm64)
-      say 'mihomo-linux-arm64-.*\.gz$'
+      say 'mihomo-linux-arm64.*\.gz$'
       ;;
     armv7l|armv7*)
       if [ "$target" = "asus-optware" ]; then
-        say 'mihomo-linux-armv5-.*\.gz$ mihomo-linux-armv7-.*\.gz$ mihomo-linux-armv6-.*\.gz$'
+        say 'mihomo-linux-armv5.*\.gz$ mihomo-linux-armv7.*\.gz$ mihomo-linux-armv6.*\.gz$'
       else
-        say 'mihomo-linux-armv7-.*\.gz$ mihomo-linux-armv5-.*\.gz$'
+        say 'mihomo-linux-armv7.*\.gz$ mihomo-linux-armv5.*\.gz$'
       fi
       ;;
     armv6l|armv6*)
-      say 'mihomo-linux-armv6-.*\.gz$ mihomo-linux-armv5-.*\.gz$'
+      say 'mihomo-linux-armv6.*\.gz$ mihomo-linux-armv5.*\.gz$'
       ;;
     armv5tel|armv5*)
-      say 'mihomo-linux-armv5-.*\.gz$'
+      say 'mihomo-linux-armv5.*\.gz$'
       ;;
     mipsle)
-      say 'mihomo-linux-mipsle-softfloat-.*\.gz$ mihomo-linux-mipsle-.*\.gz$'
+      say 'mihomo-linux-mipsle-softfloat.*\.gz$ mihomo-linux-mipsle.*\.gz$'
       ;;
     mips)
-      say 'mihomo-linux-mips-softfloat-.*\.gz$ mihomo-linux-mips-.*\.gz$'
+      say 'mihomo-linux-mips-softfloat.*\.gz$ mihomo-linux-mips.*\.gz$'
       ;;
     *)
-      say 'mihomo-linux-amd64-v1-.*\.gz$'
+      say 'mihomo-linux-amd64-v1.*\.gz$'
       ;;
   esac
 }
 
-unpack_gzip_to() {
+unpack_gzip() {
   src="$1"
   dst="$2"
 
@@ -710,79 +596,62 @@ unpack_gzip_to() {
 }
 
 install_core() {
-  ensure_custom_files
-  load_env
-  init_dirs
+  init_files >/dev/null 2>&1
+  load_settings
+  ensure_dirs
 
-  banner
-  small_header "Install Mihomo core"
+  header "$(msg install_core)"
 
   release_json="$TMP_DIR/mihomo-release.json"
-  patterns="$(detect_mihomo_patterns)"
+  patterns="$(mihomo_patterns)"
 
-  badge_info "Repo: $MIHOMO_REPO_OWNER/$MIHOMO_REPO_NAME"
-  badge_info "Arch: $(detect_arch)"
-  badge_info "Target: $(detect_target)"
-  badge_info "Patterns: $patterns"
+  say "Target:   $(detect_target)"
+  say "Arch:     $(detect_arch)"
+  say "Patterns: $patterns"
+  say ""
 
-  get_release_json "$MIHOMO_REPO_OWNER" "$MIHOMO_REPO_NAME" "$release_json" || die "failed to fetch Mihomo release info"
+  fetch_release_json "$MIHOMO_REPO_OWNER" "$MIHOMO_REPO_NAME" "$release_json" || die "cannot fetch Mihomo release"
 
   url="$(find_asset_url "$release_json" "$patterns")"
 
   if [ -z "$url" ]; then
-    badge_no "No suitable Mihomo asset found"
+    say "No suitable Mihomo asset found."
     say ""
     say "Available assets:"
-    list_release_assets "$release_json"
+    list_assets "$release_json"
     return 1
   fi
 
-  badge_info "Downloading:"
+  say "Downloading:"
   say "$url"
 
-  download "$TMP_DIR/mihomo.gz" "$url" || die "failed to download Mihomo"
-  unpack_gzip_to "$TMP_DIR/mihomo.gz" "$TMP_DIR/mihomo" || die "failed to unpack Mihomo"
+  download "$TMP_DIR/mihomo.gz" "$url" || die "cannot download Mihomo"
+  unpack_gzip "$TMP_DIR/mihomo.gz" "$TMP_DIR/mihomo" || die "cannot unpack Mihomo"
 
   chmod +x "$TMP_DIR/mihomo"
 
-  "$TMP_DIR/mihomo" -v >/dev/null 2>&1 || die "downloaded Mihomo cannot run on this system"
+  "$TMP_DIR/mihomo" -v >/dev/null 2>&1 || die "downloaded Mihomo cannot run here"
 
   mv "$TMP_DIR/mihomo" "$MIHOMO_BIN"
   chmod +x "$MIHOMO_BIN"
 
-  badge_ok "Installed: $MIHOMO_BIN"
+  say ""
+  say "$(msg done): $MIHOMO_BIN"
   "$MIHOMO_BIN" -v | head -n 5
 }
 
-core_version() {
-  banner
-  small_header "Mihomo version"
-
-  if [ -x "$MIHOMO_BIN" ]; then
-    "$MIHOMO_BIN" -v
-  else
-    badge_warn "Mihomo is not installed"
-    say "Run:"
-    say "  ./goshacrash install-core"
-  fi
-}
-
 test_config() {
-  ensure_custom_files
-  load_env
+  init_files >/dev/null 2>&1
+  load_settings
 
-  if [ ! -x "$MIHOMO_BIN" ]; then
-    die "Mihomo is not installed. Run: ./goshacrash install-core"
-  fi
+  [ -x "$MIHOMO_BIN" ] || die "Mihomo is not installed. Run: goshacrash install-core"
 
-  if [ ! -f "$TARGET_CONFIG_FILE" ]; then
+  if [ ! -f "$FINAL_CONFIG" ]; then
     generate_config >/dev/null 2>&1
   fi
 
-  banner
-  small_header "Test Mihomo config"
-
-  "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$TARGET_CONFIG_FILE"
+  header "$(msg test_config)"
+  "$MIHOMO_BIN" -t -d "$CONFIG_DIR" -f "$FINAL_CONFIG"
 }
 
 is_running() {
@@ -797,48 +666,47 @@ is_running() {
 }
 
 start_core() {
-  ensure_custom_files
-  load_env
-  init_dirs
+  init_files >/dev/null 2>&1
+  load_settings
+  ensure_dirs
 
-  [ -x "$MIHOMO_BIN" ] || die "Mihomo is not installed. Run: ./goshacrash install-core"
+  [ -x "$MIHOMO_BIN" ] || die "Mihomo is not installed. Run: goshacrash install-core"
 
-  if [ ! -f "$TARGET_CONFIG_FILE" ]; then
+  if [ ! -f "$FINAL_CONFIG" ]; then
     generate_config >/dev/null 2>&1
   fi
 
   if is_running; then
-    banner
-    badge_ok "Mihomo already running. PID: $(cat "$MIHOMO_PID_FILE")"
+    header "$(msg status)"
+    say "Mihomo already running. PID: $(cat "$MIHOMO_PID_FILE")"
     return 0
   fi
 
-  banner
-  small_header "Start Mihomo"
+  header "$(msg start)"
 
-  nohup "$MIHOMO_BIN" -d "$CONFIG_DIR" -f "$TARGET_CONFIG_FILE" > "$MIHOMO_LOG_FILE" 2>&1 &
+  nohup "$MIHOMO_BIN" -d "$CONFIG_DIR" -f "$FINAL_CONFIG" > "$MIHOMO_LOG_FILE" 2>&1 &
   pid="$!"
   echo "$pid" > "$MIHOMO_PID_FILE"
 
   sleep 1
 
   if is_running; then
-    badge_ok "Mihomo started. PID: $pid"
+    say "Mihomo started. PID: $pid"
     say ""
     say "Proxy:     http://127.0.0.1:$MIHOMO_MIXED_PORT"
     say "API:       http://$MIHOMO_API_HOST:$MIHOMO_API_PORT"
     say "Dashboard: http://$MIHOMO_API_HOST:$MIHOMO_API_PORT/ui"
     say "DNS:       $MIHOMO_DNS_HOST:$MIHOMO_DNS_PORT"
   else
-    badge_no "Mihomo failed to start"
+    say "Mihomo failed to start."
+    say ""
     tail -n 80 "$MIHOMO_LOG_FILE" 2>/dev/null || true
     return 1
   fi
 }
 
 stop_core() {
-  banner
-  small_header "Stop Mihomo"
+  header "$(msg stop)"
 
   if is_running; then
     pid="$(cat "$MIHOMO_PID_FILE")"
@@ -850,23 +718,30 @@ stop_core() {
     fi
 
     rm -f "$MIHOMO_PID_FILE"
-    badge_ok "Stopped"
+    say "Stopped."
   else
     rm -f "$MIHOMO_PID_FILE"
-    badge_warn "Mihomo is not running"
+    say "Mihomo is not running."
   fi
 }
 
 status_core() {
-  banner
-  small_header "Mihomo status"
+  load_settings
+
+  header "$(msg status)"
 
   if is_running; then
-    badge_ok "running"
-    say "PID: $(cat "$MIHOMO_PID_FILE")"
+    say "Mihomo: running"
+    say "PID:    $(cat "$MIHOMO_PID_FILE")"
   else
-    badge_warn "stopped"
+    say "Mihomo: stopped"
   fi
+
+  say ""
+  say "Home:      $GC_HOME"
+  say "Config:    $FINAL_CONFIG"
+  say "Core:      $MIHOMO_BIN"
+  say "Dashboard: http://$MIHOMO_API_HOST:$MIHOMO_API_PORT/ui"
 
   if [ -x "$MIHOMO_BIN" ]; then
     say ""
@@ -875,456 +750,337 @@ status_core() {
 }
 
 logs_core() {
-  banner
-  small_header "Mihomo logs"
+  header "$(msg logs)"
 
   if [ -f "$MIHOMO_LOG_FILE" ]; then
     tail -n 120 "$MIHOMO_LOG_FILE"
   else
-    badge_warn "Log file not found: $MIHOMO_LOG_FILE"
+    say "No logs yet: $MIHOMO_LOG_FILE"
   fi
 }
 
 install_ui() {
-  ensure_custom_files
-  load_env
-  init_dirs
+  init_files >/dev/null 2>&1
+  load_settings
+  ensure_dirs
 
-  banner
-  small_header "Install Zashboard"
+  header "$(msg install_ui)"
 
   if ! has_cmd unzip; then
-    badge_no "unzip is required"
+    say "unzip is required."
     say ""
-    say "Install it manually:"
-    say "  ASUS Optware: ipkg install unzip"
-    say "  ASUS Entware: opkg install unzip"
-    say "  WSL/Linux: sudo apt install unzip"
+    say "ASUS Optware:"
+    say "  ipkg install unzip"
+    say ""
+    say "WSL/Linux:"
+    say "  sudo apt install unzip"
     return 1
   fi
 
   release_json="$TMP_DIR/zashboard-release.json"
-  get_release_json "$ZASHBOARD_REPO_OWNER" "$ZASHBOARD_REPO_NAME" "$release_json" || die "failed to fetch Zashboard release info"
 
-  url="$(find_asset_url "$release_json" 'dist\.zip$ zashboard.*\.zip$')"
+  fetch_release_json "$ZASHBOARD_REPO_OWNER" "$ZASHBOARD_REPO_NAME" "$release_json" || die "cannot fetch Zashboard release"
+
+  url="$(find_asset_url "$release_json" 'dist.*\.zip$ zashboard.*\.zip$ .*\.zip$')"
 
   if [ -z "$url" ]; then
-    badge_no "No suitable Zashboard asset found"
+    say "No suitable Zashboard zip found."
     say ""
     say "Available assets:"
-    list_release_assets "$release_json"
+    list_assets "$release_json"
     return 1
   fi
 
-  badge_info "Downloading:"
+  say "Downloading:"
   say "$url"
-
-  download "$TMP_DIR/zashboard.zip" "$url" || die "failed to download Zashboard"
 
   rm -rf "$UI_DIR"
   mkdir -p "$UI_DIR"
 
-  unzip -q "$TMP_DIR/zashboard.zip" -d "$UI_DIR" || die "failed to unpack Zashboard"
+  download "$TMP_DIR/zashboard.zip" "$url" || die "cannot download Zashboard"
+  unzip -q "$TMP_DIR/zashboard.zip" -d "$UI_DIR" || die "cannot unpack Zashboard"
 
-  if [ -f "$UI_DIR/index.html" ]; then
-    badge_ok "Zashboard installed: $UI_DIR"
-  else
-    badge_warn "index.html not found directly in UI_DIR"
-    find "$UI_DIR" -maxdepth 2 -type f | head -n 20
+  index_file="$(find "$UI_DIR" -name index.html -type f 2>/dev/null | head -n 1)"
+
+  if [ -z "$index_file" ]; then
+    say "index.html not found after unpack."
+    return 1
   fi
+
+  index_dir="$(dirname "$index_file")"
+
+  if [ "$index_dir" != "$UI_DIR" ]; then
+    cp -R "$index_dir"/* "$UI_DIR"/ 2>/dev/null || true
+  fi
+
+  say "$(msg done): $UI_DIR"
 }
 
 doctor() {
-  ensure_custom_files
-  load_env
+  init_files >/dev/null 2>&1
+  load_settings
 
-  banner
-  small_header "System"
-  say "Target:       $(detect_target)"
-  say "Arch:         $(detect_arch)"
-  say "User:         $(whoami)"
-  say "Home:         $HOME"
-  say "Script dir:   $SCRIPT_DIR"
-  say "Base dir:     $BASE_DIR"
-  say "Custom dir:   $CUSTOM_DIR"
-  say "Kernel:"
-  say "  $(uname -a)"
+  header "$(msg doctor)"
 
-  small_header "Tools"
-  for cmd in sh curl wget gzip gunzip tar unzip grep sed awk nano mcedit ipkg opkg apt-get ip iptables ss; do
-    if has_cmd "$cmd"; then
-      badge_ok "$cmd: $(command -v "$cmd")"
-    else
-      badge_no "$cmd"
-    fi
-  done
+  say "Target:     $(detect_target)"
+  say "Arch:       $(detect_arch)"
+  say "User:       $(whoami 2>/dev/null || echo unknown)"
+  say "GC_HOME:    $GC_HOME"
+  say "Script:     $SCRIPT_DIR"
+  say ""
 
-  small_header "Files"
-  for file in "$ENV_FILE" "$DNS_FILE" "$CUSTOM_CONFIG_FILE" "$TARGET_CONFIG_FILE" "$MIHOMO_BIN"; do
+  say "Files:"
+  for file in "$ENV_FILE" "$DNS_FILE" "$PROFILE_FILE" "$FINAL_CONFIG" "$MIHOMO_BIN"; do
     if [ -f "$file" ]; then
-      badge_ok "$file"
+      say "  OK  $file"
     else
-      badge_warn "$file missing"
+      say "  --  $file"
     fi
   done
 
-  small_header "Editor"
-  if editor_cmd="$(detect_editor 2>/dev/null)"; then
-    badge_ok "$editor_cmd"
-  else
-    badge_warn "not found"
-  fi
+  say ""
+  say "Tools:"
+  for cmd in sh curl wget gzip gunzip unzip grep sed awk nano mcedit ipkg opkg apt-get iptables ip; do
+    if has_cmd "$cmd"; then
+      say "  OK  $cmd: $(command -v "$cmd")"
+    else
+      say "  --  $cmd"
+    fi
+  done
+
+  say ""
+  say "Language: $GC_LANGUAGE"
 }
 
 show_paths() {
-  banner
-  small_header "Paths"
-  say "SCRIPT_DIR          = $SCRIPT_DIR"
-  say "BASE_DIR            = $BASE_DIR"
-  say "CUSTOM_DIR          = $CUSTOM_DIR"
-  say "ENV_FILE            = $ENV_FILE"
-  say "DNS_FILE            = $DNS_FILE"
-  say "CUSTOM_CONFIG_FILE  = $CUSTOM_CONFIG_FILE"
-  say "TARGET_CONFIG_FILE  = $TARGET_CONFIG_FILE"
-  say "MIHOMO_BIN          = $MIHOMO_BIN"
-  say "UI_DIR              = $UI_DIR"
+  header "$(msg paths)"
+
+  say "GC_HOME       = $GC_HOME"
+  say "CUSTOM_DIR    = $CUSTOM_DIR"
+  say "ENV_FILE      = $ENV_FILE"
+  say "DNS_FILE      = $DNS_FILE"
+  say "PROFILE_FILE  = $PROFILE_FILE"
+  say "FINAL_CONFIG  = $FINAL_CONFIG"
+  say "MIHOMO_BIN    = $MIHOMO_BIN"
+  say "UI_DIR        = $UI_DIR"
+  say "LOG_FILE      = $MIHOMO_LOG_FILE"
+  say "LANG_FILE     = $LANG_FILE"
 }
 
-ports_plan() {
-  ensure_custom_files
-  load_env
-
-  banner
-  small_header "Ports"
-  say "mixed-port:          $MIHOMO_MIXED_PORT"
-  say "external-controller: $MIHOMO_API_HOST:$MIHOMO_API_PORT"
-  say "dashboard:           http://$MIHOMO_API_HOST:$MIHOMO_API_PORT/ui"
-  say "dns:                 $MIHOMO_DNS_HOST:$MIHOMO_DNS_PORT"
+quick_setup() {
+  init_files
+  generate_config
+  install_core
+  test_config
 }
 
-git_status() {
-  banner
-  small_header "Git"
-
-  if ! has_cmd git; then
-    badge_no "git not installed"
-    return
-  fi
-
-  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    badge_warn "not inside Git repo"
-    return
-  fi
-
-  git status --short
-  say ""
-  git log --oneline -5
-}
-
-roadmap() {
-  banner
-  small_header "Roadmap"
-
-  badge_ok "interface"
-  badge_ok "language selector"
-  badge_ok "config manager"
-  badge_ok "editor manager"
-  badge_ok "GitHub installer"
-  badge_ok "Mihomo core manager"
-  badge_warn "full ASUS autostart"
-  badge_warn "TUN"
-  badge_warn "iptables dry-run/apply/rollback"
-}
-
-about() {
-  banner
-  small_header "About"
-
-  say "GoshaCrash is a custom Mihomo + Zashboard installer/controller."
-  say ""
-  say "Focused on:"
-  say "  - ASUS Optware first"
-  say "  - ipkg support"
-  say "  - WSL testing"
-  say "  - custom DNS"
-  say "  - custom configs"
-  say "  - no forced vi usage"
-  say "  - future TUN and iptables rollback"
-}
-
-choose_language() {
+language_menu() {
   while true; do
-    banner
-    small_header "Language"
-
-    say "Current: $GC_LANG"
+    header "$(msg language)"
+    say "Current: $GC_LANGUAGE"
     say ""
-    say "  1) Русский"
-    say "  2) English"
-    say "  3) 中文"
+    say "1) Русский"
+    say "2) English"
+    say "0) $(msg back)"
     say ""
-    say "  0) Back"
-    say ""
-    print "$(t choose)"
+    ask "$(msg choose)"
 
     IFS= read -r choice
 
     case "$choice" in
-      1|ru|RU) save_lang ru; badge_ok "Language saved: ru"; pause; return ;;
-      2|en|EN) save_lang en; badge_ok "Language saved: en"; pause; return ;;
-      3|zh|ZH|cn|CN) save_lang zh; badge_ok "Language saved: zh"; pause; return ;;
-      0|q|Q) return ;;
-      *) badge_warn "$(t unknown): $choice"; pause ;;
-    esac
-  done
-}
-
-set_lang_command() {
-  case "$1" in
-    ru|en|zh) save_lang "$1"; badge_ok "Language saved: $1" ;;
-    *) die "Available languages: ru, en, zh" ;;
-  esac
-}
-
-editor_menu() {
-  while true; do
-    banner
-    small_header "$(t editor_menu)"
-
-    say "  1) Check editor"
-    say "  2) Install nano"
-    say "  3) Edit env.conf"
-    say "  4) Edit dns.yaml"
-    say "  5) Edit config.yaml"
-    say ""
-    say "  0) Back"
-    say ""
-    print "$(t choose)"
-
-    IFS= read -r choice
-
-    case "$choice" in
-      1) check_editor; pause ;;
-      2) install_editor; pause ;;
-      3) open_editor "$ENV_FILE" ;;
-      4) open_editor "$DNS_FILE" ;;
-      5) open_editor "$CUSTOM_CONFIG_FILE" ;;
-      0|q|Q) return ;;
-      *) badge_warn "$(t unknown): $choice"; pause ;;
+      1|ru)
+        save_language ru
+        say "$(msg lang_saved): ru"
+        pause
+        return
+        ;;
+      2|en)
+        save_language en
+        say "$(msg lang_saved): en"
+        pause
+        return
+        ;;
+      0|q|Q)
+        return
+        ;;
+      *)
+        say "$(msg unknown): $choice"
+        pause
+        ;;
     esac
   done
 }
 
 config_menu() {
   while true; do
-    banner
-    small_header "$(t config_menu)"
-
-    say "  1) Init custom files"
-    say "  2) Edit env.conf"
-    say "  3) Edit dns.yaml"
-    say "  4) Edit config.yaml"
-    say "  5) Show env.conf"
-    say "  6) Show dns.yaml"
-    say "  7) Show config.yaml"
-    say "  8) Generate final Mihomo config"
-    say "  9) Show final Mihomo config"
-    say " 10) Backup configs"
+    header "$(msg configs)"
+    say "1) $(msg init_files)"
+    say "2) $(msg edit_settings)"
+    say "3) $(msg edit_dns)"
+    say "4) $(msg edit_profile)"
+    say "5) $(msg generate_config)"
+    say "6) $(msg show_config)"
+    say "0) $(msg back)"
     say ""
-    say "  0) Back"
-    say ""
-    print "$(t choose)"
+    ask "$(msg choose)"
 
     IFS= read -r choice
 
     case "$choice" in
-      1) init_custom; pause ;;
+      1) init_files; pause ;;
       2) open_editor "$ENV_FILE" ;;
       3) open_editor "$DNS_FILE" ;;
-      4) open_editor "$CUSTOM_CONFIG_FILE" ;;
-      5) show_file "$ENV_FILE" "env.conf"; pause ;;
-      6) show_file "$DNS_FILE" "dns.yaml"; pause ;;
-      7) show_file "$CUSTOM_CONFIG_FILE" "config.yaml"; pause ;;
-      8) generate_config; pause ;;
-      9) show_final_config; pause ;;
-      10) backup_config; pause ;;
+      4) open_editor "$PROFILE_FILE" ;;
+      5) generate_config; pause ;;
+      6) show_config; pause ;;
       0|q|Q) return ;;
-      *) badge_warn "$(t unknown): $choice"; pause ;;
+      *) say "$(msg unknown): $choice"; pause ;;
     esac
   done
 }
 
-core_menu() {
+mihomo_menu() {
   while true; do
-    banner
-    small_header "$(t core_menu)"
-
-    say "  1) Install / update Mihomo core"
-    say "  2) Mihomo version"
-    say "  3) Test config"
-    say "  4) Start Mihomo"
-    say "  5) Stop Mihomo"
-    say "  6) Restart Mihomo"
-    say "  7) Status"
-    say "  8) Logs"
-    say "  9) Install / update Zashboard"
+    header "$(msg mihomo)"
+    say "1) $(msg install_core)"
+    say "2) $(msg test_config)"
+    say "3) $(msg start)"
+    say "4) $(msg stop)"
+    say "5) $(msg restart)"
+    say "6) $(msg status)"
+    say "7) $(msg logs)"
+    say "0) $(msg back)"
     say ""
-    say "  0) Back"
-    say ""
-    print "$(t choose)"
+    ask "$(msg choose)"
 
     IFS= read -r choice
 
     case "$choice" in
       1) install_core; pause ;;
-      2) core_version; pause ;;
-      3) test_config; pause ;;
-      4) start_core; pause ;;
-      5) stop_core; pause ;;
-      6) stop_core; start_core; pause ;;
-      7) status_core; pause ;;
-      8) logs_core; pause ;;
-      9) install_ui; pause ;;
+      2) test_config; pause ;;
+      3) start_core; pause ;;
+      4) stop_core; pause ;;
+      5) stop_core; start_core; pause ;;
+      6) status_core; pause ;;
+      7) logs_core; pause ;;
       0|q|Q) return ;;
-      *) badge_warn "$(t unknown): $choice"; pause ;;
+      *) say "$(msg unknown): $choice"; pause ;;
+    esac
+  done
+}
+
+tools_menu() {
+  while true; do
+    header "$(msg tools)"
+    say "1) $(msg doctor)"
+    say "2) $(msg install_editor)"
+    say "3) $(msg paths)"
+    say "0) $(msg back)"
+    say ""
+    ask "$(msg choose)"
+
+    IFS= read -r choice
+
+    case "$choice" in
+      1) doctor; pause ;;
+      2) install_editor; pause ;;
+      3) show_paths; pause ;;
+      0|q|Q) return ;;
+      *) say "$(msg unknown): $choice"; pause ;;
+    esac
+  done
+}
+
+main_menu() {
+  while true; do
+    header "$(msg main_menu)"
+    say "1) $(msg quick_setup)"
+    say "2) $(msg configs)"
+    say "3) $(msg mihomo)"
+    say "4) $(msg install_ui)"
+    say "5) $(msg tools)"
+    say "6) $(msg language)"
+    say "0) $(msg exit)"
+    say ""
+    ask "$(msg choose)"
+
+    IFS= read -r choice
+
+    case "$choice" in
+      1) quick_setup; pause ;;
+      2) config_menu ;;
+      3) mihomo_menu ;;
+      4) install_ui; pause ;;
+      5) tools_menu ;;
+      6) language_menu ;;
+      0|q|Q|exit) exit 0 ;;
+      *) say "$(msg unknown): $choice"; pause ;;
     esac
   done
 }
 
 show_help() {
-  say "$APP_NAME $APP_VERSION"
+  say "$APP_BIN $APP_VERSION"
   say ""
-  say "Usage:"
-  say "  ./goshacrash"
-  say "  ./goshacrash init-custom"
-  say "  ./goshacrash install-editor"
-  say "  ./goshacrash edit-env"
-  say "  ./goshacrash edit-dns"
-  say "  ./goshacrash edit-config"
-  say "  ./goshacrash gen-config"
-  say "  ./goshacrash install-core"
-  say "  ./goshacrash core-version"
-  say "  ./goshacrash test-config"
-  say "  ./goshacrash start"
-  say "  ./goshacrash stop"
-  say "  ./goshacrash status"
-  say "  ./goshacrash logs"
-  say "  ./goshacrash install-ui"
-  say "  ./goshacrash doctor"
-  say "  ./goshacrash paths"
-  say "  ./goshacrash ports"
-  say "  ./goshacrash lang"
-  say "  ./goshacrash set-lang ru|en|zh"
+  say "Commands:"
+  say "  goshacrash"
+  say "  goshacrash init"
+  say "  goshacrash edit-settings"
+  say "  goshacrash edit-dns"
+  say "  goshacrash edit-profile"
+  say "  goshacrash gen-config"
+  say "  goshacrash show-config"
+  say "  goshacrash install-core"
+  say "  goshacrash install-ui"
+  say "  goshacrash test"
+  say "  goshacrash start"
+  say "  goshacrash stop"
+  say "  goshacrash restart"
+  say "  goshacrash status"
+  say "  goshacrash logs"
+  say "  goshacrash doctor"
+  say "  goshacrash install-editor"
+  say "  goshacrash paths"
+  say "  goshacrash lang"
+  say "  goshacrash set-lang ru|en"
+  say "  goshacrash version"
 }
 
-main_menu() {
-  while true; do
-    banner
-
-    say "${BOLD}$(t main_menu)${RESET}"
-    say ""
-    say "  1) Config manager"
-    say "  2) Mihomo core"
-    say "  3) Editor"
-    say "  4) Doctor"
-    say "  5) Paths"
-    say "  6) Ports"
-    say "  7) Git status"
-    say "  8) Roadmap"
-    say "  9) About"
-    say " 10) Language"
-    say ""
-    say "  0) Exit"
-    say ""
-    print "$(t choose)"
-
-    IFS= read -r choice
-
-    case "$choice" in
-      1) config_menu ;;
-      2) core_menu ;;
-      3) editor_menu ;;
-      4) doctor; pause ;;
-      5) show_paths; pause ;;
-      6) ports_plan; pause ;;
-      7) git_status; pause ;;
-      8) roadmap; pause ;;
-      9) about; pause ;;
-      10) choose_language ;;
-      0|q|Q|exit) say "$(t bye)"; exit 0 ;;
-      *) badge_warn "$(t unknown): $choice"; pause ;;
-    esac
-  done
-}
-
-color_init
-load_lang
+ensure_dirs >/dev/null 2>&1
+load_language
 
 case "$1" in
   ""|menu)
     main_menu
     ;;
-  init-custom)
-    init_custom
+  init)
+    init_files
     ;;
-  doctor)
-    doctor
+  quick)
+    quick_setup
     ;;
-  paths)
-    show_paths
-    ;;
-  ports)
-    ports_plan
-    ;;
-  git)
-    git_status
-    ;;
-  roadmap)
-    roadmap
-    ;;
-  about)
-    about
-    ;;
-  check-editor)
-    check_editor
-    ;;
-  install-editor)
-    install_editor
-    ;;
-  edit-env)
+  edit-settings)
     open_editor "$ENV_FILE"
     ;;
   edit-dns)
     open_editor "$DNS_FILE"
     ;;
-  edit-config)
-    open_editor "$CUSTOM_CONFIG_FILE"
+  edit-profile)
+    open_editor "$PROFILE_FILE"
     ;;
-  show-env)
-    show_file "$ENV_FILE" "env.conf"
-    ;;
-  show-dns)
-    show_file "$DNS_FILE" "dns.yaml"
-    ;;
-  show-config)
-    show_file "$CUSTOM_CONFIG_FILE" "config.yaml"
-    ;;
-  gen-config|generate-config)
+  gen-config)
     generate_config
     ;;
-  show-final-config)
-    show_final_config
-    ;;
-  backup-config)
-    backup_config
+  show-config)
+    show_config
     ;;
   install-core)
     install_core
     ;;
-  core-version)
-    core_version
+  install-ui)
+    install_ui
     ;;
-  test-config)
+  test)
     test_config
     ;;
   start)
@@ -1343,14 +1099,21 @@ case "$1" in
   logs)
     logs_core
     ;;
-  install-ui)
-    install_ui
+  doctor)
+    doctor
+    ;;
+  install-editor)
+    install_editor
+    ;;
+  paths)
+    show_paths
     ;;
   lang|language)
-    choose_language
+    language_menu
     ;;
   set-lang)
-    set_lang_command "$2"
+    save_language "$2"
+    say "$(msg lang_saved): $2"
     ;;
   version|-v|--version)
     say "$APP_BIN $APP_VERSION"
@@ -1359,6 +1122,6 @@ case "$1" in
     show_help
     ;;
   *)
-    die "Unknown command: $1. Try: ./goshacrash help"
+    die "unknown command: $1"
     ;;
 esac

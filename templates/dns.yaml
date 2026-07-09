@@ -1,34 +1,28 @@
-# GoshaCrash user settings
-# This file is shell-compatible.
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
 
-# Main ports
-MIHOMO_MIXED_PORT=7890
-MIHOMO_API_HOST=127.0.0.1
-MIHOMO_API_PORT=9090
-MIHOMO_DNS_HOST=127.0.0.1
-MIHOMO_DNS_PORT=1053
+  default-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
 
-# Security
-MIHOMO_SECRET=changeme
+  nameserver:
+    - https://1.1.1.1/dns-query
+    - https://8.8.8.8/dns-query
 
-# Runtime mode:
-# wsl / linux / asus / asus-optware / asus-entware
-GC_MODE=wsl
+  proxy-server-nameserver:
+    - https://1.1.1.1/dns-query
 
-# Editor preference:
-# auto / nano / mcedit
-GC_EDITOR=auto
+  direct-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
 
-# Optional manual Mihomo asset pattern.
-# Leave empty for auto-detection.
-# Examples:
-# MIHOMO_PATTERN='mihomo-linux-amd64-v1-.*\.gz$'
-# MIHOMO_PATTERN='mihomo-linux-armv5-.*\.gz$'
-MIHOMO_PATTERN=
-
-# GitHub repos
-MIHOMO_REPO_OWNER=MetaCubeX
-MIHOMO_REPO_NAME=mihomo
-
-ZASHBOARD_REPO_OWNER=Zephyruso
-ZASHBOARD_REPO_NAME=zashboard
+  fake-ip-filter:
+    - "*.lan"
+    - "*.local"
+    - "localhost"
+    - "router.asus.com"
+    - "+.asuscomm.com"
