@@ -1,0 +1,34 @@
+# GoshaCrash user settings
+# This file is shell-compatible.
+
+# Main ports
+MIHOMO_MIXED_PORT=7890
+MIHOMO_API_HOST=127.0.0.1
+MIHOMO_API_PORT=9090
+MIHOMO_DNS_HOST=127.0.0.1
+MIHOMO_DNS_PORT=1053
+
+# Security
+MIHOMO_SECRET=changeme
+
+# Runtime mode:
+# wsl / linux / asus / asus-optware / asus-entware
+GC_MODE=wsl
+
+# Editor preference:
+# auto / nano / mcedit
+GC_EDITOR=auto
+
+# Optional manual Mihomo asset pattern.
+# Leave empty for auto-detection.
+# Examples:
+# MIHOMO_PATTERN='mihomo-linux-amd64-v1-.*\.gz$'
+# MIHOMO_PATTERN='mihomo-linux-armv5-.*\.gz$'
+MIHOMO_PATTERN=
+
+# GitHub repos
+MIHOMO_REPO_OWNER=MetaCubeX
+MIHOMO_REPO_NAME=mihomo
+
+ZASHBOARD_REPO_OWNER=Zephyruso
+ZASHBOARD_REPO_NAME=zashboard

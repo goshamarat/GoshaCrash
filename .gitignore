@@ -5,14 +5,26 @@
 tmp/
 logs/
 run/
+runtime/
 
 # Local lab files
 goshacrash-lab/
+mihomo-router-lab/
 
-# Mihomo sensitive configs
+# Backups
+*.bak
+*.backup
+backups/
+
+# Sensitive local configs
+custom/env.conf
+custom/dns.yaml
+custom/config.yaml
 config.yaml
 *.yaml.bak
 *.yml.bak
+
+# Providers / subscriptions / profiles
 providers/
 subscriptions/
 profiles/
@@ -27,6 +39,7 @@ token*
 
 # Downloaded binaries and archives
 bin/mihomo
+mihomo
 *.gz
 *.zip
 *.tar
