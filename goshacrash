@@ -2,7 +2,7 @@
 
 APP_NAME="GoshaCrash"
 APP_BIN="goshacrash"
-APP_VERSION="0.4.0-simple"
+APP_VERSION="0.5.0-user"
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)"
 
@@ -53,6 +53,7 @@ MIHOMO_REPO_NAME="${MIHOMO_REPO_NAME:-mihomo}"
 
 ZASHBOARD_REPO_OWNER="${ZASHBOARD_REPO_OWNER:-Zephyruso}"
 ZASHBOARD_REPO_NAME="${ZASHBOARD_REPO_NAME:-zashboard}"
+ZASHBOARD_ZIP_URL="${ZASHBOARD_ZIP_URL:-https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip}"
 
 say() {
   printf '%s\n' "$*"
@@ -116,7 +117,7 @@ msg() {
     ru:main_menu) printf '%s' "Главное меню" ;;
     en:main_menu) printf '%s' "Main menu" ;;
 
-    ru:quick_setup) printf '%s' "Быстрая подготовка" ;;
+    ru:quick_setup) printf '%s' "Быстрая установка" ;;
     en:quick_setup) printf '%s' "Quick setup" ;;
 
     ru:configs) printf '%s' "Конфиги" ;;
@@ -146,9 +147,6 @@ msg() {
     ru:done) printf '%s' "Готово" ;;
     en:done) printf '%s' "Done" ;;
 
-    ru:error) printf '%s' "Ошибка" ;;
-    en:error) printf '%s' "Error" ;;
-
     ru:unknown) printf '%s' "Неизвестный пункт" ;;
     en:unknown) printf '%s' "Unknown option" ;;
 
@@ -167,14 +165,17 @@ msg() {
     ru:edit_profile) printf '%s' "Редактировать прокси/правила" ;;
     en:edit_profile) printf '%s' "Edit proxies/rules" ;;
 
-    ru:generate_config) printf '%s' "Собрать итоговый config.yaml" ;;
-    en:generate_config) printf '%s' "Generate final config.yaml" ;;
+    ru:generate_config) printf '%s' "Собрать config.yaml" ;;
+    en:generate_config) printf '%s' "Generate config.yaml" ;;
 
-    ru:show_config) printf '%s' "Показать итоговый config.yaml" ;;
-    en:show_config) printf '%s' "Show final config.yaml" ;;
+    ru:show_config) printf '%s' "Показать config.yaml" ;;
+    en:show_config) printf '%s' "Show config.yaml" ;;
 
     ru:install_core) printf '%s' "Установить/обновить Mihomo" ;;
     en:install_core) printf '%s' "Install/update Mihomo" ;;
+
+    ru:core_version) printf '%s' "Версия Mihomo" ;;
+    en:core_version) printf '%s' "Mihomo version" ;;
 
     ru:test_config) printf '%s' "Проверить config.yaml" ;;
     en:test_config) printf '%s' "Test config.yaml" ;;
@@ -197,8 +198,14 @@ msg() {
     ru:install_ui) printf '%s' "Установить/обновить Zashboard" ;;
     en:install_ui) printf '%s' "Install/update Zashboard" ;;
 
+    ru:dashboard_url) printf '%s' "Показать адрес Zashboard" ;;
+    en:dashboard_url) printf '%s' "Show Zashboard URL" ;;
+
     ru:doctor) printf '%s' "Диагностика" ;;
     en:doctor) printf '%s' "Doctor" ;;
+
+    ru:install_deps) printf '%s' "Установить зависимости" ;;
+    en:install_deps) printf '%s' "Install dependencies" ;;
 
     ru:install_editor) printf '%s' "Установить nano" ;;
     en:install_editor) printf '%s' "Install nano" ;;
@@ -278,6 +285,7 @@ MIHOMO_REPO_NAME=mihomo
 
 ZASHBOARD_REPO_OWNER=Zephyruso
 ZASHBOARD_REPO_NAME=zashboard
+ZASHBOARD_ZIP_URL=https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip
 EOF_ENV
 }
 
@@ -427,6 +435,43 @@ open_editor() {
     say "  goshacrash install-editor"
     return 1
   fi
+}
+
+install_deps() {
+  header "$(msg install_deps)"
+
+  target="$(detect_target)"
+
+  case "$target" in
+    asus-optware)
+      say "Target: ASUS Optware"
+      ipkg update
+      ipkg install wget
+      ipkg install unzip
+      ipkg install gzip
+      ipkg install nano
+      ;;
+    asus-entware)
+      say "Target: ASUS Entware"
+      opkg update
+      opkg install wget
+      opkg install unzip
+      opkg install gzip
+      opkg install nano-full || opkg install nano
+      ;;
+    *)
+      say "Target: Linux/WSL"
+      if has_cmd apt-get; then
+        as_root apt-get update
+        as_root apt-get install -y curl wget unzip gzip ca-certificates nano
+      elif has_cmd apt; then
+        as_root apt update
+        as_root apt install -y curl wget unzip gzip ca-certificates nano
+      else
+        die "unsupported package manager"
+      fi
+      ;;
+  esac
 }
 
 install_editor() {
@@ -640,6 +685,18 @@ install_core() {
   "$MIHOMO_BIN" -v | head -n 5
 }
 
+core_version() {
+  header "$(msg core_version)"
+
+  if [ -x "$MIHOMO_BIN" ]; then
+    "$MIHOMO_BIN" -v
+  else
+    say "Mihomo is not installed."
+    say "Run:"
+    say "  goshacrash install-core"
+  fi
+}
+
 test_config() {
   init_files >/dev/null 2>&1
   load_settings
@@ -679,6 +736,7 @@ start_core() {
   if is_running; then
     header "$(msg status)"
     say "Mihomo already running. PID: $(cat "$MIHOMO_PID_FILE")"
+    dashboard_url
     return 0
   fi
 
@@ -695,8 +753,8 @@ start_core() {
     say ""
     say "Proxy:     http://127.0.0.1:$MIHOMO_MIXED_PORT"
     say "API:       http://$MIHOMO_API_HOST:$MIHOMO_API_PORT"
-    say "Dashboard: http://$MIHOMO_API_HOST:$MIHOMO_API_PORT/ui"
     say "DNS:       $MIHOMO_DNS_HOST:$MIHOMO_DNS_PORT"
+    dashboard_url
   else
     say "Mihomo failed to start."
     say ""
@@ -725,7 +783,13 @@ stop_core() {
   fi
 }
 
+restart_core() {
+  stop_core
+  start_core
+}
+
 status_core() {
+  init_files >/dev/null 2>&1
   load_settings
 
   header "$(msg status)"
@@ -741,7 +805,8 @@ status_core() {
   say "Home:      $GC_HOME"
   say "Config:    $FINAL_CONFIG"
   say "Core:      $MIHOMO_BIN"
-  say "Dashboard: http://$MIHOMO_API_HOST:$MIHOMO_API_PORT/ui"
+  say "UI:        $UI_DIR"
+  dashboard_url
 
   if [ -x "$MIHOMO_BIN" ]; then
     say ""
@@ -753,7 +818,11 @@ logs_core() {
   header "$(msg logs)"
 
   if [ -f "$MIHOMO_LOG_FILE" ]; then
-    tail -n 120 "$MIHOMO_LOG_FILE"
+    if [ "$1" = "-f" ]; then
+      tail -f "$MIHOMO_LOG_FILE"
+    else
+      tail -n 120 "$MIHOMO_LOG_FILE"
+    fi
   else
     say "No logs yet: $MIHOMO_LOG_FILE"
   fi
@@ -777,30 +846,18 @@ install_ui() {
     return 1
   fi
 
-  release_json="$TMP_DIR/zashboard-release.json"
-
-  fetch_release_json "$ZASHBOARD_REPO_OWNER" "$ZASHBOARD_REPO_NAME" "$release_json" || die "cannot fetch Zashboard release"
-
-  url="$(find_asset_url "$release_json" 'dist.*\.zip$ zashboard.*\.zip$ .*\.zip$')"
-
-  if [ -z "$url" ]; then
-    say "No suitable Zashboard zip found."
-    say ""
-    say "Available assets:"
-    list_assets "$release_json"
-    return 1
-  fi
-
-  say "Downloading:"
-  say "$url"
-
-  rm -rf "$UI_DIR"
+  rm -rf "$TMP_DIR/zashboard-unpack"
+  mkdir -p "$TMP_DIR/zashboard-unpack"
   mkdir -p "$UI_DIR"
 
-  download "$TMP_DIR/zashboard.zip" "$url" || die "cannot download Zashboard"
-  unzip -q "$TMP_DIR/zashboard.zip" -d "$UI_DIR" || die "cannot unpack Zashboard"
+  say "Downloading:"
+  say "$ZASHBOARD_ZIP_URL"
 
-  index_file="$(find "$UI_DIR" -name index.html -type f 2>/dev/null | head -n 1)"
+  download "$TMP_DIR/zashboard.zip" "$ZASHBOARD_ZIP_URL" || die "cannot download Zashboard"
+
+  unzip -q "$TMP_DIR/zashboard.zip" -d "$TMP_DIR/zashboard-unpack" || die "cannot unpack Zashboard"
+
+  index_file="$(find "$TMP_DIR/zashboard-unpack" -name index.html -type f 2>/dev/null | head -n 1)"
 
   if [ -z "$index_file" ]; then
     say "index.html not found after unpack."
@@ -809,11 +866,27 @@ install_ui() {
 
   index_dir="$(dirname "$index_file")"
 
-  if [ "$index_dir" != "$UI_DIR" ]; then
-    cp -R "$index_dir"/* "$UI_DIR"/ 2>/dev/null || true
-  fi
+  rm -rf "$UI_DIR"
+  mkdir -p "$UI_DIR"
+
+  cp -R "$index_dir"/* "$UI_DIR"/ 2>/dev/null || die "cannot copy Zashboard files"
 
   say "$(msg done): $UI_DIR"
+  dashboard_url
+}
+
+dashboard_url() {
+  load_settings
+
+  say "Dashboard: http://$MIHOMO_API_HOST:$MIHOMO_API_PORT/ui"
+}
+
+quick_setup() {
+  init_files
+  generate_config
+  install_core
+  install_ui
+  test_config
 }
 
 doctor() {
@@ -827,6 +900,7 @@ doctor() {
   say "User:       $(whoami 2>/dev/null || echo unknown)"
   say "GC_HOME:    $GC_HOME"
   say "Script:     $SCRIPT_DIR"
+  say "Language:   $GC_LANGUAGE"
   say ""
 
   say "Files:"
@@ -839,6 +913,14 @@ doctor() {
   done
 
   say ""
+  say "UI:"
+  if [ -f "$UI_DIR/index.html" ]; then
+    say "  OK  $UI_DIR/index.html"
+  else
+    say "  --  $UI_DIR/index.html"
+  fi
+
+  say ""
   say "Tools:"
   for cmd in sh curl wget gzip gunzip unzip grep sed awk nano mcedit ipkg opkg apt-get iptables ip; do
     if has_cmd "$cmd"; then
@@ -849,7 +931,11 @@ doctor() {
   done
 
   say ""
-  say "Language: $GC_LANGUAGE"
+  if is_running; then
+    say "Mihomo: running, PID $(cat "$MIHOMO_PID_FILE")"
+  else
+    say "Mihomo: stopped"
+  fi
 }
 
 show_paths() {
@@ -864,14 +950,8 @@ show_paths() {
   say "MIHOMO_BIN    = $MIHOMO_BIN"
   say "UI_DIR        = $UI_DIR"
   say "LOG_FILE      = $MIHOMO_LOG_FILE"
+  say "PID_FILE      = $MIHOMO_PID_FILE"
   say "LANG_FILE     = $LANG_FILE"
-}
-
-quick_setup() {
-  init_files
-  generate_config
-  install_core
-  test_config
 }
 
 language_menu() {
@@ -943,12 +1023,13 @@ mihomo_menu() {
   while true; do
     header "$(msg mihomo)"
     say "1) $(msg install_core)"
-    say "2) $(msg test_config)"
-    say "3) $(msg start)"
-    say "4) $(msg stop)"
-    say "5) $(msg restart)"
-    say "6) $(msg status)"
-    say "7) $(msg logs)"
+    say "2) $(msg core_version)"
+    say "3) $(msg test_config)"
+    say "4) $(msg start)"
+    say "5) $(msg stop)"
+    say "6) $(msg restart)"
+    say "7) $(msg status)"
+    say "8) $(msg logs)"
     say "0) $(msg back)"
     say ""
     ask "$(msg choose)"
@@ -957,12 +1038,33 @@ mihomo_menu() {
 
     case "$choice" in
       1) install_core; pause ;;
-      2) test_config; pause ;;
-      3) start_core; pause ;;
-      4) stop_core; pause ;;
-      5) stop_core; start_core; pause ;;
-      6) status_core; pause ;;
-      7) logs_core; pause ;;
+      2) core_version; pause ;;
+      3) test_config; pause ;;
+      4) start_core; pause ;;
+      5) stop_core; pause ;;
+      6) restart_core; pause ;;
+      7) status_core; pause ;;
+      8) logs_core; pause ;;
+      0|q|Q) return ;;
+      *) say "$(msg unknown): $choice"; pause ;;
+    esac
+  done
+}
+
+zashboard_menu() {
+  while true; do
+    header "$(msg zashboard)"
+    say "1) $(msg install_ui)"
+    say "2) $(msg dashboard_url)"
+    say "0) $(msg back)"
+    say ""
+    ask "$(msg choose)"
+
+    IFS= read -r choice
+
+    case "$choice" in
+      1) install_ui; pause ;;
+      2) header "$(msg dashboard_url)"; dashboard_url; say "UI path: $UI_DIR"; pause ;;
       0|q|Q) return ;;
       *) say "$(msg unknown): $choice"; pause ;;
     esac
@@ -973,8 +1075,9 @@ tools_menu() {
   while true; do
     header "$(msg tools)"
     say "1) $(msg doctor)"
-    say "2) $(msg install_editor)"
-    say "3) $(msg paths)"
+    say "2) $(msg install_deps)"
+    say "3) $(msg install_editor)"
+    say "4) $(msg paths)"
     say "0) $(msg back)"
     say ""
     ask "$(msg choose)"
@@ -983,8 +1086,9 @@ tools_menu() {
 
     case "$choice" in
       1) doctor; pause ;;
-      2) install_editor; pause ;;
-      3) show_paths; pause ;;
+      2) install_deps; pause ;;
+      3) install_editor; pause ;;
+      4) show_paths; pause ;;
       0|q|Q) return ;;
       *) say "$(msg unknown): $choice"; pause ;;
     esac
@@ -997,7 +1101,7 @@ main_menu() {
     say "1) $(msg quick_setup)"
     say "2) $(msg configs)"
     say "3) $(msg mihomo)"
-    say "4) $(msg install_ui)"
+    say "4) $(msg zashboard)"
     say "5) $(msg tools)"
     say "6) $(msg language)"
     say "0) $(msg exit)"
@@ -1010,7 +1114,7 @@ main_menu() {
       1) quick_setup; pause ;;
       2) config_menu ;;
       3) mihomo_menu ;;
-      4) install_ui; pause ;;
+      4) zashboard_menu ;;
       5) tools_menu ;;
       6) language_menu ;;
       0|q|Q|exit) exit 0 ;;
@@ -1024,6 +1128,7 @@ show_help() {
   say ""
   say "Commands:"
   say "  goshacrash"
+  say "  goshacrash quick"
   say "  goshacrash init"
   say "  goshacrash edit-settings"
   say "  goshacrash edit-dns"
@@ -1031,14 +1136,18 @@ show_help() {
   say "  goshacrash gen-config"
   say "  goshacrash show-config"
   say "  goshacrash install-core"
+  say "  goshacrash core-version"
   say "  goshacrash install-ui"
+  say "  goshacrash dashboard"
   say "  goshacrash test"
   say "  goshacrash start"
   say "  goshacrash stop"
   say "  goshacrash restart"
   say "  goshacrash status"
   say "  goshacrash logs"
+  say "  goshacrash logs -f"
   say "  goshacrash doctor"
+  say "  goshacrash install-deps"
   say "  goshacrash install-editor"
   say "  goshacrash paths"
   say "  goshacrash lang"
@@ -1053,11 +1162,11 @@ case "$1" in
   ""|menu)
     main_menu
     ;;
-  init)
-    init_files
-    ;;
   quick)
     quick_setup
+    ;;
+  init)
+    init_files
     ;;
   edit-settings)
     open_editor "$ENV_FILE"
@@ -1074,11 +1183,19 @@ case "$1" in
   show-config)
     show_config
     ;;
-  install-core)
+  install-core|update-core)
     install_core
     ;;
-  install-ui)
+  core-version)
+    core_version
+    ;;
+  install-ui|update-ui)
     install_ui
+    ;;
+  dashboard)
+    header "$(msg dashboard_url)"
+    dashboard_url
+    say "UI path: $UI_DIR"
     ;;
   test)
     test_config
@@ -1090,17 +1207,19 @@ case "$1" in
     stop_core
     ;;
   restart)
-    stop_core
-    start_core
+    restart_core
     ;;
   status)
     status_core
     ;;
   logs)
-    logs_core
+    logs_core "$2"
     ;;
   doctor)
     doctor
+    ;;
+  install-deps)
+    install_deps
     ;;
   install-editor)
     install_editor
