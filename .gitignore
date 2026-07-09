@@ -20,7 +20,7 @@ backups/
 custom/env.conf
 custom/dns.yaml
 custom/config.yaml
-config.yaml
+/config.yaml
 *.yaml.bak
 *.yml.bak
 
