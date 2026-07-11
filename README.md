@@ -1,5 +1,9 @@
 # GoshaCrash
 
+## Принцип установки
+
+Установка и повторное обновление выполняются одной командой. Ручные `sed`, копирование бинарников и исправления непосредственно на роутере не требуются.
+
 Минимальный установщик Mihomo + Zashboard для ASUSWRT/Asuswrt-Merlin.
 
 ## Что хранится на GitHub
@@ -19,8 +23,7 @@ wget --no-check-certificate \
 ## Вставка личного конфига
 
 ```sh
-goshacrash edit
-goshacrash apply
+goshacrash setup
 ```
 
 `apply`:
@@ -63,3 +66,5 @@ goshacrash update
 ├── logs/
 └── goshacrash
 ```
+
+`goshacrash setup` открывает личный `config.yaml` в nano и автоматически выполняет проверку и применение после выхода из редактора.

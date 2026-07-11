@@ -6,7 +6,7 @@
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.28}"
-GOSHACRASH_VERSION="0.2.0"
+GOSHACRASH_VERSION="0.2.1"
 
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 ZASHBOARD_URL="https://codeload.github.com/Zephyruso/zashboard/tar.gz/refs/heads/gh-pages-no-fonts"
@@ -48,22 +48,73 @@ fetch() {
 
     rm -f "$output"
 
-    wget_bin="$(find_program wget 2>/dev/null)"
-    curl_bin="$(find_program curl 2>/dev/null)"
+    # Always prefer firmware utilities. Old Download Master /opt binaries
+    # can shadow them and may have broken TLS options or CA paths.
+    for wget_bin in \
+        /usr/bin/wget \
+        /bin/wget \
+        /usr/sbin/wget \
+        /sbin/wget
+    do
+        [ -x "$wget_bin" ] || continue
 
-    if [ -n "$wget_bin" ]; then
-        if "$wget_bin" --no-check-certificate -O "$output" "$url"; then
-            return 0
+        if "$wget_bin" --help 2>&1 | grep -q -- '--no-check-certificate'; then
+            "$wget_bin" --no-check-certificate -O "$output" "$url" &&
+                return 0
+        else
+            "$wget_bin" -O "$output" "$url" &&
+                return 0
         fi
+
+        rm -f "$output"
+    done
+
+    if [ -x /bin/busybox ]; then
+        if /bin/busybox wget --help 2>&1 | grep -q -- '--no-check-certificate'; then
+            /bin/busybox wget --no-check-certificate -O "$output" "$url" &&
+                return 0
+        else
+            /bin/busybox wget -O "$output" "$url" &&
+                return 0
+        fi
+
         rm -f "$output"
     fi
 
-    if [ -n "$curl_bin" ]; then
-        if "$curl_bin" -k -fL --connect-timeout 20 -o "$output" "$url"; then
-            return 0
+    # Last resort: optional userland tools.
+    for wget_bin in \
+        /opt/bin/wget \
+        "$USB_MOUNT/asusware.arm/bin/wget"
+    do
+        [ -x "$wget_bin" ] || continue
+
+        if "$wget_bin" --help 2>&1 | grep -q -- '--no-check-certificate'; then
+            "$wget_bin" --no-check-certificate -O "$output" "$url" &&
+                return 0
+        else
+            "$wget_bin" -O "$output" "$url" &&
+                return 0
         fi
+
         rm -f "$output"
-    fi
+    done
+
+    for curl_bin in \
+        /usr/bin/curl \
+        /bin/curl \
+        /opt/bin/curl \
+        "$USB_MOUNT/asusware.arm/bin/curl"
+    do
+        [ -x "$curl_bin" ] || continue
+
+        "$curl_bin" -k -fL \
+            --connect-timeout 20 \
+            --max-time 180 \
+            -o "$output" "$url" &&
+            return 0
+
+        rm -f "$output"
+    done
 
     return 1
 }
@@ -143,6 +194,14 @@ install_repository_files() {
 }
 
 install_mihomo() {
+    if [ "${FORCE_MIHOMO_UPDATE:-0}" != "1" ] &&
+       [ -x "$BIN_DIR/mihomo" ] &&
+       "$BIN_DIR/mihomo" -v >/dev/null 2>&1
+    then
+        say "Использую уже установленный рабочий Mihomo"
+        return 0
+    fi
+
     gzip_bin="$(find_program gzip 2>/dev/null)"
     [ -n "$gzip_bin" ] || fail "Не найден gzip"
 
@@ -249,11 +308,11 @@ install_optional_tools() {
 
     case "$package_manager" in
         *opkg)
-            "$package_manager" install nano wget-ssl unzip ca-certificates ||
+            "$package_manager" install nano unzip ca-certificates ||
                 warn "Часть дополнительных пакетов не установилась"
             ;;
         *ipkg)
-            "$package_manager" install nano wget unzip ||
+            "$package_manager" install nano unzip ||
                 warn "Часть дополнительных пакетов не установилась"
             ;;
     esac
@@ -291,7 +350,7 @@ STATE_DIR="$BASE/state"
 SOURCE_CONFIG="$BASE/config.yaml"
 TMP_DIR="$BASE/.install-tmp"
 
-PATH="/opt/bin:/opt/sbin:$USB_MOUNT/asusware.arm/bin:$USB_MOUNT/asusware.arm/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+PATH="/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin:/opt/sbin:$USB_MOUNT/asusware.arm/bin:$USB_MOUNT/asusware.arm/sbin"
 export PATH
 
 say "GoshaCrash ${GOSHACRASH_VERSION}"
