@@ -1,39 +1,5 @@
-# Runtime/user files
-.goshacrash/
-custom/
-bin/
-config/
-ui/
-logs/
-run/
-tmp/
-data/
-
-# Generated configs
-/config.yaml
-*.bak
-*.backup
-*.pid
-*.log
-*.tmp
-
-# Secrets
-.env
-*.env
-secret*
-token*
-*.key
-*.pem
-
-# Downloads
-*.gz
-*.zip
-*.tar
-*.tar.gz
-mihomo
-
-# Editor/OS
-.vscode/
-.DS_Store
-
 *:Zone.Identifier
+.DS_Store
+private/
+*.secret.yaml
+*.local.yaml

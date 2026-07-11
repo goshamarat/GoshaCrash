@@ -1,73 +1,379 @@
 #!/bin/sh
+# GoshaCrash controller for ASUSWRT / Asuswrt-Merlin.
+# User edits config.yaml. GoshaCrash creates runtime.yaml with router-only fixes.
+
+GOSHACRASH_VERSION="0.2.0"
+REPO="${REPO:-goshamarat/GoshaCrash}"
+BRANCH="${BRANCH:-main}"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
-[ -n "$SCRIPT_DIR" ] || {
-    echo "Не удалось определить каталог GoshaCrash" >&2
-    exit 1
-}
+BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
 
-BASE="$SCRIPT_DIR"
 BIN="$BASE/bin/mihomo"
-CONFIG="$BASE/config.yaml"
+SOURCE_CONFIG="$BASE/config.yaml"
+RUNTIME_CONFIG="$BASE/runtime.yaml"
+PREVIOUS_RUNTIME="$BASE/runtime.previous.yaml"
 PID_FILE="$BASE/run/mihomo.pid"
 LOG_FILE="$BASE/logs/mihomo.log"
-
+BACKUP_DIR="$BASE/backups"
+STATE_DIR="$BASE/state"
 USB_MOUNT="$(dirname "$BASE")"
+
+JFFS_BASE="/jffs/addons/goshacrash"
+JFFS_BASE_FILE="$JFFS_BASE/base"
+JFFS_DNS_MODE="$JFFS_BASE/dns.mode"
+
 PATH="/opt/bin:/opt/sbin:$USB_MOUNT/asusware.arm/bin:$USB_MOUNT/asusware.arm/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 
-get_pid() {
-    [ -f "$PID_FILE" ] || return 1
-    pid="$(cat "$PID_FILE" 2>/dev/null)"
-    [ -n "$pid" ] || return 1
-    kill -0 "$pid" 2>/dev/null || return 1
-    printf '%s\n' "$pid"
+say() {
+    printf '%s\n' "[GoshaCrash] $*"
 }
 
-check_config() {
-    [ -x "$BIN" ] || {
-        echo "Mihomo не найден: $BIN" >&2
+warn() {
+    printf '%s\n' "[GoshaCrash:WARN] $*" >&2
+}
+
+fail() {
+    printf '%s\n' "[GoshaCrash:ERROR] $*" >&2
+    return 1
+}
+
+find_program() {
+    program="$1"
+    old_ifs="$IFS"
+    IFS=:
+
+    for directory in $PATH; do
+        if [ -x "$directory/$program" ]; then
+            printf '%s\n' "$directory/$program"
+            IFS="$old_ifs"
+            return 0
+        fi
+    done
+
+    IFS="$old_ifs"
+    return 1
+}
+
+fetch() {
+    url="$1"
+    output="$2"
+
+    rm -f "$output"
+
+    wget_bin="$(find_program wget 2>/dev/null)"
+    curl_bin="$(find_program curl 2>/dev/null)"
+
+    if [ -n "$wget_bin" ]; then
+        if "$wget_bin" --no-check-certificate -O "$output" "$url"; then
+            return 0
+        fi
+        rm -f "$output"
+    fi
+
+    if [ -n "$curl_bin" ]; then
+        if "$curl_bin" -k -fL --connect-timeout 20 -o "$output" "$url"; then
+            return 0
+        fi
+        rm -f "$output"
+    fi
+
+    return 1
+}
+
+strip_quotes() {
+    sed "s/^[\"']//; s/[\"']$//"
+}
+
+yaml_section_value() {
+    file="$1"
+    section="$2"
+    key="$3"
+
+    awk -v section="$section" -v key="$key" '
+        $0 ~ "^" section ":[[:space:]]*($|#)" {
+            inside = 1
+            next
+        }
+
+        inside && $0 ~ "^[^[:space:]#]" {
+            exit
+        }
+
+        inside {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+
+            if (line ~ "^" key ":[[:space:]]*") {
+                sub("^" key ":[[:space:]]*", "", line)
+                sub(/[[:space:]]+#.*/, "", line)
+                print line
+                exit
+            }
+        }
+    ' "$file" | strip_quotes
+}
+
+yaml_top_value() {
+    file="$1"
+    key="$2"
+
+    sed -n \
+        "s/^[[:space:]]*${key}:[[:space:]]*[\"']\\{0,1\\}\\([^\"'#]*\\)[\"']\\{0,1\\}[[:space:]]*\\(#.*\\)\\{0,1\\}$/\\1/p" \
+        "$file" |
+        head -n 1 |
+        sed 's/[[:space:]]*$//'
+}
+
+is_true() {
+    case "$1" in
+        true|True|TRUE|yes|Yes|YES|1|on|On|ON)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+running_pid() {
+    if [ -f "$PID_FILE" ]; then
+        pid="$(cat "$PID_FILE" 2>/dev/null)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+    fi
+
+    if find_program pidof >/dev/null 2>&1; then
+        for pid in $(pidof mihomo 2>/dev/null); do
+            if kill -0 "$pid" 2>/dev/null; then
+                printf '%s\n' "$pid"
+                return 0
+            fi
+        done
+    fi
+
+    return 1
+}
+
+rotate_log() {
+    [ -f "$LOG_FILE" ] || return 0
+
+    size="$(wc -c < "$LOG_FILE" 2>/dev/null)"
+    [ -n "$size" ] || size=0
+
+    if [ "$size" -gt 2097152 ] 2>/dev/null; then
+        tail -n 500 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null || true
+        mv -f "$LOG_FILE.tmp" "$LOG_FILE" 2>/dev/null || true
+    fi
+}
+
+tun_enabled() {
+    value="$(yaml_section_value "$RUNTIME_CONFIG" tun enable)"
+    is_true "$value"
+}
+
+tun_device() {
+    yaml_section_value "$RUNTIME_CONFIG" tun device
+}
+
+ensure_tun_device() {
+    if [ -c /dev/net/tun ]; then
+        return 0
+    fi
+
+    modprobe tun 2>/dev/null || true
+
+    if [ -c /dev/net/tun ]; then
+        return 0
+    fi
+
+    mkdir -p /dev/net 2>/dev/null || true
+    mknod /dev/net/tun c 10 200 2>/dev/null || true
+    chmod 600 /dev/net/tun 2>/dev/null || true
+
+    [ -c /dev/net/tun ]
+}
+
+wait_for_tun_interface() {
+    tun_enabled || return 0
+
+    device="$(tun_device)"
+    [ -n "$device" ] || return 0
+
+    counter=0
+    while [ "$counter" -lt 12 ]; do
+        if [ -d "/sys/class/net/$device" ]; then
+            return 0
+        fi
+
+        ifconfig "$device" >/dev/null 2>&1 && return 0
+
+        sleep 1
+        counter=$((counter + 1))
+    done
+
+    return 1
+}
+
+detect_dns_mode() {
+    file="$1"
+
+    enabled="$(yaml_section_value "$file" dns enable)"
+    if ! is_true "$enabled"; then
+        printf '%s\n' none
+        return 0
+    fi
+
+    listen="$(yaml_section_value "$file" dns listen)"
+    [ -n "$listen" ] || {
+        printf '%s\n' none
+        return 0
+    }
+
+    port="${listen##*:}"
+    port="$(printf '%s' "$port" | sed 's/[^0-9].*$//')"
+
+    case "$port" in
+        53)
+            printf '%s\n' exclusive53
+            ;;
+        '')
+            printf '%s\n' none
+            ;;
+        *)
+            printf '%s\n' "forward:$port"
+            ;;
+    esac
+}
+
+system_dns_is_local() {
+    grep -Eq '^[[:space:]]*nameserver[[:space:]]+(127\.0\.0\.1|0\.0\.0\.0|::1)([[:space:]]|$)' \
+        /etc/resolv.conf 2>/dev/null
+}
+
+render_runtime_to() {
+    output="$1"
+    [ -f "$SOURCE_CONFIG" ] || fail "Не найден $SOURCE_CONFIG" || return 1
+
+    cp "$SOURCE_CONFIG" "$output" ||
+        fail "Не удалось создать runtime-конфиг" || return 1
+
+    # Dashboard must be reachable from another LAN device.
+    sed -i \
+        -e 's/^[[:space:]]*external-controller:[[:space:]]*127\.0\.0\.1:/external-controller: 0.0.0.0:/' \
+        -e 's/^[[:space:]]*external-controller:[[:space:]]*localhost:/external-controller: 0.0.0.0:/' \
+        "$output"
+
+    if ! grep -q '^[[:space:]]*external-controller:' "$output"; then
+        printf '\nexternal-controller: 0.0.0.0:9090\n' >> "$output"
+    fi
+
+    if ! grep -q '^[[:space:]]*external-ui:' "$output"; then
+        printf 'external-ui: ui\n' >> "$output"
+    fi
+
+    # Removed by recent Mihomo. Keep the private source untouched.
+    sed -i '/^[[:space:]]*global-client-fingerprint:/d' "$output"
+
+    # Keep exactly the GEO rules and URLs supplied by the user,
+    # but disable periodic updates of the large GeoIP/GeoSite databases.
+    if grep -q '^[[:space:]]*geo-auto-update:' "$output"; then
+        sed -i \
+            's/^[[:space:]]*geo-auto-update:.*/geo-auto-update: false/' \
+            "$output"
+    else
+        printf '\ngeo-auto-update: false\n' >> "$output"
+    fi
+
+    # If ASUS resolves "system" back to localhost while Mihomo owns port 53,
+    # avoid a DNS loop in runtime.yaml only.
+    dns_mode="$(detect_dns_mode "$output")"
+    if [ "$dns_mode" = exclusive53 ] && system_dns_is_local; then
+        sed -i \
+            -e 's/:[[:space:]]*system[[:space:]]*$/:\ 9.9.9.9/' \
+            -e 's/^[[:space:]]*-[[:space:]]*system[[:space:]]*$/    - 9.9.9.9/' \
+            "$output"
+    fi
+}
+
+check_file() {
+    file="$1"
+
+    [ -x "$BIN" ] || fail "Mihomo не найден: $BIN" || return 1
+    [ -f "$file" ] || fail "Конфиг не найден: $file" || return 1
+
+    "$BIN" -t -d "$BASE" -f "$file"
+}
+
+check_source() {
+    temp="$BASE/runtime.check.yaml"
+    rm -f "$temp"
+
+    render_runtime_to "$temp" || {
+        rm -f "$temp"
         return 1
     }
 
-    [ -f "$CONFIG" ] || {
-        echo "Конфиг не найден: $CONFIG" >&2
-        return 1
-    }
+    check_file "$temp"
+    result=$?
+    rm -f "$temp"
+    return "$result"
+}
 
-    "$BIN" -t -d "$BASE" -f "$CONFIG"
+check_runtime() {
+    check_file "$RUNTIME_CONFIG"
 }
 
 start_mihomo() {
-    if pid="$(get_pid)"; then
+    if pid="$(running_pid)"; then
         echo "Mihomo уже запущен, PID=$pid"
         return 0
     fi
 
+    [ -f "$RUNTIME_CONFIG" ] ||
+        fail "Сначала выполни: goshacrash apply" ||
+        return 1
+
+    if tun_enabled && ! ensure_tun_device; then
+        fail "В системе нет рабочего /dev/net/tun"
+        return 1
+    fi
+
+    check_runtime || return 1
+
     mkdir -p "$BASE/run" "$BASE/logs"
+    rotate_log
     rm -f "$PID_FILE"
 
-    check_config || return 1
-
-    "$BIN" -d "$BASE" -f "$CONFIG" >> "$LOG_FILE" 2>&1 &
+    "$BIN" -d "$BASE" -f "$RUNTIME_CONFIG" >> "$LOG_FILE" 2>&1 &
     pid=$!
     printf '%s\n' "$pid" > "$PID_FILE"
 
     sleep 2
 
-    if running_pid="$(get_pid)"; then
-        echo "Mihomo запущен, PID=$running_pid"
-        return 0
+    if ! running_pid >/dev/null 2>&1; then
+        echo "Mihomo завершился при запуске" >&2
+        rm -f "$PID_FILE"
+        tail -n 60 "$LOG_FILE" 2>/dev/null
+        return 1
     fi
 
-    echo "Mihomo завершился при запуске" >&2
-    rm -f "$PID_FILE"
-    tail -n 40 "$LOG_FILE" 2>/dev/null
-    return 1
+    if ! wait_for_tun_interface; then
+        warn "Mihomo запущен, но TUN-интерфейс не появился"
+        stop_mihomo >/dev/null 2>&1 || true
+        tail -n 80 "$LOG_FILE" 2>/dev/null
+        return 1
+    fi
+
+    pid="$(running_pid)"
+    echo "Mihomo запущен, PID=$pid"
 }
 
 stop_mihomo() {
-    if pid="$(get_pid)"; then
+    if pid="$(running_pid)"; then
         kill "$pid" 2>/dev/null || true
 
         counter=0
@@ -89,78 +395,538 @@ stop_mihomo() {
     echo "Mihomo не запущен"
 }
 
-edit_config() {
-    for editor in /opt/bin/nano "$USB_MOUNT/asusware.arm/bin/nano" /usr/bin/nano /bin/nano; do
-        if [ -x "$editor" ]; then
-            exec "$editor" "$CONFIG"
-        fi
-    done
+restart_dnsmasq() {
+    if service restart_dnsmasq >/dev/null 2>&1; then
+        return 0
+    fi
 
-    echo "nano не найден, открываю vi"
-    exec vi "$CONFIG"
+    if rc_service restart_dnsmasq >/dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+write_dns_mode() {
+    mode="$1"
+
+    mkdir -p "$JFFS_BASE" || return 1
+    printf '%s\n' "$mode" > "$JFFS_DNS_MODE"
+}
+
+read_dns_mode() {
+    if [ -f "$JFFS_DNS_MODE" ]; then
+        cat "$JFFS_DNS_MODE"
+    else
+        printf '%s\n' none
+    fi
+}
+
+backup_source() {
+    mkdir -p "$BACKUP_DIR" || return 1
+
+    stamp="$(date '+%Y%m%d-%H%M%S' 2>/dev/null)"
+    [ -n "$stamp" ] || stamp="$(date +%s 2>/dev/null)"
+    [ -n "$stamp" ] || stamp="backup"
+
+    target="$BACKUP_DIR/config-$stamp.yaml"
+    cp "$SOURCE_CONFIG" "$target" || return 1
+
+    echo "$target"
+}
+
+apply_config() {
+    [ -f "$SOURCE_CONFIG" ] ||
+        fail "Не найден личный config.yaml" ||
+        return 1
+
+    mkdir -p "$BACKUP_DIR" "$STATE_DIR" "$BASE/run" "$BASE/logs"
+
+    backup="$(backup_source)" ||
+        fail "Не удалось создать резервную копию config.yaml" ||
+        return 1
+
+    say "Резервная копия: $backup"
+
+    candidate="$BASE/runtime.candidate.yaml"
+    rm -f "$candidate"
+
+    render_runtime_to "$candidate" || {
+        rm -f "$candidate"
+        return 1
+    }
+
+    say "Проверяю подготовленный runtime.yaml"
+    if ! check_file "$candidate"; then
+        rm -f "$candidate"
+        fail "Исходный config.yaml не применён"
+        return 1
+    fi
+
+    new_dns_mode="$(detect_dns_mode "$candidate")"
+    old_dns_mode="$(read_dns_mode)"
+
+    if [ -f "$RUNTIME_CONFIG" ]; then
+        cp "$RUNTIME_CONFIG" "$PREVIOUS_RUNTIME" 2>/dev/null || true
+    else
+        rm -f "$PREVIOUS_RUNTIME"
+    fi
+
+    stop_mihomo >/dev/null 2>&1 || true
+
+    mv -f "$candidate" "$RUNTIME_CONFIG" ||
+        fail "Не удалось установить runtime.yaml" ||
+        return 1
+
+    write_dns_mode "$new_dns_mode" ||
+        fail "Не удалось сохранить режим DNS" ||
+        return 1
+
+    install_hooks || return 1
+
+    if [ "$new_dns_mode" = exclusive53 ]; then
+        say "Освобождаю порт 53 у dnsmasq, DHCP останется включён"
+        if ! restart_dnsmasq; then
+            rollback_apply "$old_dns_mode"
+            fail "Не удалось перезапустить dnsmasq"
+            return 1
+        fi
+    fi
+
+    say "Запускаю Mihomo"
+    if ! start_mihomo; then
+        rollback_apply "$old_dns_mode"
+        fail "Новый конфиг не запустился, выполнен откат"
+        return 1
+    fi
+
+    if [ "$new_dns_mode" != exclusive53 ]; then
+        if ! restart_dnsmasq; then
+            warn "Mihomo запущен, но dnsmasq не удалось перезапустить"
+        fi
+    fi
+
+    say "Конфиг применён"
+    status_mihomo
+}
+
+rollback_apply() {
+    old_dns_mode="$1"
+
+    stop_mihomo >/dev/null 2>&1 || true
+
+    if [ -f "$PREVIOUS_RUNTIME" ]; then
+        cp "$PREVIOUS_RUNTIME" "$RUNTIME_CONFIG" 2>/dev/null || true
+    else
+        rm -f "$RUNTIME_CONFIG"
+    fi
+
+    write_dns_mode "$old_dns_mode" 2>/dev/null || true
+    restart_dnsmasq >/dev/null 2>&1 || true
+
+    if [ -f "$RUNTIME_CONFIG" ]; then
+        start_mihomo >/dev/null 2>&1 || true
+    fi
+}
+
+status_mihomo() {
+    if pid="$(running_pid)"; then
+        echo "Mihomo: работает, PID=$pid"
+    else
+        echo "Mihomo: остановлен"
+    fi
+
+    echo "GoshaCrash: $GOSHACRASH_VERSION"
+    echo "Личный конфиг: $SOURCE_CONFIG"
+    echo "Runtime-конфиг: $RUNTIME_CONFIG"
+    echo "DNS-режим: $(read_dns_mode)"
+
+    if [ -f "$RUNTIME_CONFIG" ] && tun_enabled; then
+        device="$(tun_device)"
+        [ -n "$device" ] || device="не указан"
+
+        if [ -d "/sys/class/net/$device" ] || ifconfig "$device" >/dev/null 2>&1; then
+            echo "TUN: работает ($device)"
+        else
+            echo "TUN: включён в конфиге, интерфейс $device не найден"
+        fi
+    else
+        echo "TUN: выключен"
+    fi
+
+    show_ui
 }
 
 show_ui() {
     lan_ip="$(nvram get lan_ipaddr 2>/dev/null)"
-    [ -n "$lan_ip" ] || lan_ip="127.0.0.1"
-    secret="$(sed -n 's/^[[:space:]]*secret:[[:space:]]*["'"']\{0,1\}\([^"'"']*\)["'"']\{0,1\}[[:space:]]*$/\1/p' "$CONFIG" | head -n 1)"
+    [ -n "$lan_ip" ] || lan_ip="IP_РОУТЕРА"
 
-    echo "Zashboard: http://$lan_ip:9090/ui/"
+    controller="$(yaml_top_value "$RUNTIME_CONFIG" external-controller)"
+    port="${controller##*:}"
+
+    case "$port" in
+        ''|*[!0-9]*)
+            port=9090
+            ;;
+    esac
+
+    secret="$(yaml_top_value "$RUNTIME_CONFIG" secret)"
+
+    echo "Zashboard: http://$lan_ip:$port/ui/"
     [ -n "$secret" ] && echo "API secret: $secret"
+}
+
+edit_source() {
+    for editor in \
+        /opt/bin/nano \
+        "$USB_MOUNT/asusware.arm/bin/nano" \
+        /usr/bin/nano \
+        /bin/nano
+    do
+        if [ -x "$editor" ]; then
+            exec "$editor" "$SOURCE_CONFIG"
+        fi
+    done
+
+    echo "nano не найден, открываю vi"
+    exec vi "$SOURCE_CONFIG"
+}
+
+ensure_hook() {
+    target="$1"
+    command_line="$2"
+    marker="$3"
+    temp="$target.goshacrash.tmp"
+
+    mkdir -p /jffs/scripts || return 1
+
+    if [ ! -f "$target" ]; then
+        printf '%s\n' '#!/bin/sh' > "$target" || return 1
+    fi
+
+    grep -v "$marker" "$target" > "$temp" 2>/dev/null || true
+    printf '%s\n' "$command_line # $marker" >> "$temp" || return 1
+    mv -f "$temp" "$target" || return 1
+    chmod 755 "$target" || return 1
+}
+
+install_hooks() {
+    mkdir -p "$JFFS_BASE" /jffs/scripts || {
+        fail "Не удалось создать JFFS-каталоги"
+        return 1
+    }
+
+    printf '%s\n' "$BASE" > "$JFFS_BASE_FILE" || return 1
+
+    if [ ! -f "$JFFS_DNS_MODE" ]; then
+        printf '%s\n' none > "$JFFS_DNS_MODE"
+    fi
+
+    cat > "$JFFS_BASE/hook.sh" <<'HOOK'
+#!/bin/sh
+
+BASE_FILE="/jffs/addons/goshacrash/base"
+[ -f "$BASE_FILE" ] || exit 0
+
+BASE="$(cat "$BASE_FILE" 2>/dev/null)"
+CTL="$BASE/goshacrash"
+ACTION="$1"
+ARGUMENT="$2"
+
+case "$ACTION" in
+    post-mount)
+        [ "$ARGUMENT" = "$(dirname "$BASE")" ] || exit 0
+        sleep 2
+        [ -x "$CTL" ] && "$CTL" boot
+        ;;
+
+    services-start)
+        counter=0
+        while [ ! -x "$CTL" ] && [ "$counter" -lt 60 ]; do
+            sleep 2
+            counter=$((counter + 1))
+        done
+        [ -x "$CTL" ] && "$CTL" boot
+        ;;
+
+    firewall-start)
+        sleep 5
+        [ -x "$CTL" ] && "$CTL" firewall-reload
+        ;;
+
+    dnsmasq-postconf)
+        [ -x "$CTL" ] && "$CTL" dnsmasq-postconf "$ARGUMENT"
+        ;;
+esac
+
+exit 0
+HOOK
+
+    chmod 755 "$JFFS_BASE/hook.sh" || return 1
+
+    ensure_hook \
+        /jffs/scripts/post-mount \
+        '/jffs/addons/goshacrash/hook.sh post-mount "$1" &' \
+        'GOSHACRASH_POST_MOUNT' ||
+        return 1
+
+    ensure_hook \
+        /jffs/scripts/services-start \
+        '/jffs/addons/goshacrash/hook.sh services-start &' \
+        'GOSHACRASH_SERVICES_START' ||
+        return 1
+
+    ensure_hook \
+        /jffs/scripts/firewall-start \
+        '/jffs/addons/goshacrash/hook.sh firewall-start &' \
+        'GOSHACRASH_FIREWALL_START' ||
+        return 1
+
+    ensure_hook \
+        /jffs/scripts/dnsmasq.postconf \
+        '/jffs/addons/goshacrash/hook.sh dnsmasq-postconf "$1"' \
+        'GOSHACRASH_DNSMASQ_POSTCONF' ||
+        return 1
+
+    nvram set jffs2_scripts=1 >/dev/null 2>&1 || true
+    nvram commit >/dev/null 2>&1 || true
+
+    echo "JFFS-хуки установлены"
+}
+
+dnsmasq_postconf() {
+    config_file="$1"
+    [ -n "$config_file" ] || exit 0
+    [ -f "$config_file" ] || exit 0
+
+    mode="$(read_dns_mode)"
+
+    case "$mode" in
+        exclusive53)
+            sed -i '/^[[:space:]]*port=/d' "$config_file"
+            printf '%s\n' 'port=0' >> "$config_file"
+            ;;
+
+        forward:*)
+            port="${mode#forward:}"
+            printf '%s\n' 'no-resolv' >> "$config_file"
+            printf '%s\n' "server=127.0.0.1#$port" >> "$config_file"
+            ;;
+
+        *)
+            ;;
+    esac
+
+    exit 0
+}
+
+boot_service() {
+    counter=0
+    while [ ! -x "$BIN" ] && [ "$counter" -lt 30 ]; do
+        sleep 2
+        counter=$((counter + 1))
+    done
+
+    [ -x "$BIN" ] || return 1
+    [ -f "$RUNTIME_CONFIG" ] || return 0
+
+    start_mihomo
+}
+
+firewall_reload() {
+    if running_pid >/dev/null 2>&1; then
+        say "Firewall перезапущен, пересоздаю правила Mihomo"
+        stop_mihomo >/dev/null 2>&1 || true
+        start_mihomo
+    fi
+}
+
+doctor() {
+    echo "=== GoshaCrash doctor ==="
+    echo "BASE=$BASE"
+    echo "USB=$USB_MOUNT"
+    echo "ARCH=$(uname -m 2>/dev/null)"
+    echo
+
+    [ -x "$BIN" ] && "$BIN" -v || echo "Mihomo: не найден"
+    [ -c /dev/net/tun ] && echo "/dev/net/tun: OK" || echo "/dev/net/tun: NOT FOUND"
+
+    echo
+    if [ -f "$SOURCE_CONFIG" ]; then
+        echo "config.yaml: найден"
+        check_source || true
+    else
+        echo "config.yaml: не найден"
+    fi
+
+    echo
+    status_mihomo
+
+    echo
+    echo "Слушающие порты:"
+    netstat -lnp 2>/dev/null |
+        grep -E '(:53[[:space:]]|:9090[[:space:]]|:7892[[:space:]])' ||
+        echo "Нужные порты не найдены в netstat"
+
+    echo
+    echo "Последние строки журнала:"
+    tail -n 30 "$LOG_FILE" 2>/dev/null || echo "Журнал пуст"
+}
+
+restore_source() {
+    requested="$1"
+
+    if [ -n "$requested" ]; then
+        source_file="$requested"
+    else
+        source_file="$(ls -1t "$BACKUP_DIR"/config-*.yaml 2>/dev/null | head -n 1)"
+    fi
+
+    [ -n "$source_file" ] && [ -f "$source_file" ] || {
+        fail "Резервная копия не найдена"
+        return 1
+    }
+
+    cp "$source_file" "$SOURCE_CONFIG" || return 1
+    echo "Восстановлено: $source_file"
+    echo "Для применения выполни: goshacrash apply"
+}
+
+update_goshacrash() {
+    installer="/tmp/goshacrash-install.sh"
+    url="https://raw.githubusercontent.com/${REPO}/${BRANCH}/install.sh?$(date +%s 2>/dev/null)"
+
+    fetch "$url" "$installer" ||
+        fail "Не удалось скачать install.sh" ||
+        return 1
+
+    sh "$installer"
+}
+
+geo_status() {
+    echo "GEO-настройки runtime.yaml:"
+    grep -E \
+        '^[[:space:]]*(geo-auto-update|geodata-mode|geo-update-interval|geox-url:|mmdb:|geoip:|geosite:)|^[[:space:]]*-[[:space:]]*(GEOIP|GEOSITE),' \
+        "$RUNTIME_CONFIG" 2>/dev/null ||
+        echo "GEO-настройки не найдены"
+
+    echo
+    echo "GEO-файлы:"
+    for file in \
+        "$BASE/geoip.dat" \
+        "$BASE/geosite.dat" \
+        "$BASE/Country.mmdb" \
+        "$BASE/country.mmdb" \
+        "$BASE/GeoLite2-ASN.mmdb"
+    do
+        [ -f "$file" ] && ls -lh "$file"
+    done
 }
 
 case "${1:-}" in
     start)
         start_mihomo
         ;;
+
     stop)
         stop_mihomo
         ;;
+
     restart|reload)
         stop_mihomo
         start_mihomo
         ;;
+
     status)
-        if pid="$(get_pid)"; then
-            echo "Mihomo работает, PID=$pid"
-        else
-            echo "Mihomo остановлен"
-            exit 1
-        fi
+        status_mihomo
         ;;
+
     check)
-        check_config
+        check_source
         ;;
+
+    apply)
+        apply_config
+        ;;
+
+    render)
+        render_runtime_to "$RUNTIME_CONFIG"
+        echo "Создан: $RUNTIME_CONFIG"
+        ;;
+
     edit)
-        edit_config
+        edit_source
         ;;
+
     logs)
-        lines="${2:-80}"
-        tail -n "$lines" "$LOG_FILE" 2>/dev/null || echo "Лог пока пуст"
+        lines="${2:-100}"
+        tail -n "$lines" "$LOG_FILE" 2>/dev/null ||
+            echo "Журнал пока пуст"
         ;;
+
     version)
+        echo "GoshaCrash $GOSHACRASH_VERSION"
         "$BIN" -v
         ;;
+
     ui)
         show_ui
         ;;
+
+    doctor)
+        doctor
+        ;;
+
+    backup)
+        backup_source
+        ;;
+
+    restore)
+        restore_source "${2:-}"
+        ;;
+
+    install-hooks)
+        install_hooks
+        ;;
+
+    dnsmasq-postconf)
+        dnsmasq_postconf "${2:-}"
+        ;;
+
+    boot)
+        boot_service
+        ;;
+
+    firewall-reload)
+        firewall_reload
+        ;;
+
+    update)
+        update_goshacrash
+        ;;
+
+    geo-status)
+        geo_status
+        ;;
+
     *)
-        cat <<EOF
-GoshaCrash — управление Mihomo
-
-Использование: $0 COMMAND
-
-Команды:
-  start       запустить Mihomo
-  stop        остановить Mihomo
-  restart     перезапустить Mihomo
-  reload      проверить конфиг и перезапустить
-  status      показать состояние
-  check       проверить config.yaml
-  edit        открыть config.yaml
-  logs [N]    показать последние N строк лога
-  version     показать версию Mihomo
-  ui          показать адрес Zashboard
+        cat <<'EOF'
+Использование:
+  goshacrash edit              вставить/изменить личный config.yaml
+  goshacrash check             проверить личный конфиг
+  goshacrash apply             безопасно применить конфиг к ASUS
+  goshacrash status            состояние Mihomo, DNS и TUN
+  goshacrash doctor            полная диагностика
+  goshacrash start
+  goshacrash stop
+  goshacrash restart
+  goshacrash logs [строки]
+  goshacrash ui
+  goshacrash version
+  goshacrash backup
+  goshacrash restore [файл]
+  goshacrash geo-status
+  goshacrash update
 EOF
         ;;
 esac

@@ -1,14 +1,9 @@
-# Единственный пользовательский конфиг GoshaCrash.
-# Установщик не перезаписывает этот файл при повторном запуске.
-
-# Добавь серверы сюда и управляй выбранным сервером через Zashboard.
-# proxies:
-#   - name: "My proxy"
-#     type: hysteria2
-#     server: example.com
-#     port: 443
-#     password: "change-me"
-#     skip-cert-verify: false
+# Безопасный публичный шаблон.
+# Настоящий личный config.yaml с серверами и паролями хранится только на роутере.
+#
+# После установки:
+#   goshacrash edit
+#   goshacrash apply
 
 mixed-port: 7892
 allow-lan: true
@@ -16,158 +11,32 @@ bind-address: "*"
 mode: rule
 log-level: info
 ipv6: false
-unified-delay: false
-tcp-concurrent: true
-global-client-fingerprint: chrome
 
-# Zashboard / Mihomo REST API
 external-controller: 0.0.0.0:9090
 secret: "3665"
 external-ui: ui
-external-ui-url: "https://github.com/Zephyruso/zashboard/archive/refs/heads/gh-pages-no-fonts.zip"
 
 profile:
   store-selected: true
   store-fake-ip: true
 
-# Не загружаем GeoIP/GeoSite базы Mihomo.
-# В правилах ниже не должно быть GEOIP и GEOSITE.
+# GoshaCrash также принудительно ставит false в runtime.yaml,
+# не меняя личный config.yaml.
 geo-auto-update: false
 
-# На первом запуске DNS работает на отдельном порту и не конфликтует с dnsmasq ASUS.
 dns:
-  enable: true
-  listen: 127.0.0.1:1053
-  ipv6: false
-  prefer-h3: false
-  use-hosts: false
-  use-system-hosts: false
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  fake-ip-filter-mode: blacklist
-  fake-ip-filter:
-    - "+.lan"
-    - "+.local"
-    - "+.arpa"
-    - localhost
-    - "+.ntp.org"
-    - time.nist.gov
-    - time.windows.com
-    - "+.msftncsi.com"
-    - "+.msftconnecttest.com"
-  default-nameserver:
-    - 9.9.9.9
-    - 1.1.1.1
-  nameserver:
-    - tls://common.dot.dns.yandex.net
-  direct-nameserver:
-    - system
+  enable: false
 
-sniffer:
-  enable: true
-  sniff:
-    HTTP:
-      ports: [80, 8080-8880]
-      override-destination: true
-    TLS:
-      ports: [443, 8443]
-    QUIC:
-      ports: [443, 8443]
-  skip-domain:
-    - "Mijia Cloud"
-    - "+.push.apple.com"
-
-# Сначала проверяем Mihomo и Zashboard без перехвата трафика.
-# После проверки на ASUS включим TUN и добавим запуск через firewall-start.
 tun:
   enable: false
-  stack: system
-  device: tun
-  dns-hijack:
-    - any:53
-    - tcp://any:53
-  auto-route: false
-  auto-redirect: false
-  auto-detect-interface: true
+
+proxies: []
 
 proxy-groups:
-  - name: RU-PROXY
-    type: select
-    proxies:
-      - DIRECT
-    include-all: true
-
   - name: GLOBAL-PROXY
     type: select
     proxies:
       - DIRECT
-    include-all: true
-
-# Это пользовательские компактные правила .mrs, а не GeoIP/GeoSite базы Mihomo.
-rule-providers:
-  domain_ru:
-    type: http
-    behavior: domain
-    url: "https://firebasestorage.googleapis.com/v0/b/subscriptions-tm.firebasestorage.app/o/files%2FRules%2Fruleset_domain_ru.mrs?alt=media"
-    path: ./rulesets/ruleset_domain_ru.mrs
-    interval: 86400
-    format: mrs
-    proxy: DIRECT
-
-  ipcidr_ru:
-    type: http
-    behavior: ipcidr
-    url: "https://firebasestorage.googleapis.com/v0/b/subscriptions-tm.firebasestorage.app/o/files%2FRules%2Fruleset_ipcidr_ru.mrs?alt=media"
-    path: ./rulesets/ruleset_ipcidr_ru.mrs
-    interval: 86400
-    format: mrs
-    proxy: DIRECT
-
-  domain_global:
-    type: http
-    behavior: domain
-    url: "https://firebasestorage.googleapis.com/v0/b/subscriptions-tm.firebasestorage.app/o/files%2FRules%2Fruleset_domain_global.mrs?alt=media"
-    path: ./rulesets/ruleset_domain_global.mrs
-    interval: 86400
-    format: mrs
-    proxy: DIRECT
-
-  ipcidr_global:
-    type: http
-    behavior: ipcidr
-    url: "https://firebasestorage.googleapis.com/v0/b/subscriptions-tm.firebasestorage.app/o/files%2FRules%2Fruleset_ipcidr_global.mrs?alt=media"
-    path: ./rulesets/ruleset_ipcidr_global.mrs
-    interval: 86400
-    format: mrs
-    proxy: DIRECT
 
 rules:
-  # Локальные и служебные сети без GEOIP,private.
-  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
-  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
-  - IP-CIDR,172.16.0.0/12,DIRECT,no-resolve
-  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve
-  - IP-CIDR,169.254.0.0/16,DIRECT,no-resolve
-  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
-  - IP-CIDR,198.18.0.0/16,DIRECT,no-resolve
-  - IP-CIDR,224.0.0.0/4,DIRECT,no-resolve
-
-  # Пример отдельных доменных правил.
-  - DOMAIN-SUFFIX,bard.google.com,GLOBAL-PROXY
-  - DOMAIN-SUFFIX,gemini.google.com,GLOBAL-PROXY
-  - DOMAIN-SUFFIX,generativelanguage.googleapis.com,GLOBAL-PROXY
-  - DOMAIN-SUFFIX,ai.google.dev,GLOBAL-PROXY
-  - DOMAIN-SUFFIX,aistudio.google.com,GLOBAL-PROXY
-
-  - DOMAIN-SUFFIX,sync.com,GLOBAL-PROXY
-  - DOMAIN-SUFFIX,gmx.com,GLOBAL-PROXY
-  - DOMAIN-SUFFIX,gmx.de,GLOBAL-PROXY
-  - DOMAIN-SUFFIX,gmx.net,GLOBAL-PROXY
-
-  # Основные пользовательские наборы правил.
-  - RULE-SET,domain_ru,RU-PROXY
-  - RULE-SET,ipcidr_ru,RU-PROXY
-  - RULE-SET,domain_global,GLOBAL-PROXY
-  - RULE-SET,ipcidr_global,GLOBAL-PROXY
-
   - MATCH,DIRECT
