@@ -255,6 +255,36 @@ install_optional_tools
 
 rm -rf "$TMP_DIR"
 
+say "Настраиваю политику GEO"
+
+GEO_CONFIG="$BASE/config.yaml"
+
+if grep -q '^[[:space:]]*geo-auto-update:' "$GEO_CONFIG"; then
+    sed -i \
+        's/^[[:space:]]*geo-auto-update:.*/geo-auto-update: false/' \
+        "$GEO_CONFIG"
+else
+    printf '\ngeo-auto-update: false\n' >> "$GEO_CONFIG"
+fi
+
+if grep -Eq \
+    '^[[:space:]]*-[[:space:]]*(GEOIP|GEOSITE|SRC-GEOIP|SRC-GEOSITE|IP-ASN|SRC-IP-ASN),' \
+    "$GEO_CONFIG"
+then
+    say "В конфиге используются GEOIP/GEOSITE"
+    say "GEO-файлы пока не удаляются, иначе эти правила перестанут работать"
+else
+    say "GEO-правила не найдены, удаляю ненужные базы"
+
+    rm -f \
+        "$BASE/geoip.dat" \
+        "$BASE/geosite.dat" \
+        "$BASE/Country.mmdb" \
+        "$BASE/country.mmdb" \
+        "$BASE/GeoLite2-ASN.mmdb" \
+        "$BASE/geoip.metadb"
+fi
+
 say "Проверяю конфигурацию"
 "$BASE/goshacrash" check || fail "config.yaml не прошёл проверку Mihomo"
 
