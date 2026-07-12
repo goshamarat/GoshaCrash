@@ -2,7 +2,7 @@
 # GoshaCrash controller for ASUSWRT / Asuswrt-Merlin.
 # User edits config.yaml. GoshaCrash creates runtime.yaml with router-only fixes.
 
-GOSHACRASH_VERSION="0.3.2-dns-forward"
+GOSHACRASH_VERSION="0.3.3-dns-forward"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
