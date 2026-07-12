@@ -1,16 +1,26 @@
-# GoshaCrash 0.3.1 DNS stable
+# GoshaCrash 0.3.2 DNS forward
 
-Версия для ASUSWRT / Asuswrt-Merlin, в которой DNS Mihomo работает непосредственно на порту `53`.
+Версия для ASUSWRT / Asuswrt-Merlin с правильной DNS-схемой для роутера.
 
 ## Как работает DNS
 
-- `dnsmasq` остаётся запущенным и продолжает выдавать DHCP.
-- GoshaCrash добавляет управляемый блок `port=0` в `/jffs/configs/dnsmasq.conf.add`.
-- DNS-функция `dnsmasq` отключается, после чего порт `53` занимает Mihomo.
-- При остановке Mihomo или ошибке запуска GoshaCrash удаляет свой блок и возвращает штатный DNS ASUS.
-- Личный `config.yaml` не переписывается: изменения делаются только в `runtime.yaml`.
+```text
+клиенты LAN -> dnsmasq ASUS:53 -> Mihomo DNS 127.0.0.1:1053 -> внешние DNS
+```
 
-## Установка из GitHub
+- Штатный `dnsmasq` остаётся на порту `53`.
+- DHCP и локальные имена ASUS продолжают работать.
+- Mihomo DNS слушает только `127.0.0.1:1053`.
+- GoshaCrash добавляет в `dnsmasq`:
+  - `no-resolv`
+  - `server=127.0.0.1#1053`
+- Сначала запускается Mihomo и проверяется порт `1053`.
+- Только после успешного запуска `dnsmasq` переключается на Mihomo.
+- При остановке или ошибке GoshaCrash удаляет свой блок и возвращает штатные DNS ASUS.
+- Личный `config.yaml` не изменяется. Даже если там указано `0.0.0.0:53`, в `runtime.yaml` будет `127.0.0.1:1053`.
+- Значения `system` внутри DNS-раздела заменяются только в `runtime.yaml`, чтобы не создать цикл `Mihomo -> dnsmasq -> Mihomo`.
+
+## Обновление с GitHub
 
 ```sh
 wget --no-check-certificate -O /tmp/goshacrash-install.sh \
@@ -18,9 +28,9 @@ wget --no-check-certificate -O /tmp/goshacrash-install.sh \
 sh /tmp/goshacrash-install.sh
 ```
 
-Если GoshaCrash уже установлен, тот же установщик обновит управляющий скрипт и сохранит личный `config.yaml`.
+Личный `config.yaml` сохраняется.
 
-## Применение конфига
+## Применение
 
 ```sh
 /tmp/mnt/GOSHACRASH/goshacrash/goshacrash apply
@@ -32,30 +42,24 @@ sh /tmp/goshacrash-install.sh
 /tmp/mnt/GOSHACRASH/goshacrash/goshacrash doctor
 ```
 
-На порту `53` должен отображаться процесс `mihomo`, а в `/jffs/configs/dnsmasq.conf.add` — блок:
+Ожидаемая схема портов:
+
+```text
+dnsmasq -> 0.0.0.0:53
+mihomo  -> 127.0.0.1:1053
+mihomo  -> 0.0.0.0:7892
+mihomo  -> 0.0.0.0:9090
+```
+
+Управляемый блок:
 
 ```text
 # GOSHACRASH_DNS_BEGIN
-port=0
+no-resolv
+server=127.0.0.1#1053
 # GOSHACRASH_DNS_END
 ```
 
-## Остановка
-
-```sh
-/tmp/mnt/GOSHACRASH/goshacrash/goshacrash stop
-```
-
-Команда останавливает Mihomo и автоматически возвращает штатный DNS ASUS.
-
 ## TUN
 
-На текущем RT-AC68U автоматические policy-routing правила Mihomo завершаются ошибкой `invalid argument`. Поэтому эта версия запускается в режиме `dns-only`: исходный `config.yaml` сохраняется, но в `runtime.yaml` TUN временно отключается. Это сделано специально, чтобы Mihomo, DNS, правила и Zashboard уже работали без отката.
-
-Для экспериментального запуска без этой защиты можно передать:
-
-```sh
-GOSHACRASH_TUN_MODE=native /tmp/mnt/GOSHACRASH/goshacrash/goshacrash apply
-```
-
-На данном роутере такой режим пока, вероятнее всего, снова упрётся в ошибку автоматической маршрутизации.
+На текущем RT-AC68U автоматические policy-routing правила Mihomo завершаются ошибкой `invalid argument`. Поэтому по умолчанию TUN отключается только в `runtime.yaml`, пока не будет добавлена отдельная маршрутизация для старого ASUS.

@@ -24,6 +24,8 @@ profile:
 # не меняя личный config.yaml.
 geo-auto-update: false
 
+# В личном конфиге можно оставить обычный порт 53.
+# GoshaCrash перенесёт Mihomo на 127.0.0.1:1053 только в runtime.yaml.
 dns:
   enable: true
   listen: 0.0.0.0:53

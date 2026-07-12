@@ -2,7 +2,7 @@
 # GoshaCrash controller for ASUSWRT / Asuswrt-Merlin.
 # User edits config.yaml. GoshaCrash creates runtime.yaml with router-only fixes.
 
-GOSHACRASH_VERSION="0.3.1-dns-stable"
+GOSHACRASH_VERSION="0.3.2-dns-forward"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -27,6 +27,9 @@ DNS_MARK_BEGIN="# GOSHACRASH_DNS_BEGIN"
 DNS_MARK_END="# GOSHACRASH_DNS_END"
 DNS_OLD_MARK_BEGIN="# GOSHACRASH_DNS_TEST_BEGIN"
 DNS_OLD_MARK_END="# GOSHACRASH_DNS_TEST_END"
+MIHOMO_DNS_HOST="${MIHOMO_DNS_HOST:-127.0.0.1}"
+MIHOMO_DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
+DNS_BOOTSTRAP="${DNS_BOOTSTRAP:-9.9.9.9}"
 
 PATH="/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin:/opt/sbin:$USB_MOUNT/asusware.arm/bin:$USB_MOUNT/asusware.arm/sbin"
 export PATH
@@ -344,15 +347,71 @@ render_runtime_to() {
         printf '\ngeo-auto-update: false\n' >> "$output"
     fi
 
-    # If ASUS resolves "system" back to localhost while Mihomo owns port 53,
-    # avoid a DNS loop in runtime.yaml only.
-    dns_mode="$(detect_dns_mode "$output")"
-    if [ "$dns_mode" = exclusive53 ] && system_dns_is_local; then
-        sed -i \
-            -e 's/:[[:space:]]*system[[:space:]]*$/: 9.9.9.9/' \
-            -e 's/^[[:space:]]*-[[:space:]]*system[[:space:]]*$/    - 9.9.9.9/' \
-            "$output"
-    fi
+    # On a router, dnsmasq must keep port 53 for LAN clients and DHCP-related
+    # local name handling. Mihomo DNS therefore always listens locally on 1053
+    # in runtime.yaml. The user's original config.yaml stays unchanged.
+    awk -v host="$MIHOMO_DNS_HOST" -v port="$MIHOMO_DNS_PORT" '
+        /^dns:[[:space:]]*($|#)/ {
+            in_dns = 1
+            listen_seen = 0
+            print
+            next
+        }
+
+        in_dns && /^[^[:space:]#]/ {
+            if (!listen_seen)
+                print "  listen: " host ":" port
+            in_dns = 0
+        }
+
+        in_dns && /^[[:space:]]+listen:[[:space:]]*/ {
+            print "  listen: " host ":" port
+            listen_seen = 1
+            next
+        }
+
+        { print }
+
+        END {
+            if (in_dns && !listen_seen)
+                print "  listen: " host ":" port
+        }
+    ' "$output" > "$output.dns-listen" || return 1
+    mv -f "$output.dns-listen" "$output" || return 1
+
+    # dnsmasq forwards to Mihomo, so using "system" from inside Mihomo would
+    # create a loop: Mihomo -> dnsmasq -> Mihomo. Replace only DNS-section
+    # occurrences in runtime.yaml with a direct bootstrap resolver.
+    awk -v bootstrap="$DNS_BOOTSTRAP" '
+        /^dns:[[:space:]]*($|#)/ {
+            in_dns = 1
+            print
+            next
+        }
+
+        in_dns && /^[^[:space:]#]/ {
+            in_dns = 0
+        }
+
+        in_dns {
+            if ($0 ~ /^[[:space:]]*-[[:space:]]*system[[:space:]]*$/) {
+                line = $0
+                sub(/-[[:space:]]*system[[:space:]]*$/, "- " bootstrap, line)
+                print line
+                next
+            }
+
+            if ($0 ~ /:[[:space:]]*system[[:space:]]*$/) {
+                line = $0
+                sub(/:[[:space:]]*system[[:space:]]*$/, ": " bootstrap, line)
+                print line
+                next
+            }
+        }
+
+        { print }
+    ' "$output" > "$output.dns-bootstrap" || return 1
+    mv -f "$output.dns-bootstrap" "$output" || return 1
 
     # The current RT-AC68U firmware rejects Mihomo automatic policy-routing
     # rules. Keep the user's config unchanged, but run DNS safely first.
@@ -435,11 +494,13 @@ start_mihomo() {
     check_runtime || return 1
 
     desired_dns_mode="$(detect_dns_mode "$RUNTIME_CONFIG")"
-    say "Подготавливаю DNS-режим: $desired_dns_mode"
-    if ! activate_dns_mode "$desired_dns_mode"; then
-        restore_system_dns
-        fail "Не удалось подготовить dnsmasq"
-        return 1
+
+    # Keep native ASUS DNS available while Mihomo is bootstrapping.
+    # Only after Mihomo is listening on 1053 do we switch dnsmasq upstream.
+    if [ "$desired_dns_mode" != none ]; then
+        write_dnsmasq_mode none >/dev/null 2>&1 || true
+        restart_dnsmasq >/dev/null 2>&1 || true
+        sleep 1
     fi
 
     mkdir -p "$BASE/run" "$BASE/logs"
@@ -460,13 +521,40 @@ start_mihomo() {
         return 1
     fi
 
-    if [ "$desired_dns_mode" = exclusive53 ] && ! wait_mihomo_dns; then
-        warn "Mihomo не занял DNS-порт 53"
-        port_53_listeners >&2 || true
-        kill_mihomo_process >/dev/null 2>&1 || true
-        restore_system_dns
-        tail -n 80 "$LOG_FILE" 2>/dev/null
-        return 1
+    case "$desired_dns_mode" in
+        forward:*)
+            dns_port="${desired_dns_mode#forward:}"
+            if ! wait_mihomo_dns_port "$dns_port"; then
+                warn "Mihomo не занял DNS-порт $dns_port"
+                port_listeners "$dns_port" >&2 || true
+                kill_mihomo_process >/dev/null 2>&1 || true
+                restore_system_dns
+                tail -n 80 "$LOG_FILE" 2>/dev/null
+                return 1
+            fi
+            ;;
+
+        exclusive53)
+            if ! wait_mihomo_dns_port 53; then
+                warn "Mihomo не занял DNS-порт 53"
+                port_listeners 53 >&2 || true
+                kill_mihomo_process >/dev/null 2>&1 || true
+                restore_system_dns
+                tail -n 80 "$LOG_FILE" 2>/dev/null
+                return 1
+            fi
+            ;;
+    esac
+
+    if [ "$desired_dns_mode" != none ]; then
+        say "Переключаю dnsmasq на Mihomo DNS: $desired_dns_mode"
+        if ! activate_dns_mode "$desired_dns_mode"; then
+            warn "Не удалось направить dnsmasq в Mihomo"
+            kill_mihomo_process >/dev/null 2>&1 || true
+            restore_system_dns
+            tail -n 80 "$LOG_FILE" 2>/dev/null
+            return 1
+        fi
     fi
 
     if ! wait_for_tun_interface; then
@@ -577,8 +665,13 @@ write_dnsmasq_mode() {
     write_dns_mode "$mode"
 }
 
+port_listeners() {
+    port="$1"
+    netstat -lnp 2>/dev/null | grep ":$port[[:space:]]"
+}
+
 port_53_listeners() {
-    netstat -lnp 2>/dev/null | grep ':53[[:space:]]'
+    port_listeners 53
 }
 
 wait_port_53_free() {
@@ -593,15 +686,18 @@ wait_port_53_free() {
     return 1
 }
 
-wait_mihomo_dns() {
+wait_mihomo_dns_port() {
+    port="$1"
     counter=0
+
     while [ "$counter" -lt 10 ]; do
-        if port_53_listeners 2>/dev/null | grep -q 'mihomo'; then
+        if port_listeners "$port" 2>/dev/null | grep -q 'mihomo'; then
             return 0
         fi
         sleep 1
         counter=$((counter + 1))
     done
+
     return 1
 }
 
@@ -1014,7 +1110,7 @@ doctor() {
     echo
     echo "Слушающие порты:"
     netstat -lnp 2>/dev/null |
-        grep -E '(:53[[:space:]]|:9090[[:space:]]|:7892[[:space:]])' ||
+        grep -E '(:53[[:space:]]|:1053[[:space:]]|:9090[[:space:]]|:7892[[:space:]])' ||
         echo "Нужные порты не найдены в netstat"
 
     echo
