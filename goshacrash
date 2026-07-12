@@ -2,7 +2,7 @@
 # GoshaCrash controller for ASUSWRT / Asuswrt-Merlin.
 # User edits config.yaml. GoshaCrash creates runtime.yaml with router-only fixes.
 
-GOSHACRASH_VERSION="0.3.0-dns-test"
+GOSHACRASH_VERSION="0.3.1-dns-stable"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -22,6 +22,11 @@ USB_MOUNT="$(dirname "$BASE")"
 JFFS_BASE="/jffs/addons/goshacrash"
 JFFS_BASE_FILE="$JFFS_BASE/base"
 JFFS_DNS_MODE="$JFFS_BASE/dns.mode"
+DNSMASQ_ADD="/jffs/configs/dnsmasq.conf.add"
+DNS_MARK_BEGIN="# GOSHACRASH_DNS_BEGIN"
+DNS_MARK_END="# GOSHACRASH_DNS_END"
+DNS_OLD_MARK_BEGIN="# GOSHACRASH_DNS_TEST_BEGIN"
+DNS_OLD_MARK_END="# GOSHACRASH_DNS_TEST_END"
 
 PATH="/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin:/opt/sbin:$USB_MOUNT/asusware.arm/bin:$USB_MOUNT/asusware.arm/sbin"
 export PATH
@@ -344,9 +349,43 @@ render_runtime_to() {
     dns_mode="$(detect_dns_mode "$output")"
     if [ "$dns_mode" = exclusive53 ] && system_dns_is_local; then
         sed -i \
-            -e 's/:[[:space:]]*system[[:space:]]*$/:\ 9.9.9.9/' \
+            -e 's/:[[:space:]]*system[[:space:]]*$/: 9.9.9.9/' \
             -e 's/^[[:space:]]*-[[:space:]]*system[[:space:]]*$/    - 9.9.9.9/' \
             "$output"
+    fi
+
+    # The current RT-AC68U firmware rejects Mihomo automatic policy-routing
+    # rules. Keep the user's config unchanged, but run DNS safely first.
+    # TUN will be enabled in a later build with router-specific routes.
+    if [ "${GOSHACRASH_TUN_MODE:-dns-only}" = "dns-only" ]; then
+        awk '
+            /^tun:[[:space:]]*($|#)/ {
+                in_tun = 1
+                enable_seen = 0
+                print
+                next
+            }
+
+            in_tun && /^[^[:space:]#]/ {
+                if (!enable_seen)
+                    print "  enable: false"
+                in_tun = 0
+            }
+
+            in_tun && /^[[:space:]]+enable:[[:space:]]*/ {
+                print "  enable: false"
+                enable_seen = 1
+                next
+            }
+
+            { print }
+
+            END {
+                if (in_tun && !enable_seen)
+                    print "  enable: false"
+            }
+        ' "$output" > "$output.tun" || return 1
+        mv -f "$output.tun" "$output" || return 1
     fi
 }
 
@@ -395,6 +434,14 @@ start_mihomo() {
 
     check_runtime || return 1
 
+    desired_dns_mode="$(detect_dns_mode "$RUNTIME_CONFIG")"
+    say "Подготавливаю DNS-режим: $desired_dns_mode"
+    if ! activate_dns_mode "$desired_dns_mode"; then
+        restore_system_dns
+        fail "Не удалось подготовить dnsmasq"
+        return 1
+    fi
+
     mkdir -p "$BASE/run" "$BASE/logs"
     rotate_log
     rm -f "$PID_FILE"
@@ -409,12 +456,23 @@ start_mihomo() {
         echo "Mihomo завершился при запуске" >&2
         rm -f "$PID_FILE"
         tail -n 60 "$LOG_FILE" 2>/dev/null
+        restore_system_dns
+        return 1
+    fi
+
+    if [ "$desired_dns_mode" = exclusive53 ] && ! wait_mihomo_dns; then
+        warn "Mihomo не занял DNS-порт 53"
+        port_53_listeners >&2 || true
+        kill_mihomo_process >/dev/null 2>&1 || true
+        restore_system_dns
+        tail -n 80 "$LOG_FILE" 2>/dev/null
         return 1
     fi
 
     if ! wait_for_tun_interface; then
         warn "Mihomo запущен, но TUN-интерфейс не появился"
-        stop_mihomo >/dev/null 2>&1 || true
+        kill_mihomo_process >/dev/null 2>&1 || true
+        restore_system_dns
         tail -n 80 "$LOG_FILE" 2>/dev/null
         return 1
     fi
@@ -423,7 +481,7 @@ start_mihomo() {
     echo "Mihomo запущен, PID=$pid"
 }
 
-stop_mihomo() {
+kill_mihomo_process() {
     if pid="$(running_pid)"; then
         kill "$pid" 2>/dev/null || true
 
@@ -444,6 +502,139 @@ stop_mihomo() {
 
     rm -f "$PID_FILE"
     echo "Mihomo не запущен"
+}
+
+remove_dnsmasq_managed_block() {
+    input="$1"
+    output="$2"
+
+    [ -f "$input" ] || : > "$input"
+
+    awk \
+        -v begin="$DNS_MARK_BEGIN" \
+        -v end="$DNS_MARK_END" \
+        -v old_begin="$DNS_OLD_MARK_BEGIN" \
+        -v old_end="$DNS_OLD_MARK_END" '
+        $0 == begin || $0 == old_begin { skip = 1; next }
+        $0 == end || $0 == old_end     { skip = 0; next }
+        !skip                           { print }
+    ' "$input" > "$output"
+}
+
+write_dnsmasq_mode() {
+    mode="$1"
+
+    mkdir -p /jffs/configs "$JFFS_BASE" || return 1
+    [ -f "$DNSMASQ_ADD" ] || : > "$DNSMASQ_ADD"
+
+    clean="$DNSMASQ_ADD.goshacrash.clean"
+    next="$DNSMASQ_ADD.goshacrash.next"
+
+    remove_dnsmasq_managed_block "$DNSMASQ_ADD" "$clean" || {
+        rm -f "$clean" "$next"
+        return 1
+    }
+
+    cat "$clean" > "$next" || {
+        rm -f "$clean" "$next"
+        return 1
+    }
+
+    case "$mode" in
+        exclusive53)
+            {
+                printf '%s\n' "$DNS_MARK_BEGIN"
+                printf '%s\n' 'port=0'
+                printf '%s\n' "$DNS_MARK_END"
+            } >> "$next" || return 1
+            ;;
+
+        forward:*)
+            port="${mode#forward:}"
+            {
+                printf '%s\n' "$DNS_MARK_BEGIN"
+                printf '%s\n' 'no-resolv'
+                printf '%s\n' "server=127.0.0.1#$port"
+                printf '%s\n' "$DNS_MARK_END"
+            } >> "$next" || return 1
+            ;;
+
+        none)
+            ;;
+
+        *)
+            rm -f "$clean" "$next"
+            return 1
+            ;;
+    esac
+
+    mv -f "$next" "$DNSMASQ_ADD" || {
+        rm -f "$clean" "$next"
+        return 1
+    }
+    rm -f "$clean"
+
+    write_dns_mode "$mode"
+}
+
+port_53_listeners() {
+    netstat -lnp 2>/dev/null | grep ':53[[:space:]]'
+}
+
+wait_port_53_free() {
+    counter=0
+    while [ "$counter" -lt 10 ]; do
+        if ! port_53_listeners >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        counter=$((counter + 1))
+    done
+    return 1
+}
+
+wait_mihomo_dns() {
+    counter=0
+    while [ "$counter" -lt 10 ]; do
+        if port_53_listeners 2>/dev/null | grep -q 'mihomo'; then
+            return 0
+        fi
+        sleep 1
+        counter=$((counter + 1))
+    done
+    return 1
+}
+
+restore_system_dns() {
+    write_dnsmasq_mode none >/dev/null 2>&1 || true
+    restart_dnsmasq >/dev/null 2>&1 || true
+}
+
+activate_dns_mode() {
+    mode="$1"
+
+    write_dnsmasq_mode "$mode" || return 1
+
+    restart_dnsmasq || return 1
+    sleep 2
+
+    case "$mode" in
+        exclusive53)
+            if ! wait_port_53_free; then
+                warn "Порт 53 не освободился"
+                port_53_listeners >&2 || true
+                return 1
+            fi
+            ;;
+    esac
+
+    return 0
+}
+
+stop_mihomo() {
+    kill_mihomo_process
+    say "Возвращаю штатный DNS ASUS"
+    restore_system_dns
 }
 
 restart_dnsmasq() {
@@ -514,9 +705,6 @@ apply_config() {
         return 1
     fi
 
-    new_dns_mode="$(detect_dns_mode "$candidate")"
-    old_dns_mode="$(read_dns_mode)"
-
     if [ -f "$RUNTIME_CONFIG" ]; then
         cp "$RUNTIME_CONFIG" "$PREVIOUS_RUNTIME" 2>/dev/null || true
     else
@@ -529,32 +717,13 @@ apply_config() {
         fail "Не удалось установить runtime.yaml" ||
         return 1
 
-    write_dns_mode "$new_dns_mode" ||
-        fail "Не удалось сохранить режим DNS" ||
-        return 1
-
     install_hooks || return 1
-
-    if [ "$new_dns_mode" = exclusive53 ]; then
-        say "Освобождаю порт 53 у dnsmasq, DHCP останется включён"
-        if ! restart_dnsmasq; then
-            rollback_apply "$old_dns_mode"
-            fail "Не удалось перезапустить dnsmasq"
-            return 1
-        fi
-    fi
 
     say "Запускаю Mihomo"
     if ! start_mihomo; then
-        rollback_apply "$old_dns_mode"
+        rollback_apply
         fail "Новый конфиг не запустился, выполнен откат"
         return 1
-    fi
-
-    if [ "$new_dns_mode" != exclusive53 ]; then
-        if ! restart_dnsmasq; then
-            warn "Mihomo запущен, но dnsmasq не удалось перезапустить"
-        fi
     fi
 
     say "Конфиг применён"
@@ -562,18 +731,14 @@ apply_config() {
 }
 
 rollback_apply() {
-    old_dns_mode="$1"
-
-    stop_mihomo >/dev/null 2>&1 || true
+    kill_mihomo_process >/dev/null 2>&1 || true
+    restore_system_dns
 
     if [ -f "$PREVIOUS_RUNTIME" ]; then
         cp "$PREVIOUS_RUNTIME" "$RUNTIME_CONFIG" 2>/dev/null || true
     else
         rm -f "$RUNTIME_CONFIG"
     fi
-
-    write_dns_mode "$old_dns_mode" 2>/dev/null || true
-    restart_dnsmasq >/dev/null 2>&1 || true
 
     if [ -f "$RUNTIME_CONFIG" ]; then
         start_mihomo >/dev/null 2>&1 || true
@@ -591,6 +756,9 @@ status_mihomo() {
     echo "Личный конфиг: $SOURCE_CONFIG"
     echo "Runtime-конфиг: $RUNTIME_CONFIG"
     echo "DNS-режим: $(read_dns_mode)"
+    if [ "${GOSHACRASH_TUN_MODE:-dns-only}" = "dns-only" ]; then
+        echo "Режим совместимости: DNS работает, TUN отключён только в runtime.yaml"
+    fi
 
     if [ -f "$RUNTIME_CONFIG" ] && tun_enabled; then
         device="$(tun_device)"
@@ -838,6 +1006,10 @@ doctor() {
 
     echo
     status_mihomo
+
+    echo
+    echo "Управляемый блок dnsmasq:"
+    sed -n "/$DNS_MARK_BEGIN/,/$DNS_MARK_END/p" "$DNSMASQ_ADD" 2>/dev/null || true
 
     echo
     echo "Слушающие порты:"

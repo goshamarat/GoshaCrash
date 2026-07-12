@@ -1,5 +1,23 @@
 *:Zone.Identifier
 .DS_Store
+
+# Личный конфиг и файлы, создаваемые на роутере
+/config.yaml
+/runtime.yaml
+/runtime.candidate.yaml
+/runtime.previous.yaml
+/runtime.check.yaml
+/backups/
+/logs/
+/run/
+/state/
+/bin/
+/ui/
+/rulesets/
+/cache/
+*.log
+*.pid
+
 private/
 *.secret.yaml
 *.local.yaml

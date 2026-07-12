@@ -6,7 +6,7 @@
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.28}"
-GOSHACRASH_VERSION="0.3.0-dns-test"
+GOSHACRASH_VERSION="0.3.1-dns-stable"
 
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 ZASHBOARD_URL="https://codeload.github.com/Zephyruso/zashboard/tar.gz/refs/heads/gh-pages-no-fonts"
@@ -168,6 +168,13 @@ arch_candidates() {
             return 1
             ;;
     esac
+}
+
+cleanup_obsolete_files() {
+    rm -f \
+        "$BASE/dns-test.sh" \
+        "$BASE/restore-dns.sh" \
+        "$BASE/install-local.sh"
 }
 
 install_repository_files() {
@@ -368,6 +375,7 @@ mkdir -p \
     fail "Не удалось создать каталоги установки"
 
 install_repository_files
+cleanup_obsolete_files
 install_mihomo
 install_zashboard
 install_optional_tools
@@ -379,15 +387,9 @@ say "Устанавливаю JFFS-хуки"
 GOSHACRASH_BASE="$BASE" "$BASE/goshacrash" install-hooks ||
     fail "Не удалось установить хуки"
 
-if [ -f "$BASE/runtime.yaml" ]; then
-    say "Перезапускаю ранее применённую конфигурацию"
-    GOSHACRASH_BASE="$BASE" "$BASE/goshacrash" restart ||
-        warn "Старую runtime-конфигурацию не удалось запустить"
-else
-    say "Применяю безопасный стартовый конфиг"
-    GOSHACRASH_BASE="$BASE" "$BASE/goshacrash" apply ||
-        fail "Стартовый config.yaml не удалось применить"
-fi
+say "Создаю новый runtime.yaml и применяю конфигурацию"
+GOSHACRASH_BASE="$BASE" "$BASE/goshacrash" apply ||
+    fail "config.yaml не удалось применить"
 
 LAN_IP="$(nvram get lan_ipaddr 2>/dev/null)"
 [ -n "$LAN_IP" ] || LAN_IP="IP_РОУТЕРА"
