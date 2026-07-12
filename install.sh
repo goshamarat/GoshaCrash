@@ -6,7 +6,7 @@
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.28}"
-GOSHACRASH_VERSION="0.2.1"
+GOSHACRASH_VERSION="0.3.0-dns-test"
 
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 ZASHBOARD_URL="https://codeload.github.com/Zephyruso/zashboard/tar.gz/refs/heads/gh-pages-no-fonts"

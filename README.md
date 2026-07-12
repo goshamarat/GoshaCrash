@@ -1,70 +1,44 @@
-# GoshaCrash
+# GoshaCrash 0.3.0 DNS test
 
-## Принцип установки
-
-Установка и повторное обновление выполняются одной командой. Ручные `sed`, копирование бинарников и исправления непосредственно на роутере не требуются.
-
-Минимальный установщик Mihomo + Zashboard для ASUSWRT/Asuswrt-Merlin.
-
-## Что хранится на GitHub
-
-Только публичные скрипты и безопасный шаблон. Настоящий `config.yaml` с серверами,
-паролями и правилами хранится только на USB роутера.
-
-## Установка
-
-```sh
-wget --no-check-certificate \
-  -O /tmp/goshacrash-install.sh \
-  https://raw.githubusercontent.com/goshamarat/GoshaCrash/main/install.sh \
-  && sh /tmp/goshacrash-install.sh
-```
-
-## Вставка личного конфига
-
-```sh
-goshacrash setup
-```
-
-`apply`:
-
-- сохраняет резервную копию `config.yaml`;
-- создаёт отдельный `runtime.yaml`;
-- открывает API Zashboard в LAN;
-- убирает устаревший `global-client-fingerprint` только из runtime;
-- добавляет `geo-auto-update: false`, не удаляя пользовательские GEO-правила;
-- освобождает порт 53 у dnsmasq, если DNS Mihomo слушает порт 53;
-- сохраняет DHCP ASUS;
-- проверяет `/dev/net/tun`;
-- запускает TUN из пользовательского конфига;
-- устанавливает хуки `post-mount`, `services-start`, `firewall-start` и
-  `dnsmasq.postconf`;
-- откатывается к предыдущему runtime при ошибке.
-
-## Команды
-
-```sh
-goshacrash status
-goshacrash doctor
-goshacrash logs 100
-goshacrash ui
-goshacrash backup
-goshacrash restore
-goshacrash update
-```
-
-## Файлы на роутере
+Архив предназначен для установки поверх уже существующего каталога:
 
 ```text
-/tmp/mnt/GOSHACRASH/goshacrash/
-├── bin/mihomo
-├── config.yaml          # личный исходный конфиг
-├── runtime.yaml         # версия, подготовленная для ASUS
-├── ui/
-├── rulesets/
-├── backups/
-├── logs/
-└── goshacrash
+/tmp/mnt/GOSHACRASH/goshacrash
 ```
 
-`goshacrash setup` открывает личный `config.yaml` в nano и автоматически выполняет проверку и применение после выхода из редактора.
+Личный `config.yaml`, установленный `bin/mihomo`, Zashboard и правила не удаляются.
+
+## Установка из распакованного архива
+
+```sh
+sh install-local.sh
+```
+
+## Безопасный тест DNS на порту 53
+
+```sh
+sh /tmp/mnt/GOSHACRASH/goshacrash/dns-test.sh
+```
+
+Скрипт:
+
+- сохраняет резервные копии;
+- создаёт `runtime.yaml`;
+- временно отключает TUN только в runtime;
+- добавляет `port=0` в `/jffs/configs/dnsmasq.conf.add`;
+- оставляет DHCP dnsmasq включённым;
+- перезапускает dnsmasq;
+- проверяет, освободился ли порт 53;
+- запускает Mihomo;
+- проверяет, что порт 53 слушает Mihomo;
+- автоматически возвращает прежние настройки при ошибке.
+
+Исходный `config.yaml` не меняется.
+
+## Возврат штатного DNS ASUS
+
+```sh
+sh /tmp/mnt/GOSHACRASH/goshacrash/restore-dns.sh
+```
+
+TUN в этой версии намеренно не настраивается: сначала отдельно проверяется DNS.
