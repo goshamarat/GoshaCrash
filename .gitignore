@@ -21,3 +21,6 @@
 private/
 *.secret.yaml
 *.local.yaml
+/runtime.tun-test.yaml
+/tun-minimal.yaml
+/tun-minimal-home/

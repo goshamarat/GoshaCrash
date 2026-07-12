@@ -6,7 +6,7 @@
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.28}"
-GOSHACRASH_VERSION="0.3.3-dns-forward"
+GOSHACRASH_VERSION="0.4.0-manual-tun"
 
 RAW_BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 ZASHBOARD_URL="https://codeload.github.com/Zephyruso/zashboard/tar.gz/refs/heads/gh-pages-no-fonts"
@@ -190,13 +190,22 @@ install_repository_files() {
     if [ -f "$SOURCE_CONFIG" ]; then
         say "Личный config.yaml сохранён без изменений"
     else
-        say "Создаю безопасный стартовый config.yaml"
+        latest_backup="$(ls -1t "$USB_MOUNT"/config-backup-*.yaml 2>/dev/null | head -n 1)"
 
-        fetch "$RAW_BASE/templates/config.yaml" "$SOURCE_CONFIG.new" ||
-            fail "Не удалось скачать templates/config.yaml"
+        if [ "${RESTORE_CONFIG_BACKUP:-1}" = "1" ] &&
+           [ -n "$latest_backup" ] && [ -f "$latest_backup" ]; then
+            cp "$latest_backup" "$SOURCE_CONFIG" ||
+                fail "Не удалось восстановить config.yaml из резервной копии"
+            say "Восстановлен личный конфиг: $latest_backup"
+        else
+            say "Создаю безопасный стартовый config.yaml"
 
-        mv -f "$SOURCE_CONFIG.new" "$SOURCE_CONFIG" ||
-            fail "Не удалось установить стартовый config.yaml"
+            fetch "$RAW_BASE/templates/config.yaml" "$SOURCE_CONFIG.new" ||
+                fail "Не удалось скачать templates/config.yaml"
+
+            mv -f "$SOURCE_CONFIG.new" "$SOURCE_CONFIG" ||
+                fail "Не удалось установить стартовый config.yaml"
+        fi
     fi
 }
 
@@ -411,4 +420,6 @@ printf '%s\n' "   goshacrash apply"
 printf '%s\n' ""
 printf '%s\n' " Проверка:"
 printf '%s\n' "   goshacrash doctor"
+printf '%s\n' ""
+printf '%s\n' " Режим: dnsmasq:53 -> Mihomo:1053; ручной TUN через table 2022"
 printf '%s\n' "============================================================"

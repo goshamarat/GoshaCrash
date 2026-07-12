@@ -20,8 +20,7 @@ profile:
   store-selected: true
   store-fake-ip: true
 
-# GoshaCrash также принудительно ставит false в runtime.yaml,
-# не меняя личный config.yaml.
+# GoshaCrash сохраняет эту настройку и адаптирует TUN только в runtime.yaml.
 geo-auto-update: false
 
 # В личном конфиге можно оставить обычный порт 53.
@@ -40,7 +39,12 @@ dns:
     - tls://9.9.9.9
 
 tun:
-  enable: false
+  enable: true
+  stack: system
+  device: mihomo0
+  auto-route: false
+  auto-redirect: false
+  auto-detect-interface: false
 
 proxies: []
 

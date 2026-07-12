@@ -2,7 +2,7 @@
 # GoshaCrash controller for ASUSWRT / Asuswrt-Merlin.
 # User edits config.yaml. GoshaCrash creates runtime.yaml with router-only fixes.
 
-GOSHACRASH_VERSION="0.3.3-dns-forward"
+GOSHACRASH_VERSION="0.4.0-manual-tun"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -30,6 +30,19 @@ DNS_OLD_MARK_END="# GOSHACRASH_DNS_TEST_END"
 MIHOMO_DNS_HOST="${MIHOMO_DNS_HOST:-127.0.0.1}"
 MIHOMO_DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
 DNS_BOOTSTRAP="${DNS_BOOTSTRAP:-9.9.9.9}"
+
+# Manual TUN routing for older ASUSWRT kernels. Mihomo creates only the
+# interface; GoshaCrash creates policy routing and firewall rules.
+TUN_MODE="${GOSHACRASH_TUN_MODE:-manual}"
+TUN_DEVICE_DEFAULT="${GOSHACRASH_TUN_DEVICE:-mihomo0}"
+TUN_MTU="${GOSHACRASH_TUN_MTU:-1500}"
+TUN_TABLE="${GOSHACRASH_TUN_TABLE:-2022}"
+TUN_MARK="${GOSHACRASH_TUN_MARK:-0x2333}"
+TUN_RULE_PREF="${GOSHACRASH_TUN_RULE_PREF:-10010}"
+TUN_MANGLE_CHAIN="GOSHACRASH_TUN"
+TUN_FILTER_CHAIN="GOSHACRASH_FORWARD"
+DNS_HIJACK_CHAIN="GOSHACRASH_DNS_HIJACK"
+ROUTING_STATE_FILE="$STATE_DIR/tun-routing.enabled"
 
 PATH="/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin:/opt/sbin:$USB_MOUNT/asusware.arm/bin:$USB_MOUNT/asusware.arm/sbin"
 export PATH
@@ -142,7 +155,7 @@ fetch() {
 }
 
 strip_quotes() {
-    sed "s/^[\"']//; s/[\"']$//"
+    sed "s/\r$//; s/^[\"']//; s/[\"']$//"
 }
 
 yaml_section_value() {
@@ -320,6 +333,10 @@ render_runtime_to() {
     cp "$SOURCE_CONFIG" "$output" ||
         fail "Не удалось создать runtime-конфиг" || return 1
 
+    # Configs copied from Windows can contain CRLF. Normalize runtime only;
+    # the user's source file remains untouched.
+    sed -i 's/\r$//' "$output" || return 1
+
     # Dashboard must be reachable from another LAN device.
     sed -i \
         -e 's/^[[:space:]]*external-controller:[[:space:]]*127\.0\.0\.1:/external-controller: 0.0.0.0:/' \
@@ -413,39 +430,55 @@ render_runtime_to() {
     ' "$output" > "$output.dns-bootstrap" || return 1
     mv -f "$output.dns-bootstrap" "$output" || return 1
 
-    # The current RT-AC68U firmware rejects Mihomo automatic policy-routing
-    # rules. Keep the user's config unchanged, but run DNS safely first.
-    # TUN will be enabled in a later build with router-specific routes.
-    if [ "${GOSHACRASH_TUN_MODE:-dns-only}" = "dns-only" ]; then
-        awk '
-            /^tun:[[:space:]]*($|#)/ {
-                in_tun = 1
-                enable_seen = 0
-                print
-                next
-            }
+    # Older ASUSWRT accepts a plain TUN interface but rejects Mihomo's
+    # automatic policy-routing rules. Preserve the user's enable/disable
+    # choice, then force only the compatible interface settings in runtime.
+    source_tun_enable="$(yaml_section_value "$SOURCE_CONFIG" tun enable)"
+    runtime_tun_enable=false
 
-            in_tun && /^[^[:space:]#]/ {
-                if (!enable_seen)
-                    print "  enable: false"
-                in_tun = 0
-            }
-
-            in_tun && /^[[:space:]]+enable:[[:space:]]*/ {
-                print "  enable: false"
-                enable_seen = 1
-                next
-            }
-
-            { print }
-
-            END {
-                if (in_tun && !enable_seen)
-                    print "  enable: false"
-            }
-        ' "$output" > "$output.tun" || return 1
-        mv -f "$output.tun" "$output" || return 1
+    if [ "$TUN_MODE" = manual ] && is_true "$source_tun_enable"; then
+        runtime_tun_enable=true
     fi
+
+    awk \
+        -v enable="$runtime_tun_enable" \
+        -v device="$TUN_DEVICE_DEFAULT" \
+        -v mtu="$TUN_MTU" '
+        function emit_tun() {
+            print "tun:"
+            print "  enable: " enable
+            print "  stack: system"
+            print "  device: " device
+            print "  mtu: " mtu
+            print "  auto-route: false"
+            print "  auto-redirect: false"
+            print "  auto-detect-interface: false"
+            print "  strict-route: false"
+        }
+
+        /^tun:[[:space:]]*($|#)/ {
+            emit_tun()
+            found = 1
+            in_tun = 1
+            next
+        }
+
+        in_tun && /^[^[:space:]#]/ {
+            in_tun = 0
+        }
+
+        !in_tun {
+            print
+        }
+
+        END {
+            if (!found) {
+                print ""
+                emit_tun()
+            }
+        }
+    ' "$output" > "$output.tun" || return 1
+    mv -f "$output.tun" "$output" || return 1
 }
 
 check_file() {
@@ -476,15 +509,233 @@ check_runtime() {
     check_file "$RUNTIME_CONFIG"
 }
 
+lan_interface() {
+    if [ -n "${GOSHACRASH_LAN_IF:-}" ]; then
+        printf '%s\n' "$GOSHACRASH_LAN_IF"
+        return 0
+    fi
+
+    value="$(nvram get lan_ifname 2>/dev/null)"
+    [ -n "$value" ] || value=br0
+    printf '%s\n' "$value"
+}
+
+lan_address() {
+    value="$(nvram get lan_ipaddr 2>/dev/null)"
+    [ -n "$value" ] || value=127.0.0.1
+    printf '%s\n' "$value"
+}
+
+tun_routing_active() {
+    ip rule show 2>/dev/null |
+        grep -q "^[[:space:]]*${TUN_RULE_PREF}:[[:space:]].*fwmark ${TUN_MARK}.*lookup ${TUN_TABLE}"
+}
+
+remove_rule_pref() {
+    counter=0
+    while ip rule show 2>/dev/null |
+          grep -q "^[[:space:]]*${TUN_RULE_PREF}:"; do
+        ip rule del pref "$TUN_RULE_PREF" 2>/dev/null || break
+        counter=$((counter + 1))
+        [ "$counter" -lt 10 ] || break
+    done
+}
+
+save_and_set_proc_value() {
+    proc_file="$1"
+    state_name="$2"
+    new_value="$3"
+    state_file="$STATE_DIR/$state_name"
+
+    [ -f "$proc_file" ] || return 0
+    mkdir -p "$STATE_DIR" || return 1
+
+    if [ ! -f "$state_file" ]; then
+        cat "$proc_file" > "$state_file" 2>/dev/null || true
+    fi
+
+    printf '%s\n' "$new_value" > "$proc_file" 2>/dev/null || true
+}
+
+restore_proc_value() {
+    proc_file="$1"
+    state_name="$2"
+    state_file="$STATE_DIR/$state_name"
+
+    if [ -f "$proc_file" ] && [ -f "$state_file" ]; then
+        cat "$state_file" > "$proc_file" 2>/dev/null || true
+    fi
+
+    rm -f "$state_file"
+}
+
+remove_tun_routing() {
+    lan_if="$(lan_interface)"
+
+    while iptables -t nat -D PREROUTING -i "$lan_if" -p udp --dport 53 -j "$DNS_HIJACK_CHAIN" 2>/dev/null; do :; done
+    while iptables -t nat -D PREROUTING -i "$lan_if" -p tcp --dport 53 -j "$DNS_HIJACK_CHAIN" 2>/dev/null; do :; done
+    iptables -t nat -F "$DNS_HIJACK_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$DNS_HIJACK_CHAIN" 2>/dev/null || true
+
+    while iptables -t mangle -D PREROUTING -i "$lan_if" -j "$TUN_MANGLE_CHAIN" 2>/dev/null; do :; done
+    iptables -t mangle -F "$TUN_MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t mangle -X "$TUN_MANGLE_CHAIN" 2>/dev/null || true
+
+    while iptables -t filter -D FORWARD -j "$TUN_FILTER_CHAIN" 2>/dev/null; do :; done
+    iptables -t filter -F "$TUN_FILTER_CHAIN" 2>/dev/null || true
+    iptables -t filter -X "$TUN_FILTER_CHAIN" 2>/dev/null || true
+
+    remove_rule_pref
+    ip route flush table "$TUN_TABLE" 2>/dev/null || true
+    ip route flush cache 2>/dev/null || true
+
+    restore_proc_value /proc/sys/net/ipv4/ip_forward ip_forward.before
+    restore_proc_value /proc/sys/net/ipv4/conf/all/rp_filter rp_filter_all.before
+    restore_proc_value "/proc/sys/net/ipv4/conf/$lan_if/rp_filter" "rp_filter_${lan_if}.before"
+    restore_proc_value "/proc/sys/net/ipv4/conf/$TUN_DEVICE_DEFAULT/rp_filter" "rp_filter_${TUN_DEVICE_DEFAULT}.before"
+
+    rm -f "$ROUTING_STATE_FILE"
+}
+
+setup_dns_hijack() {
+    [ "${GOSHACRASH_DNS_HIJACK:-1}" = 1 ] || return 0
+
+    lan_if="$(lan_interface)"
+    lan_ip="$(lan_address)"
+
+    iptables -t nat -N "$DNS_HIJACK_CHAIN" 2>/dev/null || return 1
+    iptables -t nat -A "$DNS_HIJACK_CHAIN" -d "$lan_ip/32" -j RETURN 2>/dev/null || return 1
+    iptables -t nat -A "$DNS_HIJACK_CHAIN" -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null || return 1
+    iptables -t nat -A "$DNS_HIJACK_CHAIN" -p tcp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null || return 1
+    iptables -t nat -I PREROUTING 1 -i "$lan_if" -p udp --dport 53 -j "$DNS_HIJACK_CHAIN" 2>/dev/null || return 1
+    iptables -t nat -I PREROUTING 1 -i "$lan_if" -p tcp --dport 53 -j "$DNS_HIJACK_CHAIN" 2>/dev/null || return 1
+}
+
+setup_tun_routing() {
+    tun_enabled || {
+        remove_tun_routing
+        return 0
+    }
+
+    device="$(tun_device)"
+    [ -n "$device" ] || device="$TUN_DEVICE_DEFAULT"
+    lan_if="$(lan_interface)"
+
+    [ -d "/sys/class/net/$device" ] || {
+        fail "TUN-интерфейс $device не найден"
+        return 1
+    }
+
+    command -v ip >/dev/null 2>&1 || {
+        fail "Не найдена команда ip"
+        return 1
+    }
+
+    command -v iptables >/dev/null 2>&1 || {
+        fail "Не найдена команда iptables"
+        return 1
+    }
+
+    remove_tun_routing
+
+    save_and_set_proc_value /proc/sys/net/ipv4/ip_forward ip_forward.before 1
+    save_and_set_proc_value /proc/sys/net/ipv4/conf/all/rp_filter rp_filter_all.before 0
+    save_and_set_proc_value "/proc/sys/net/ipv4/conf/$lan_if/rp_filter" "rp_filter_${lan_if}.before" 0
+    save_and_set_proc_value "/proc/sys/net/ipv4/conf/$device/rp_filter" "rp_filter_${device}.before" 0
+
+    ip route add default dev "$device" table "$TUN_TABLE" 2>/dev/null || {
+        warn "Не удалось создать таблицу маршрутизации $TUN_TABLE"
+        remove_tun_routing
+        return 1
+    }
+
+    ip rule add pref "$TUN_RULE_PREF" fwmark "$TUN_MARK" lookup "$TUN_TABLE" 2>/dev/null || {
+        warn "Не удалось создать ip rule для метки $TUN_MARK"
+        remove_tun_routing
+        return 1
+    }
+
+    iptables -t filter -N "$TUN_FILTER_CHAIN" 2>/dev/null || {
+        remove_tun_routing
+        return 1
+    }
+    iptables -t filter -A "$TUN_FILTER_CHAIN" -i "$lan_if" -o "$device" -j ACCEPT 2>/dev/null || {
+        remove_tun_routing
+        return 1
+    }
+    iptables -t filter -A "$TUN_FILTER_CHAIN" -i "$device" -o "$lan_if" -j ACCEPT 2>/dev/null || {
+        remove_tun_routing
+        return 1
+    }
+    iptables -t filter -I FORWARD 1 -j "$TUN_FILTER_CHAIN" 2>/dev/null || {
+        remove_tun_routing
+        return 1
+    }
+
+    iptables -t mangle -N "$TUN_MANGLE_CHAIN" 2>/dev/null || {
+        remove_tun_routing
+        return 1
+    }
+
+    for network in \
+        0.0.0.0/8 \
+        10.0.0.0/8 \
+        100.64.0.0/10 \
+        127.0.0.0/8 \
+        169.254.0.0/16 \
+        172.16.0.0/12 \
+        192.168.0.0/16 \
+        224.0.0.0/4 \
+        240.0.0.0/4 \
+        255.255.255.255/32
+    do
+        iptables -t mangle -A "$TUN_MANGLE_CHAIN" -d "$network" -j RETURN 2>/dev/null || {
+            remove_tun_routing
+            return 1
+        }
+    done
+
+    iptables -t mangle -A "$TUN_MANGLE_CHAIN" -j MARK --set-mark "$TUN_MARK" 2>/dev/null || {
+        remove_tun_routing
+        return 1
+    }
+
+    # Attach only after the route, rule and filter path are ready.
+    iptables -t mangle -I PREROUTING 1 -i "$lan_if" -j "$TUN_MANGLE_CHAIN" 2>/dev/null || {
+        remove_tun_routing
+        return 1
+    }
+
+    if ! setup_dns_hijack; then
+        warn "Не удалось включить перехват стороннего DNS; основной DNS через DHCP продолжит работать"
+        while iptables -t nat -D PREROUTING -i "$lan_if" -p udp --dport 53 -j "$DNS_HIJACK_CHAIN" 2>/dev/null; do :; done
+        while iptables -t nat -D PREROUTING -i "$lan_if" -p tcp --dport 53 -j "$DNS_HIJACK_CHAIN" 2>/dev/null; do :; done
+        iptables -t nat -F "$DNS_HIJACK_CHAIN" 2>/dev/null || true
+        iptables -t nat -X "$DNS_HIJACK_CHAIN" 2>/dev/null || true
+    fi
+
+    ip route flush cache 2>/dev/null || true
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$device" > "$ROUTING_STATE_FILE"
+
+    say "TUN-маршрутизация включена: $lan_if -> mark $TUN_MARK -> table $TUN_TABLE -> $device"
+}
+
 start_mihomo() {
     if pid="$(running_pid)"; then
+        if tun_enabled; then
+            setup_tun_routing || return 1
+        fi
         echo "Mihomo уже запущен, PID=$pid"
         return 0
     fi
 
-    [ -f "$RUNTIME_CONFIG" ] ||
-        fail "Сначала выполни: goshacrash apply" ||
+    [ -f "$RUNTIME_CONFIG" ] || {
+        fail "Сначала выполни: goshacrash apply"
         return 1
+    }
+
+    remove_tun_routing
 
     if tun_enabled && ! ensure_tun_device; then
         fail "В системе нет рабочего /dev/net/tun"
@@ -495,8 +746,8 @@ start_mihomo() {
 
     desired_dns_mode="$(detect_dns_mode "$RUNTIME_CONFIG")"
 
-    # Keep native ASUS DNS available while Mihomo is bootstrapping.
-    # Only after Mihomo is listening on 1053 do we switch dnsmasq upstream.
+    # Keep native ASUS DNS while Mihomo starts. Switch dnsmasq only after the
+    # local Mihomo DNS listener is confirmed.
     if [ "$desired_dns_mode" != none ]; then
         write_dnsmasq_mode none >/dev/null 2>&1 || true
         restart_dnsmasq >/dev/null 2>&1 || true
@@ -507,7 +758,7 @@ start_mihomo() {
     rotate_log
     rm -f "$PID_FILE"
 
-    "$BIN" -d "$BASE" -f "$RUNTIME_CONFIG" >> "$LOG_FILE" 2>&1 &
+    GOGC="${GOGC:-50}" "$BIN" -d "$BASE" -f "$RUNTIME_CONFIG" >> "$LOG_FILE" 2>&1 &
     pid=$!
     printf '%s\n' "$pid" > "$PID_FILE"
 
@@ -516,8 +767,9 @@ start_mihomo() {
     if ! running_pid >/dev/null 2>&1; then
         echo "Mihomo завершился при запуске" >&2
         rm -f "$PID_FILE"
-        tail -n 60 "$LOG_FILE" 2>/dev/null
+        tail -n 80 "$LOG_FILE" 2>/dev/null
         restore_system_dns
+        remove_tun_routing
         return 1
     fi
 
@@ -529,6 +781,7 @@ start_mihomo() {
                 port_listeners "$dns_port" >&2 || true
                 kill_mihomo_process >/dev/null 2>&1 || true
                 restore_system_dns
+                remove_tun_routing
                 tail -n 80 "$LOG_FILE" 2>/dev/null
                 return 1
             fi
@@ -540,6 +793,7 @@ start_mihomo() {
                 port_listeners 53 >&2 || true
                 kill_mihomo_process >/dev/null 2>&1 || true
                 restore_system_dns
+                remove_tun_routing
                 tail -n 80 "$LOG_FILE" 2>/dev/null
                 return 1
             fi
@@ -552,6 +806,7 @@ start_mihomo() {
             warn "Не удалось направить dnsmasq в Mihomo"
             kill_mihomo_process >/dev/null 2>&1 || true
             restore_system_dns
+            remove_tun_routing
             tail -n 80 "$LOG_FILE" 2>/dev/null
             return 1
         fi
@@ -561,6 +816,16 @@ start_mihomo() {
         warn "Mihomo запущен, но TUN-интерфейс не появился"
         kill_mihomo_process >/dev/null 2>&1 || true
         restore_system_dns
+        remove_tun_routing
+        tail -n 80 "$LOG_FILE" 2>/dev/null
+        return 1
+    fi
+
+    if tun_enabled && ! setup_tun_routing; then
+        warn "TUN создан, но ручная маршрутизация не установилась"
+        kill_mihomo_process >/dev/null 2>&1 || true
+        restore_system_dns
+        remove_tun_routing
         tail -n 80 "$LOG_FILE" 2>/dev/null
         return 1
     fi
@@ -568,6 +833,7 @@ start_mihomo() {
     pid="$(running_pid)"
     echo "Mihomo запущен, PID=$pid"
 }
+
 
 kill_mihomo_process() {
     if pid="$(running_pid)"; then
@@ -728,10 +994,13 @@ activate_dns_mode() {
 }
 
 stop_mihomo() {
+    say "Убираю TUN-маршрутизацию"
+    remove_tun_routing
     kill_mihomo_process
     say "Возвращаю штатный DNS ASUS"
     restore_system_dns
 }
+
 
 restart_dnsmasq() {
     if service restart_dnsmasq >/dev/null 2>&1; then
@@ -774,15 +1043,17 @@ backup_source() {
 }
 
 apply_config() {
-    [ -f "$SOURCE_CONFIG" ] ||
-        fail "Не найден личный config.yaml" ||
+    [ -f "$SOURCE_CONFIG" ] || {
+        fail "Не найден личный config.yaml"
         return 1
+    }
 
     mkdir -p "$BACKUP_DIR" "$STATE_DIR" "$BASE/run" "$BASE/logs"
 
-    backup="$(backup_source)" ||
-        fail "Не удалось создать резервную копию config.yaml" ||
+    backup="$(backup_source)" || {
+        fail "Не удалось создать резервную копию config.yaml"
         return 1
+    }
 
     say "Резервная копия: $backup"
 
@@ -794,24 +1065,33 @@ apply_config() {
         return 1
     }
 
-    say "Проверяю подготовленный runtime.yaml"
-    if ! check_file "$candidate"; then
-        rm -f "$candidate"
-        fail "Исходный config.yaml не применён"
-        return 1
-    fi
-
     if [ -f "$RUNTIME_CONFIG" ]; then
         cp "$RUNTIME_CONFIG" "$PREVIOUS_RUNTIME" 2>/dev/null || true
     else
         rm -f "$PREVIOUS_RUNTIME"
     fi
 
+    # GeoSite/GeoIP can consume most RAM on this router. Stop the old process
+    # before `mihomo -t`, otherwise two simultaneous loaders can OOM.
     stop_mihomo >/dev/null 2>&1 || true
 
-    mv -f "$candidate" "$RUNTIME_CONFIG" ||
-        fail "Не удалось установить runtime.yaml" ||
+    say "Проверяю подготовленный runtime.yaml"
+    if ! check_file "$candidate"; then
+        rm -f "$candidate"
+
+        if [ -f "$PREVIOUS_RUNTIME" ]; then
+            cp "$PREVIOUS_RUNTIME" "$RUNTIME_CONFIG" 2>/dev/null || true
+            start_mihomo >/dev/null 2>&1 || true
+        fi
+
+        fail "Исходный config.yaml не применён"
         return 1
+    fi
+
+    mv -f "$candidate" "$RUNTIME_CONFIG" || {
+        fail "Не удалось установить runtime.yaml"
+        return 1
+    }
 
     install_hooks || return 1
 
@@ -826,7 +1106,9 @@ apply_config() {
     status_mihomo
 }
 
+
 rollback_apply() {
+    remove_tun_routing
     kill_mihomo_process >/dev/null 2>&1 || true
     restore_system_dns
 
@@ -841,6 +1123,7 @@ rollback_apply() {
     fi
 }
 
+
 status_mihomo() {
     if pid="$(running_pid)"; then
         echo "Mihomo: работает, PID=$pid"
@@ -852,25 +1135,30 @@ status_mihomo() {
     echo "Личный конфиг: $SOURCE_CONFIG"
     echo "Runtime-конфиг: $RUNTIME_CONFIG"
     echo "DNS-режим: $(read_dns_mode)"
-    if [ "${GOSHACRASH_TUN_MODE:-dns-only}" = "dns-only" ]; then
-        echo "Режим совместимости: DNS работает, TUN отключён только в runtime.yaml"
-    fi
 
     if [ -f "$RUNTIME_CONFIG" ] && tun_enabled; then
         device="$(tun_device)"
-        [ -n "$device" ] || device="не указан"
+        [ -n "$device" ] || device="$TUN_DEVICE_DEFAULT"
 
         if [ -d "/sys/class/net/$device" ] || ifconfig "$device" >/dev/null 2>&1; then
             echo "TUN: работает ($device)"
         else
             echo "TUN: включён в конфиге, интерфейс $device не найден"
         fi
+
+        if tun_routing_active; then
+            echo "Маршрутизация TUN: работает (mark $TUN_MARK, table $TUN_TABLE)"
+        else
+            echo "Маршрутизация TUN: не установлена"
+        fi
     else
         echo "TUN: выключен"
+        echo "Маршрутизация TUN: выключена"
     fi
 
     show_ui
 }
+
 
 show_ui() {
     lan_ip="$(nvram get lan_ipaddr 2>/dev/null)"
@@ -1050,8 +1338,10 @@ dnsmasq_postconf() {
 
         forward:*)
             port="${mode#forward:}"
-            printf '%s\n' 'no-resolv' >> "$config_file"
-            printf '%s\n' "server=127.0.0.1#$port" >> "$config_file"
+            grep -qx 'no-resolv' "$config_file" 2>/dev/null ||
+                printf '%s\n' 'no-resolv' >> "$config_file"
+            grep -Fqx "server=127.0.0.1#$port" "$config_file" 2>/dev/null ||
+                printf '%s\n' "server=127.0.0.1#$port" >> "$config_file"
             ;;
 
         *)
@@ -1060,6 +1350,7 @@ dnsmasq_postconf() {
 
     exit 0
 }
+
 
 boot_service() {
     counter=0
@@ -1076,17 +1367,23 @@ boot_service() {
 
 firewall_reload() {
     if running_pid >/dev/null 2>&1; then
-        say "Firewall перезапущен, пересоздаю правила Mihomo"
-        stop_mihomo >/dev/null 2>&1 || true
-        start_mihomo
+        say "Firewall перезапущен, восстанавливаю правила GoshaCrash"
+        if tun_enabled; then
+            setup_tun_routing
+        else
+            remove_tun_routing
+        fi
     fi
 }
+
 
 doctor() {
     echo "=== GoshaCrash doctor ==="
     echo "BASE=$BASE"
     echo "USB=$USB_MOUNT"
     echo "ARCH=$(uname -m 2>/dev/null)"
+    echo "LAN_IF=$(lan_interface)"
+    echo "LAN_IP=$(lan_address)"
     echo
 
     [ -x "$BIN" ] && "$BIN" -v || echo "Mihomo: не найден"
@@ -1095,7 +1392,6 @@ doctor() {
     echo
     if [ -f "$SOURCE_CONFIG" ]; then
         echo "config.yaml: найден"
-        check_source || true
     else
         echo "config.yaml: не найден"
     fi
@@ -1114,9 +1410,33 @@ doctor() {
         echo "Нужные порты не найдены в netstat"
 
     echo
+    echo "TUN-интерфейс:"
+    device="$(tun_device)"
+    [ -n "$device" ] || device="$TUN_DEVICE_DEFAULT"
+    ip link show "$device" 2>&1 || true
+
+    echo
+    echo "Policy routing:"
+    ip rule show 2>/dev/null | grep -E "(^|[[:space:]])${TUN_RULE_PREF}:|fwmark ${TUN_MARK}" || echo "Правило GoshaCrash не найдено"
+    ip route show table "$TUN_TABLE" 2>/dev/null || true
+
+    echo
+    echo "iptables mangle:"
+    iptables -t mangle -L "$TUN_MANGLE_CHAIN" -n -v 2>/dev/null || echo "Цепочка не найдена"
+
+    echo
+    echo "iptables DNS hijack:"
+    iptables -t nat -L "$DNS_HIJACK_CHAIN" -n -v 2>/dev/null || echo "Цепочка не найдена"
+
+    echo
+    echo "Память:"
+    free 2>/dev/null || cat /proc/meminfo 2>/dev/null | head -n 8
+
+    echo
     echo "Последние строки журнала:"
-    tail -n 30 "$LOG_FILE" 2>/dev/null || echo "Журнал пуст"
+    tail -n 40 "$LOG_FILE" 2>/dev/null || echo "Журнал пуст"
 }
+
 
 restore_source() {
     requested="$1"
@@ -1250,6 +1570,15 @@ case "${1:-}" in
         firewall_reload
         ;;
 
+    tun-enable)
+        setup_tun_routing
+        ;;
+
+    tun-disable)
+        remove_tun_routing
+        echo "TUN-маршрутизация отключена; процесс Mihomo оставлен запущенным"
+        ;;
+
     update)
         update_goshacrash
         ;;
@@ -1270,6 +1599,8 @@ case "${1:-}" in
   goshacrash start
   goshacrash stop
   goshacrash restart
+  goshacrash tun-enable        восстановить ручную TUN-маршрутизацию
+  goshacrash tun-disable       убрать маршрутизацию, не останавливая Mihomo
   goshacrash logs [строки]
   goshacrash ui
   goshacrash version
