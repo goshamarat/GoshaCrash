@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-13-network-fresh-064
-# GoshaCrash 0.6.4 — network installer for Mihomo + Zashboard on stock ASUSWRT.
+# BUILD: 2026-07-13-network-ifs-fixed-066
+# GoshaCrash 0.6.6 — network installer for Mihomo + Zashboard on stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-VERSION="0.6.4-stock-asuswrt"
-BUILD_ID="2026-07-13-network-fresh-064"
+VERSION="0.6.6-stock-asuswrt"
+BUILD_ID="2026-07-13-network-ifs-fixed-066"
 MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.28}"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
@@ -85,55 +85,90 @@ lan_ifaces(){
 lan_ip(){ x="$(nvram get lan_ipaddr 2>/dev/null)"; [ -n "$x" ] || x=192.168.1.1; echo "$x"; }
 
 fetch(){
-    url="$1"; out="$2"; part="$out.part.$$"; err="/tmp/goshacrash-fetch.err.$$"
-    rm -f "$part" "$out" "$err"
+    url="$1"; out="$2"; part="$out.part.$$"; errors="/tmp/goshacrash-fetch-errors.$$"
+    rm -f "$part" "$out" "$errors"
 
-    wget_list="$(command -v wget 2>/dev/null) /opt/bin/wget /usr/bin/wget /bin/wget /usr/sbin/wget /sbin/wget"
-    for wget_bin in $wget_list; do
-        [ -n "$wget_bin" ] || continue
-        [ -x "$wget_bin" ] || continue
-
-        rm -f "$part" "$err"
-        say "Загрузчик: $wget_bin"
-        "$wget_bin" --no-check-certificate -O "$part" "$url" >"$err" 2>&1
-        rc=$?
-        [ "$rc" -eq 0 ] && [ -s "$part" ] && {
-            mv -f "$part" "$out"; rm -f "$err"; return 0;
-        }
-
-        rm -f "$part"
-        "$wget_bin" -O "$part" "$url" >"$err" 2>&1
-        rc=$?
-        [ "$rc" -eq 0 ] && [ -s "$part" ] && {
-            mv -f "$part" "$out"; rm -f "$err"; return 0;
-        }
-    done
-
-    if [ -x /bin/busybox ]; then
-        rm -f "$part" "$err"
-        /bin/busybox wget --no-check-certificate -O "$part" "$url" >"$err" 2>&1
-        rc=$?
-        [ "$rc" -eq 0 ] && [ -s "$part" ] && {
-            mv -f "$part" "$out"; rm -f "$err"; return 0;
-        }
+    if [ -n "${GOSHACRASH_WGET_CANDIDATES:-}" ]; then
+        saved_ifs="$IFS"
+        IFS=' '
+        set -- $GOSHACRASH_WGET_CANDIDATES
+        IFS="$saved_ifs"
+    else
+        detected_wget="$(command -v wget 2>/dev/null)"
+        set -- /usr/sbin/wget "$detected_wget" /opt/bin/wget /usr/bin/wget /bin/wget /sbin/wget
     fi
 
-    curl_list="$(command -v curl 2>/dev/null) /opt/bin/curl /usr/bin/curl /bin/curl"
-    for curl_bin in $curl_list; do
+    tried=" "
+    for wget_bin do
+        [ -n "$wget_bin" ] || continue
+        [ -x "$wget_bin" ] || continue
+        case "$tried" in *" $wget_bin "*) continue;; esac
+        tried="$tried$wget_bin "
+
+        for tls_mode in insecure normal; do
+            attempt="/tmp/goshacrash-fetch-attempt.$$"
+            rm -f "$part" "$attempt"
+            say "Загрузчик: $wget_bin ($tls_mode)"
+            if [ "$tls_mode" = insecure ]; then
+                "$wget_bin" --no-check-certificate -O "$part" "$url" >"$attempt" 2>&1
+            else
+                "$wget_bin" -O "$part" "$url" >"$attempt" 2>&1
+            fi
+            rc=$?
+            if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
+                mv -f "$part" "$out"; rm -f "$attempt" "$errors"; return 0
+            fi
+            {
+                printf '%s
+' "--- $wget_bin ($tls_mode), code=$rc ---"
+                [ -s "$attempt" ] && cat "$attempt" || printf '%s
+' '(нет текста ошибки)'
+            } >> "$errors"
+            rm -f "$part" "$attempt"
+        done
+    done
+
+    if [ -n "${GOSHACRASH_CURL_CANDIDATES:-}" ]; then
+        saved_ifs="$IFS"
+        IFS=' '
+        set -- $GOSHACRASH_CURL_CANDIDATES
+        IFS="$saved_ifs"
+    else
+        detected_curl="$(command -v curl 2>/dev/null)"
+        set -- "$detected_curl" /opt/bin/curl /usr/bin/curl /bin/curl
+    fi
+
+    tried=" "
+    for curl_bin do
         [ -n "$curl_bin" ] || continue
         [ -x "$curl_bin" ] || continue
-
-        rm -f "$part" "$err"
-        "$curl_bin" -k -f -L -o "$part" "$url" >"$err" 2>&1
+        case "$tried" in *" $curl_bin "*) continue;; esac
+        tried="$tried$curl_bin "
+        attempt="/tmp/goshacrash-fetch-attempt.$$"
+        rm -f "$part" "$attempt"
+        say "Загрузчик: $curl_bin"
+        "$curl_bin" -k -f -L -o "$part" "$url" >"$attempt" 2>&1
         rc=$?
-        [ "$rc" -eq 0 ] && [ -s "$part" ] && {
-            mv -f "$part" "$out"; rm -f "$err"; return 0;
-        }
+        if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
+            mv -f "$part" "$out"; rm -f "$attempt" "$errors"; return 0
+        fi
+        {
+            printf '%s
+' "--- $curl_bin, code=$rc ---"
+            [ -s "$attempt" ] && cat "$attempt" || printf '%s
+' '(нет текста ошибки)'
+        } >> "$errors"
+        rm -f "$part" "$attempt"
     done
 
     warn "Не удалось скачать $url"
-    [ -s "$err" ] && { warn "Последняя ошибка загрузчика:"; cat "$err" >&2; }
-    rm -f "$part" "$out" "$err"
+    if [ -s "$errors" ]; then
+        warn "Ошибки всех доступных загрузчиков:"
+        cat "$errors" >&2
+    else
+        warn "Не найден рабочий wget или curl"
+    fi
+    rm -f "$part" "$out" "$errors"
     return 1
 }
 

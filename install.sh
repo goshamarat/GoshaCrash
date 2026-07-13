@@ -1,15 +1,15 @@
 #!/bin/sh
-# BUILD: 2026-07-13-network-fresh-063
+# BUILD: 2026-07-13-network-ifs-fixed-066
 # GoshaCrash bootstrap installer for stock ASUSWRT.
 # Installs the controller to USB storage, then installs Mihomo, Zashboard,
 # DNS integration, TUN routing and Download Master autostart.
 
-INSTALLER_VERSION="0.6.4"
-BUILD_ID="2026-07-13-network-fresh-064"
+INSTALLER_VERSION="0.6.6"
+BUILD_ID="2026-07-13-network-ifs-fixed-066"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 ACTION="${1:-install}"
-EXPECTED_CONTROLLER_VERSION="0.6.4-stock-asuswrt"
+EXPECTED_CONTROLLER_VERSION="0.6.6-stock-asuswrt"
 
 say() {
     printf '%s\n' "[GoshaCrash installer] $*"
@@ -32,72 +32,105 @@ fetch() {
     url="$1"
     output="$2"
     part="$output.part.$$"
-    err="/tmp/goshacrash-fetch.err.$$"
-    rm -f "$part" "$output" "$err"
+    errors="/tmp/goshacrash-fetch-errors.$$"
+    rm -f "$part" "$output" "$errors"
 
-    # First use exactly the wget that works in the interactive ASUS shell.
-    wget_list="$(command -v wget 2>/dev/null) /opt/bin/wget /usr/bin/wget /bin/wget /usr/sbin/wget /sbin/wget"
-
-    for wget_bin in $wget_list; do
-        [ -n "$wget_bin" ] || continue
-        [ -x "$wget_bin" ] || continue
-
-        rm -f "$part" "$err"
-        say "Загрузчик: $wget_bin"
-        "$wget_bin" --no-check-certificate -O "$part" "$url" >"$err" 2>&1
-        rc=$?
-
-        if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
-            mv -f "$part" "$output"
-            rm -f "$err"
-            return 0
-        fi
-
-        rm -f "$part"
-        "$wget_bin" -O "$part" "$url" >"$err" 2>&1
-        rc=$?
-
-        if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
-            mv -f "$part" "$output"
-            rm -f "$err"
-            return 0
-        fi
-    done
-
-    if [ -x /bin/busybox ]; then
-        rm -f "$part" "$err"
-        /bin/busybox wget --no-check-certificate -O "$part" "$url" >"$err" 2>&1
-        rc=$?
-        if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
-            mv -f "$part" "$output"
-            rm -f "$err"
-            return 0
-        fi
+    # ASUSWRT has several unrelated wget binaries. The firmware GNU wget at
+    # /usr/sbin/wget is known to work on RT-AC68U, so try it first. Never call
+    # `busybox wget` blindly: many ASUS BusyBox builds do not include that applet.
+    if [ -n "${GOSHACRASH_WGET_CANDIDATES:-}" ]; then
+        saved_ifs="$IFS"
+        IFS=' '
+        set -- $GOSHACRASH_WGET_CANDIDATES
+        IFS="$saved_ifs"
+    else
+        detected_wget="$(command -v wget 2>/dev/null)"
+        set -- /usr/sbin/wget "$detected_wget" /opt/bin/wget /usr/bin/wget /bin/wget /sbin/wget
     fi
 
-    curl_list="$(command -v curl 2>/dev/null) /opt/bin/curl /usr/bin/curl /bin/curl"
-    for curl_bin in $curl_list; do
+    tried=" "
+    for wget_bin do
+        [ -n "$wget_bin" ] || continue
+        [ -x "$wget_bin" ] || continue
+        case "$tried" in *" $wget_bin "*) continue;; esac
+        tried="$tried$wget_bin "
+
+        for tls_mode in insecure normal; do
+            rm -f "$part"
+            attempt="/tmp/goshacrash-fetch-attempt.$$"
+            rm -f "$attempt"
+            say "Загрузчик: $wget_bin ($tls_mode)"
+
+            if [ "$tls_mode" = insecure ]; then
+                "$wget_bin" --no-check-certificate -O "$part" "$url" >"$attempt" 2>&1
+            else
+                "$wget_bin" -O "$part" "$url" >"$attempt" 2>&1
+            fi
+            rc=$?
+
+            if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
+                mv -f "$part" "$output"
+                rm -f "$attempt" "$errors"
+                return 0
+            fi
+
+            {
+                printf '%s
+' "--- $wget_bin ($tls_mode), code=$rc ---"
+                [ -s "$attempt" ] && cat "$attempt" || printf '%s
+' '(нет текста ошибки)'
+            } >> "$errors"
+            rm -f "$part" "$attempt"
+        done
+    done
+
+    if [ -n "${GOSHACRASH_CURL_CANDIDATES:-}" ]; then
+        saved_ifs="$IFS"
+        IFS=' '
+        set -- $GOSHACRASH_CURL_CANDIDATES
+        IFS="$saved_ifs"
+    else
+        detected_curl="$(command -v curl 2>/dev/null)"
+        set -- "$detected_curl" /opt/bin/curl /usr/bin/curl /bin/curl
+    fi
+
+    tried=" "
+    for curl_bin do
         [ -n "$curl_bin" ] || continue
         [ -x "$curl_bin" ] || continue
+        case "$tried" in *" $curl_bin "*) continue;; esac
+        tried="$tried$curl_bin "
 
-        rm -f "$part" "$err"
-        "$curl_bin" -k -f -L -o "$part" "$url" >"$err" 2>&1
+        attempt="/tmp/goshacrash-fetch-attempt.$$"
+        rm -f "$part" "$attempt"
+        say "Загрузчик: $curl_bin"
+        "$curl_bin" -k -f -L -o "$part" "$url" >"$attempt" 2>&1
         rc=$?
 
         if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
             mv -f "$part" "$output"
-            rm -f "$err"
+            rm -f "$attempt" "$errors"
             return 0
         fi
+
+        {
+            printf '%s
+' "--- $curl_bin, code=$rc ---"
+            [ -s "$attempt" ] && cat "$attempt" || printf '%s
+' '(нет текста ошибки)'
+        } >> "$errors"
+        rm -f "$part" "$attempt"
     done
 
     warn "Не удалось скачать $url"
-    if [ -s "$err" ]; then
-        warn "Последняя ошибка загрузчика:"
-        cat "$err" >&2
+    if [ -s "$errors" ]; then
+        warn "Ошибки всех доступных загрузчиков:"
+        cat "$errors" >&2
+    else
+        warn "Не найден рабочий wget или curl"
     fi
 
-    rm -f "$part" "$output" "$err"
+    rm -f "$part" "$output" "$errors"
     return 1
 }
 
@@ -105,20 +138,20 @@ fetch_controller() {
     output="$1"
     urls=""
 
-    if [ -n "${GOSHACRASH_URL:-}" ]; then
-        urls="$GOSHACRASH_URL"
-    else
-        nonce="${BUILD_ID}-$$"
-        urls="https://raw.githubusercontent.com/$REPO/$BRANCH/goshacrash?build=$nonce
-https://github.com/$REPO/raw/$BRANCH/goshacrash?build=$nonce
+    nonce="${BUILD_ID}-$$"
+    defaults="https://raw.githubusercontent.com/$REPO/$BRANCH/goshacrash?build=$nonce
+https://github.com/$REPO/raw/refs/heads/$BRANCH/goshacrash?build=$nonce
 https://testingcf.jsdelivr.net/gh/$REPO@$BRANCH/goshacrash?build=$nonce
 https://cdn.jsdelivr.net/gh/$REPO@$BRANCH/goshacrash?build=$nonce"
+
+    if [ -n "${GOSHACRASH_URL:-}" ]; then
+        urls="$GOSHACRASH_URL
+$defaults"
+    else
+        urls="$defaults"
     fi
 
-    old_ifs="$IFS"
-    IFS='
-'
-    for url in $urls; do
+    while IFS= read -r url; do
         [ -n "$url" ] || continue
         say "Скачиваю $url"
         if fetch "$url" "$output"; then
@@ -126,14 +159,14 @@ https://cdn.jsdelivr.net/gh/$REPO@$BRANCH/goshacrash?build=$nonce"
             first_line="$(sed -n '1p' "$output" 2>/dev/null)"
             got_version="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$output" 2>/dev/null | head -n 1)"
             if [ "$first_line" = '#!/bin/sh' ] && sh -n "$output" >/dev/null 2>&1 && [ "$got_version" = "$EXPECTED_CONTROLLER_VERSION" ]; then
-                IFS="$old_ifs"
                 return 0
             fi
             warn "Отклонён контроллер: версия '${got_version:-не определена}', ожидалась '$EXPECTED_CONTROLLER_VERSION'"
         fi
         rm -f "$output"
-    done
-    IFS="$old_ifs"
+    done <<URLS_EOF
+$urls
+URLS_EOF
     return 1
 }
 
@@ -248,8 +281,14 @@ install_controller() {
     chmod 755 "$target" || return 1
 
     printf '%s\n' "$base" > /tmp/goshacrash-install-base
+    installed_version="$("$target" version 2>/dev/null)"
+    [ "$installed_version" = "$EXPECTED_CONTROLLER_VERSION" ] || {
+        fail "После установки получена неверная версия контроллера: ${installed_version:-не определена}"
+        [ -f "$backup" ] && mv -f "$backup" "$target"
+        return 1
+    }
     say "Контроллер установлен: $target"
-    "$target" version 2>/dev/null || true
+    say "Версия контроллера: $installed_version"
 
     write_wrapper "$mount" "$base" || return 1
 
