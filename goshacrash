@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-13-network-fresh-063
-# GoshaCrash 0.6.3 — network installer for Mihomo + Zashboard on stock ASUSWRT.
+# BUILD: 2026-07-13-network-fresh-064
+# GoshaCrash 0.6.4 — network installer for Mihomo + Zashboard on stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-VERSION="0.6.3-stock-asuswrt"
-BUILD_ID="2026-07-13-network-fresh-063"
+VERSION="0.6.4-stock-asuswrt"
+BUILD_ID="2026-07-13-network-fresh-064"
 MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.28}"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
@@ -353,6 +353,21 @@ render_runtime(){
     sed -i '/^[[:space:]]*global-client-fingerprint:/d' "$out"
     if grep -q '^[[:space:]]*geo-auto-update:' "$out"; then sed -i 's/^[[:space:]]*geo-auto-update:.*/geo-auto-update: false/' "$out"
     else printf '\ngeo-auto-update: false\n' >> "$out"; fi
+    if ! grep -Eq '^dns:[[:space:]]*($|#)' "$out"; then
+        cat >> "$out" <<DNS_RUNTIME
+
+dns:
+  enable: true
+  listen: $DNS_HOST:$DNS_PORT
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver: [$DNS_BOOTSTRAP, 1.1.1.1]
+  nameserver: [tls://1.1.1.1, tls://9.9.9.9]
+  proxy-server-nameserver: [$DNS_BOOTSTRAP, 1.1.1.1]
+  direct-nameserver: [$DNS_BOOTSTRAP, 1.1.1.1]
+DNS_RUNTIME
+    fi
     awk -v h="$DNS_HOST" -v p="$DNS_PORT" '
       /^dns:[[:space:]]*($|#)/ {d=1; seen=0; print; next}
       d && /^[^[:space:]#]/ {if(!seen) print "  listen: " h ":" p; d=0}
@@ -435,7 +450,8 @@ remove_routing(){
 
 setup_dns_hijack(){
     iptables -t nat -N "$DNS_CHAIN" 2>/dev/null || true; iptables -t nat -F "$DNS_CHAIN" || return 1
-    iptables -t nat -A "$DNS_CHAIN" -j REDIRECT --to-ports 53 || return 1
+    iptables -t nat -A "$DNS_CHAIN" -p udp -j REDIRECT --to-ports 53 || return 1
+    iptables -t nat -A "$DNS_CHAIN" -p tcp -j REDIRECT --to-ports 53 || return 1
     for i in $(lan_ifaces); do
         while iptables -t nat -D PREROUTING -i "$i" -p udp --dport 53 -j "$DNS_CHAIN" 2>/dev/null; do :; done
         while iptables -t nat -D PREROUTING -i "$i" -p tcp --dport 53 -j "$DNS_CHAIN" 2>/dev/null; do :; done

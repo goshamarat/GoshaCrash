@@ -4,11 +4,12 @@
 # Installs the controller to USB storage, then installs Mihomo, Zashboard,
 # DNS integration, TUN routing and Download Master autostart.
 
-INSTALLER_VERSION="0.6.3"
-BUILD_ID="2026-07-13-network-fresh-063"
+INSTALLER_VERSION="0.6.4"
+BUILD_ID="2026-07-13-network-fresh-064"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 ACTION="${1:-install}"
+EXPECTED_CONTROLLER_VERSION="0.6.4-stock-asuswrt"
 
 say() {
     printf '%s\n' "[GoshaCrash installer] $*"
@@ -102,26 +103,37 @@ fetch() {
 
 fetch_controller() {
     output="$1"
+    urls=""
 
     if [ -n "${GOSHACRASH_URL:-}" ]; then
-        say "Скачиваю контроллер из GOSHACRASH_URL"
-        fetch "$GOSHACRASH_URL" "$output"
-        return $?
+        urls="$GOSHACRASH_URL"
+    else
+        nonce="${BUILD_ID}-$$"
+        urls="https://raw.githubusercontent.com/$REPO/$BRANCH/goshacrash?build=$nonce
+https://github.com/$REPO/raw/$BRANCH/goshacrash?build=$nonce
+https://testingcf.jsdelivr.net/gh/$REPO@$BRANCH/goshacrash?build=$nonce
+https://cdn.jsdelivr.net/gh/$REPO@$BRANCH/goshacrash?build=$nonce"
     fi
 
-    jsdelivr_url="https://testingcf.jsdelivr.net/gh/$REPO@$BRANCH/goshacrash"
-    raw_url="https://raw.githubusercontent.com/$REPO/$BRANCH/goshacrash"
-    jsdelivr2_url="https://cdn.jsdelivr.net/gh/$REPO@$BRANCH/goshacrash"
-    github_url="https://github.com/$REPO/raw/$BRANCH/goshacrash"
-
-    for url in "$jsdelivr_url" "$raw_url" "$jsdelivr2_url" "$github_url"; do
+    old_ifs="$IFS"
+    IFS='
+'
+    for url in $urls; do
+        [ -n "$url" ] || continue
         say "Скачиваю $url"
         if fetch "$url" "$output"; then
-            return 0
+            sed -i 's/\r$//' "$output" 2>/dev/null || true
+            first_line="$(sed -n '1p' "$output" 2>/dev/null)"
+            got_version="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$output" 2>/dev/null | head -n 1)"
+            if [ "$first_line" = '#!/bin/sh' ] && sh -n "$output" >/dev/null 2>&1 && [ "$got_version" = "$EXPECTED_CONTROLLER_VERSION" ]; then
+                IFS="$old_ifs"
+                return 0
+            fi
+            warn "Отклонён контроллер: версия '${got_version:-не определена}', ожидалась '$EXPECTED_CONTROLLER_VERSION'"
         fi
-        warn "Не удалось скачать $url"
+        rm -f "$output"
     done
-
+    IFS="$old_ifs"
     return 1
 }
 
