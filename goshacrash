@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-13-dns-detect-fix-072
-# GoshaCrash 0.7.2 — slim installer, menu, nano detection and fixed DNS forwarding for stock ASUSWRT.
+# BUILD: 2026-07-13-shellcrash-dns-hijack-073
+# GoshaCrash 0.7.3 — ShellCrash-style DNS hijack for stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-VERSION="0.7.2-stock-asuswrt"
-BUILD_ID="2026-07-13-dns-detect-fix-072"
+VERSION="0.7.3-stock-asuswrt"
+BUILD_ID="2026-07-13-shellcrash-dns-hijack-073"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
@@ -23,11 +23,7 @@ STATE="$BASE/state"
 
 JFFS_BASE="/jffs/addons/goshacrash"
 JFFS_BASE_FILE="$JFFS_BASE/base"
-JFFS_DNS_MODE="$JFFS_BASE/dns.mode"
 RESOLV="${STOCK_RESOLV_DNSMASQ:-/tmp/resolv.dnsmasq}"
-RESOLV_BACKUP="$STATE/resolv.dnsmasq.original"
-DNS_MARK="# GOSHACRASH_STOCK_DNS"
-DNS_HOST="${MIHOMO_DNS_HOST:-127.0.0.1}"
 DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
 DNS_BOOTSTRAP="${DNS_BOOTSTRAP:-9.9.9.9}"
 
@@ -235,7 +231,7 @@ profile:
 geo-auto-update: false
 dns:
   enable: true
-  listen: 127.0.0.1:1053
+  listen: :1053
   ipv6: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
@@ -334,7 +330,7 @@ render_runtime(){
 
 dns:
   enable: true
-  listen: $DNS_HOST:$DNS_PORT
+  listen: :$DNS_PORT
   ipv6: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
@@ -344,12 +340,12 @@ dns:
   direct-nameserver: [$DNS_BOOTSTRAP, 1.1.1.1]
 DNS_RUNTIME
     fi
-    awk -v h="$DNS_HOST" -v p="$DNS_PORT" '
+    awk -v p="$DNS_PORT" '
       /^dns:[[:space:]]*($|#)/ {d=1; seen=0; print; next}
-      d && /^[^[:space:]#]/ {if(!seen) print "  listen: " h ":" p; d=0}
-      d && /^[[:space:]]+listen:[[:space:]]*/ {print "  listen: " h ":" p; seen=1; next}
+      d && /^[^[:space:]#]/ {if(!seen) print "  listen: :" p; d=0}
+      d && /^[[:space:]]+listen:[[:space:]]*/ {print "  listen: :" p; seen=1; next}
       {print}
-      END {if(d&&!seen) print "  listen: " h ":" p}
+      END {if(d&&!seen) print "  listen: :" p}
     ' "$out" > "$out.dns" || return 1; mv -f "$out.dns" "$out" || return 1
     awk -v b="$DNS_BOOTSTRAP" '
       /^dns:[[:space:]]*($|#)/ {d=1; print; next}
@@ -425,14 +421,21 @@ remove_routing(){
 }
 
 setup_dns_hijack(){
-    iptables -t nat -N "$DNS_CHAIN" 2>/dev/null || true; iptables -t nat -F "$DNS_CHAIN" || return 1
-    iptables -t nat -A "$DNS_CHAIN" -p udp -j REDIRECT --to-ports 53 || return 1
-    iptables -t nat -A "$DNS_CHAIN" -p tcp -j REDIRECT --to-ports 53 || return 1
+    port="$1"
+    case "$port" in ''|*[!0-9]*) return 1;; esac
+    iptables -t nat -N "$DNS_CHAIN" 2>/dev/null || true
+    iptables -t nat -F "$DNS_CHAIN" || return 1
+
+    # ShellCrash-style DNS hijack: LAN TCP/UDP port 53 -> Mihomo DNS port.
+    # Protocol is explicit because old ASUS iptables rejects REDIRECT without it.
+    iptables -t nat -A "$DNS_CHAIN" -p tcp -j REDIRECT --to-ports "$port" || return 1
+    iptables -t nat -A "$DNS_CHAIN" -p udp -j REDIRECT --to-ports "$port" || return 1
+
     for i in $(lan_ifaces); do
-        while iptables -t nat -D PREROUTING -i "$i" -p udp --dport 53 -j "$DNS_CHAIN" 2>/dev/null; do :; done
         while iptables -t nat -D PREROUTING -i "$i" -p tcp --dport 53 -j "$DNS_CHAIN" 2>/dev/null; do :; done
-        iptables -t nat -I PREROUTING 1 -i "$i" -p udp --dport 53 -j "$DNS_CHAIN" || return 1
+        while iptables -t nat -D PREROUTING -i "$i" -p udp --dport 53 -j "$DNS_CHAIN" 2>/dev/null; do :; done
         iptables -t nat -I PREROUTING 1 -i "$i" -p tcp --dport 53 -j "$DNS_CHAIN" || return 1
+        iptables -t nat -I PREROUTING 1 -i "$i" -p udp --dport 53 -j "$DNS_CHAIN" || return 1
     done
 }
 
@@ -460,81 +463,97 @@ setup_routing(){
         iptables -A "$FILTER_CHAIN" -i "$d" -o "$i" -j ACCEPT || return 1
     done
     iptables -I FORWARD 1 -j "$FILTER_CHAIN" || { remove_routing; return 1; }
-    setup_dns_hijack || warn "Не включён принудительный DNS-перехват"
+    dns_mode="$(detect_dns_mode "$RUNTIME")"
+    case "$dns_mode" in
+        forward:*)
+            dns_port="${dns_mode#forward:}"
+            setup_dns_hijack "$dns_port" || warn "Не включён DNS-перехват 53->$dns_port"
+            ;;
+        *) warn "DNS в runtime.yaml не включён; перехват порта 53 пропущен";;
+    esac
     ip route flush cache 2>/dev/null || true
     say "TUN включён: $(lan_ifaces) -> table $TUN_TABLE -> $d"
 }
 
-write_dns_state(){ mkdir -p "$JFFS_BASE" || return 1; echo "$1" > "$JFFS_DNS_MODE"; }
-read_dns_state(){
-    if [ -f "$RESOLV" ]; then
-        actual="$(sed -n 's/^server=127\.0\.0\.1#\([0-9][0-9]*\)$/forward:\1/p' "$RESOLV" 2>/dev/null | head -n 1)"
-        [ -n "$actual" ] && { echo "$actual"; return; }
-    fi
-    [ -f "$JFFS_DNS_MODE" ] && cat "$JFFS_DNS_MODE" || echo none
+dns_hijack_port(){
+    iptables -t nat -S "$DNS_CHAIN" 2>/dev/null |
+        sed -n 's/.*--to-ports \([0-9][0-9]*\).*/\1/p' |
+        head -n 1
 }
 
-write_dns(){
-    mode="$1"; next="$RESOLV.goshacrash.next"; mkdir -p "$STATE" "$JFFS_BASE" || return 1
-    [ -f "$RESOLV" ] || { fail "Не найден $RESOLV"; return 1; }
+dns_status(){
+    mode="$(detect_dns_mode "$RUNTIME")"
     case "$mode" in
         forward:*)
-            p="${mode#forward:}"
-            grep -Fqx "$DNS_MARK" "$RESOLV" 2>/dev/null || cp "$RESOLV" "$RESOLV_BACKUP" || return 1
-            src="$RESOLV_BACKUP"; [ -f "$src" ] || src="$RESOLV"
-            { echo "$DNS_MARK"; echo "server=$DNS_HOST#$p"; awk '/^[[:space:]]*server=\//{print}' "$src"; } > "$next" || return 1
-            mv -f "$next" "$RESOLV" || return 1;;
-        none)
-            if grep -Fqx "$DNS_MARK" "$RESOLV" 2>/dev/null; then
-                if [ -f "$RESOLV_BACKUP" ]; then cp "$RESOLV_BACKUP" "$RESOLV" || return 1
-                else awk -v m="$DNS_MARK" -v l="server=$DNS_HOST#$DNS_PORT" '$0!=m&&$0!=l{print}' "$RESOLV" > "$next" && mv -f "$next" "$RESOLV"; fi
+            port="${mode#forward:}"
+            if netstat -ln 2>/dev/null | grep -Eq "[:.]$port[[:space:]]"; then
+                active="$(dns_hijack_port)"
+                if [ "$active" = "$port" ]; then
+                    echo "hijack:53->$port"
+                else
+                    echo "listener:$port (hijack off)"
+                fi
+            else
+                echo "configured:$port (not listening)"
             fi
-            rm -f "$RESOLV_BACKUP";;
-        exclusive53) fail "На stock ASUSWRT порт 53 остаётся у dnsmasq"; return 1;;
-        *) return 1;;
-    esac
-    write_dns_state "$mode"
-}
-
-reload_dnsmasq(){ killall -HUP dnsmasq >/dev/null 2>&1; }
-restore_dns(){ write_dns none >/dev/null 2>&1 || true; reload_dnsmasq >/dev/null 2>&1 || true; }
-activate_dns(){
-    mode="$1"
-    write_dns "$mode" || return 1
-    case "$mode" in
-        forward:*)
-            p="${mode#forward:}"
-            grep -Fqx "server=$DNS_HOST#$p" "$RESOLV" 2>/dev/null || {
-                fail "dnsmasq не переключён на $DNS_HOST:$p"
-                return 1
-            }
             ;;
+        *) echo none;;
     esac
-    reload_dnsmasq || return 1
-    sleep 1
 }
 
 start_mihomo(){
     if p="$(running_pid)"; then
-        mode="$(detect_dns_mode "$RUNTIME")"; [ "$mode" = none ] || activate_dns "$mode" >/dev/null 2>&1 || true
-        tun_enabled && setup_routing || true; echo "Mihomo уже запущен, PID=$p"; return 0
+        tun_enabled && setup_routing || true
+        echo "Mihomo уже запущен, PID=$p"
+        return 0
     fi
+
     [ -f "$RUNTIME" ] || { fail "Сначала выполни: goshacrash apply"; return 1; }
     tun_enabled && ensure_tun || { tun_enabled && { fail "Нет /dev/net/tun"; return 1; }; }
     check_file "$RUNTIME" || return 1
+
+    remove_routing
+    ensure_dirs || return 1
+    rm -f "$PIDFILE"
+    [ -f "$LOGFILE" ] && [ "$(wc -c < "$LOGFILE" 2>/dev/null)" -gt 1048576 ] 2>/dev/null &&
+        mv -f "$LOGFILE" "$LOGFILE.previous"
+
+    GOGC="${GOGC:-50}" "$BIN" -d "$BASE" -f "$RUNTIME" >> "$LOGFILE" 2>&1 &
+    p=$!
+    echo "$p" > "$PIDFILE"
+    sleep 2
+
+    running_pid >/dev/null 2>&1 || {
+        fail "Mihomo завершился"
+        tail -n 80 "$LOGFILE"
+        return 1
+    }
+
     mode="$(detect_dns_mode "$RUNTIME")"
-    [ "$mode" = none ] || { write_dns none >/dev/null 2>&1 || true; reload_dnsmasq >/dev/null 2>&1 || true; }
-    remove_routing; ensure_dirs || return 1; rm -f "$PIDFILE"
-    [ -f "$LOGFILE" ] && [ "$(wc -c < "$LOGFILE" 2>/dev/null)" -gt 1048576 ] 2>/dev/null && mv -f "$LOGFILE" "$LOGFILE.previous"
-    GOGC="${GOGC:-50}" "$BIN" -d "$BASE" -f "$RUNTIME" >> "$LOGFILE" 2>&1 & p=$!; echo "$p" > "$PIDFILE"; sleep 2
-    running_pid >/dev/null 2>&1 || { fail "Mihomo завершился"; tail -n 80 "$LOGFILE"; restore_dns; return 1; }
-    case "$mode" in forward:*) wait_port "${mode#forward:}" || { kill_mihomo; restore_dns; return 1; };; exclusive53) wait_port 53 || { kill_mihomo; restore_dns; return 1; };; esac
-    [ "$mode" = none ] || { say "Переключаю dnsmasq: $mode"; activate_dns "$mode" || { kill_mihomo; restore_dns; return 1; }; }
-    if tun_enabled; then wait_tun || { kill_mihomo; restore_dns; return 1; }; setup_routing || { kill_mihomo; restore_dns; return 1; }; fi
+    case "$mode" in
+        forward:*)
+            port="${mode#forward:}"
+            wait_port "$port" || {
+                kill_mihomo
+                fail "Mihomo DNS не слушает порт $port"
+                return 1
+            }
+            ;;
+    esac
+
+    if tun_enabled; then
+        wait_tun || { kill_mihomo; return 1; }
+        setup_routing || { kill_mihomo; return 1; }
+    fi
+
     echo "Mihomo запущен, PID=$p"
 }
 
-stop_mihomo(){ remove_routing; kill_mihomo; restore_dns; echo "Mihomo остановлен"; }
+stop_mihomo(){
+    remove_routing
+    kill_mihomo
+    echo "Mihomo остановлен"
+}
 
 backup_config(){
     ensure_dirs || return 1; [ -f "$CONFIG" ] || return 1
@@ -604,19 +623,18 @@ check_config(){ ensure_dirs || return 1; t="$BASE/run/check.yaml"; render_runtim
 boot_service(){
     n=0; while [ ! -x "$BIN" ] && [ "$n" -lt 30 ]; do sleep 2; n=$((n+1)); done
     [ -x "$BIN" ] || return 1; [ -f "$RUNTIME" ] || return 0
-    n=0; while [ ! -f "$RESOLV" ] && [ "$n" -lt 30 ]; do sleep 2; n=$((n+1)); done
     start_mihomo
 }
 
 firewall_reload(){
-    running_pid >/dev/null 2>&1 || return 0; say "Восстанавливаю DNS и iptables"
-    m="$(detect_dns_mode "$RUNTIME")"; [ "$m" = none ] || { write_dns "$m" || warn "DNS не восстановлен"; reload_dnsmasq >/dev/null 2>&1 || true; }
+    running_pid >/dev/null 2>&1 || return 0
+    say "Восстанавливаю TUN и DNS-перехват"
     tun_enabled && setup_routing || remove_routing
 }
 
 status(){
     if p="$(running_pid)"; then echo "Mihomo: работает, PID=$p"; else echo "Mihomo: не запущен"; fi
-    echo "GoshaCrash: $VERSION"; echo "BASE: $BASE"; echo "DNS: $(read_dns_state)"
+    echo "GoshaCrash: $VERSION"; echo "BASE: $BASE"; echo "DNS: $(dns_status)"
     if tun_enabled; then d="$(tun_device)"; ip link show "$d" >/dev/null 2>&1 && echo "TUN: $d работает" || echo "TUN: $d не найден"; else echo "TUN: выключен"; fi
     c="$(yaml_top "$RUNTIME" external-controller)"; [ -n "$c" ] || c=0.0.0.0:9090; p="${c##*:}"; p="$(echo "$p" | sed 's/[^0-9].*$//')"; [ -n "$p" ] || p=9090
     echo "Zashboard: http://$(lan_ip):$p/ui/"; s="$(yaml_top "$RUNTIME" secret)"; [ -n "$s" ] && echo "API secret: $s"
@@ -625,7 +643,7 @@ status(){
 doctor(){
     echo "=== GoshaCrash doctor ==="; echo "BASE=$BASE"; echo "USB=$USB_MOUNT"; echo "ARCH=$(uname -m)"; echo "LAN=$(lan_ifaces)"; echo "IP=$(lan_ip)"; echo
     [ -x "$BIN" ] && "$BIN" -v || echo "Mihomo: NOT FOUND"; [ -c /dev/net/tun ] && echo "/dev/net/tun: OK" || echo "/dev/net/tun: NOT FOUND"; echo
-    status; echo; echo "=== $RESOLV ==="; cat "$RESOLV" 2>/dev/null || true; echo
+    status; echo; echo "=== stock dnsmasq upstreams (unchanged) ==="; cat "$RESOLV" 2>/dev/null || true; echo
     echo "=== ports ==="; netstat -lnp 2>/dev/null | grep -E '(:53[[:space:]]|:1053[[:space:]]|:9090[[:space:]]|:7892[[:space:]])' || true; echo
     echo "=== routes ==="; ip rule show 2>/dev/null | grep -E "($TUN_PREF|$TUN_TABLE|$TUN_MARK)" || true; ip route show table "$TUN_TABLE" 2>/dev/null || true; echo
     echo "=== iptables ==="; iptables -t mangle -L "$MANGLE_CHAIN" -n -v 2>/dev/null || true; iptables -t nat -L "$DNS_CHAIN" -n -v 2>/dev/null || true; echo

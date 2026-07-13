@@ -1,15 +1,15 @@
 #!/bin/sh
-# BUILD: 2026-07-13-dns-detect-fix-072
+# BUILD: 2026-07-13-shellcrash-dns-hijack-073
 # GoshaCrash bootstrap installer for stock ASUSWRT.
 # Installs the controller to USB storage, then installs Mihomo, Zashboard,
 # DNS integration, TUN routing and Download Master autostart.
 
-INSTALLER_VERSION="0.7.2"
-BUILD_ID="2026-07-13-dns-detect-fix-072"
+INSTALLER_VERSION="0.7.3"
+BUILD_ID="2026-07-13-shellcrash-dns-hijack-073"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 ACTION="${1:-install}"
-EXPECTED_CONTROLLER_VERSION="0.7.2-stock-asuswrt"
+EXPECTED_CONTROLLER_VERSION="0.7.3-stock-asuswrt"
 
 say() {
     printf '%s\n' "[GoshaCrash installer] $*"
