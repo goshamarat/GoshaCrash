@@ -1,1613 +1,531 @@
 #!/bin/sh
-# GoshaCrash controller for ASUSWRT / Asuswrt-Merlin.
-# User edits config.yaml. GoshaCrash creates runtime.yaml with router-only fixes.
+# GoshaCrash 0.5.0 — Mihomo + Zashboard for stock ASUSWRT.
+# Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-GOSHACRASH_VERSION="0.4.0-manual-tun"
-REPO="${REPO:-goshamarat/GoshaCrash}"
-BRANCH="${BRANCH:-main}"
+VERSION="0.5.0-stock-asuswrt"
+MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.28}"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
-
-BIN="$BASE/bin/mihomo"
-SOURCE_CONFIG="$BASE/config.yaml"
-RUNTIME_CONFIG="$BASE/runtime.yaml"
-PREVIOUS_RUNTIME="$BASE/runtime.previous.yaml"
-PID_FILE="$BASE/run/mihomo.pid"
-LOG_FILE="$BASE/logs/mihomo.log"
-BACKUP_DIR="$BASE/backups"
-STATE_DIR="$BASE/state"
 USB_MOUNT="$(dirname "$BASE")"
+BIN="$BASE/bin/mihomo"
+UI="$BASE/ui"
+CONFIG="$BASE/config.yaml"
+RUNTIME="$BASE/runtime.yaml"
+PREVIOUS="$BASE/runtime.previous.yaml"
+PIDFILE="$BASE/run/mihomo.pid"
+LOGFILE="$BASE/logs/mihomo.log"
+BACKUPS="$BASE/backups"
+STATE="$BASE/state"
 
 JFFS_BASE="/jffs/addons/goshacrash"
 JFFS_BASE_FILE="$JFFS_BASE/base"
 JFFS_DNS_MODE="$JFFS_BASE/dns.mode"
-DNSMASQ_ADD="/jffs/configs/dnsmasq.conf.add"
-DNS_MARK_BEGIN="# GOSHACRASH_DNS_BEGIN"
-DNS_MARK_END="# GOSHACRASH_DNS_END"
-DNS_OLD_MARK_BEGIN="# GOSHACRASH_DNS_TEST_BEGIN"
-DNS_OLD_MARK_END="# GOSHACRASH_DNS_TEST_END"
-MIHOMO_DNS_HOST="${MIHOMO_DNS_HOST:-127.0.0.1}"
-MIHOMO_DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
+RESOLV="${STOCK_RESOLV_DNSMASQ:-/tmp/resolv.dnsmasq}"
+RESOLV_BACKUP="$STATE/resolv.dnsmasq.original"
+DNS_MARK="# GOSHACRASH_STOCK_DNS"
+DNS_HOST="${MIHOMO_DNS_HOST:-127.0.0.1}"
+DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
 DNS_BOOTSTRAP="${DNS_BOOTSTRAP:-9.9.9.9}"
 
-# Manual TUN routing for older ASUSWRT kernels. Mihomo creates only the
-# interface; GoshaCrash creates policy routing and firewall rules.
-TUN_MODE="${GOSHACRASH_TUN_MODE:-manual}"
-TUN_DEVICE_DEFAULT="${GOSHACRASH_TUN_DEVICE:-mihomo0}"
+TUN_DEVICE="${GOSHACRASH_TUN_DEVICE:-mihomo0}"
 TUN_MTU="${GOSHACRASH_TUN_MTU:-1500}"
 TUN_TABLE="${GOSHACRASH_TUN_TABLE:-2022}"
 TUN_MARK="${GOSHACRASH_TUN_MARK:-0x2333}"
-TUN_RULE_PREF="${GOSHACRASH_TUN_RULE_PREF:-10010}"
-TUN_MANGLE_CHAIN="GOSHACRASH_TUN"
-TUN_FILTER_CHAIN="GOSHACRASH_FORWARD"
-DNS_HIJACK_CHAIN="GOSHACRASH_DNS_HIJACK"
-ROUTING_STATE_FILE="$STATE_DIR/tun-routing.enabled"
+TUN_PREF="${GOSHACRASH_TUN_PREF:-10010}"
+MANGLE_CHAIN="GOSHACRASH_TUN"
+FILTER_CHAIN="GOSHACRASH_FORWARD"
+DNS_CHAIN="GOSHACRASH_DNS_HIJACK"
 
 PATH="/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin:/opt/sbin:$USB_MOUNT/asusware.arm/bin:$USB_MOUNT/asusware.arm/sbin"
 export PATH
 
-say() {
-    printf '%s\n' "[GoshaCrash] $*"
-}
+say(){ printf '%s\n' "[GoshaCrash] $*"; }
+warn(){ printf '%s\n' "[GoshaCrash:WARN] $*" >&2; }
+fail(){ printf '%s\n' "[GoshaCrash:ERROR] $*" >&2; return 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
 
-warn() {
-    printf '%s\n' "[GoshaCrash:WARN] $*" >&2
-}
+ensure_dirs(){ mkdir -p "$BASE/bin" "$UI" "$BASE/run" "$BASE/logs" "$BACKUPS" "$STATE"; }
 
-fail() {
-    printf '%s\n' "[GoshaCrash:ERROR] $*" >&2
+is_true(){
+    case "$1" in true|True|TRUE|yes|Yes|YES|1|on|On|ON) return 0;; esac
     return 1
 }
 
-find_program() {
-    program="$1"
-    old_ifs="$IFS"
-    IFS=:
-
-    for directory in $PATH; do
-        if [ -x "$directory/$program" ]; then
-            printf '%s\n' "$directory/$program"
-            IFS="$old_ifs"
-            return 0
-        fi
-    done
-
-    IFS="$old_ifs"
-    return 1
+strip_value(){
+    printf '%s\n' "$1" | sed -e 's/[[:space:]]*#.*$//' -e 's/^[[:space:]]*//' \
+        -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"
 }
 
-fetch() {
-    url="$1"
-    output="$2"
-
-    rm -f "$output"
-
-    # Always prefer firmware utilities. Old Download Master /opt binaries
-    # can shadow them and may have broken TLS options or CA paths.
-    for wget_bin in \
-        /usr/bin/wget \
-        /bin/wget \
-        /usr/sbin/wget \
-        /sbin/wget
-    do
-        [ -x "$wget_bin" ] || continue
-
-        if "$wget_bin" --help 2>&1 | grep -q -- '--no-check-certificate'; then
-            "$wget_bin" --no-check-certificate -O "$output" "$url" &&
-                return 0
-        else
-            "$wget_bin" -O "$output" "$url" &&
-                return 0
-        fi
-
-        rm -f "$output"
-    done
-
-    if [ -x /bin/busybox ]; then
-        if /bin/busybox wget --help 2>&1 | grep -q -- '--no-check-certificate'; then
-            /bin/busybox wget --no-check-certificate -O "$output" "$url" &&
-                return 0
-        else
-            /bin/busybox wget -O "$output" "$url" &&
-                return 0
-        fi
-
-        rm -f "$output"
-    fi
-
-    # Last resort: optional userland tools.
-    for wget_bin in \
-        /opt/bin/wget \
-        "$USB_MOUNT/asusware.arm/bin/wget"
-    do
-        [ -x "$wget_bin" ] || continue
-
-        if "$wget_bin" --help 2>&1 | grep -q -- '--no-check-certificate'; then
-            "$wget_bin" --no-check-certificate -O "$output" "$url" &&
-                return 0
-        else
-            "$wget_bin" -O "$output" "$url" &&
-                return 0
-        fi
-
-        rm -f "$output"
-    done
-
-    for curl_bin in \
-        /usr/bin/curl \
-        /bin/curl \
-        /opt/bin/curl \
-        "$USB_MOUNT/asusware.arm/bin/curl"
-    do
-        [ -x "$curl_bin" ] || continue
-
-        "$curl_bin" -k -fL \
-            --connect-timeout 20 \
-            --max-time 180 \
-            -o "$output" "$url" &&
-            return 0
-
-        rm -f "$output"
-    done
-
-    return 1
+yaml_top(){
+    f="$1"; k="$2"
+    v="$(awk -v k="$k" '$0 ~ "^[[:space:]]*" k ":[[:space:]]*" {x=$0; sub("^[[:space:]]*" k ":[[:space:]]*","",x); print x; exit}' "$f" 2>/dev/null)"
+    strip_value "$v"
 }
 
-strip_quotes() {
-    sed "s/\r$//; s/^[\"']//; s/[\"']$//"
+yaml_section(){
+    f="$1"; s="$2"; k="$3"
+    v="$(awk -v s="$s" -v k="$k" '
+        $0 ~ "^" s ":[[:space:]]*($|#)" {inside=1; next}
+        inside && /^[^[:space:]#]/ {exit}
+        inside && $0 ~ "^[[:space:]]+" k ":[[:space:]]*" {x=$0; sub("^[[:space:]]+" k ":[[:space:]]*","",x); print x; exit}
+    ' "$f" 2>/dev/null)"
+    strip_value "$v"
 }
 
-yaml_section_value() {
-    file="$1"
-    section="$2"
-    key="$3"
-
-    awk -v section="$section" -v key="$key" '
-        $0 ~ "^" section ":[[:space:]]*($|#)" {
-            inside = 1
-            next
-        }
-
-        inside && $0 ~ "^[^[:space:]#]" {
-            exit
-        }
-
-        inside {
-            line = $0
-            sub(/^[[:space:]]*/, "", line)
-
-            if (line ~ "^" key ":[[:space:]]*") {
-                sub("^" key ":[[:space:]]*", "", line)
-                sub(/[[:space:]]+#.*/, "", line)
-                print line
-                exit
-            }
-        }
-    ' "$file" | strip_quotes
+lan_ifaces(){
+    [ -n "${GOSHACRASH_LAN_IFACES:-}" ] && { echo "$GOSHACRASH_LAN_IFACES"; return; }
+    x="$(nvram get lan_ifname 2>/dev/null)"; [ -n "$x" ] || x=br0; echo "$x"
 }
 
-yaml_top_value() {
-    file="$1"
-    key="$2"
+lan_ip(){ x="$(nvram get lan_ipaddr 2>/dev/null)"; [ -n "$x" ] || x=192.168.1.1; echo "$x"; }
 
-    sed -n \
-        "s/^[[:space:]]*${key}:[[:space:]]*[\"']\\{0,1\\}\\([^\"'#]*\\)[\"']\\{0,1\\}[[:space:]]*\\(#.*\\)\\{0,1\\}$/\\1/p" \
-        "$file" |
-        head -n 1 |
-        sed 's/[[:space:]]*$//'
+fetch(){
+    url="$1"; out="$2"; rm -f "$out"
+    if have curl; then curl -fL --connect-timeout 20 --retry 2 -o "$out" "$url" >/dev/null 2>&1 && [ -s "$out" ] && return 0; fi
+    if have wget; then wget -q --no-check-certificate -O "$out" "$url" && [ -s "$out" ] && return 0; fi
+    rm -f "$out"; return 1
 }
 
-is_true() {
-    case "$1" in
-        true|True|TRUE|yes|Yes|YES|1|on|On|ON)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
+fetch_any(){ out="$1"; shift; for u in "$@"; do say "Скачиваю $u"; fetch "$u" "$out" && return 0; done; return 1; }
+
+core_arch(){
+    case "$(uname -m 2>/dev/null)" in
+        armv7l|armv7*|armhf) echo armv7;;
+        aarch64|arm64) echo arm64;;
+        x86_64|amd64) echo amd64;;
+        i?86|x86) echo 386;;
+        *) fail "Неподдерживаемая архитектура: $(uname -m)"; return 1;;
     esac
 }
 
-running_pid() {
-    if [ -f "$PID_FILE" ]; then
-        pid="$(cat "$PID_FILE" 2>/dev/null)"
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            printf '%s\n' "$pid"
-            return 0
-        fi
-    fi
-
-    if find_program pidof >/dev/null 2>&1; then
-        for pid in $(pidof mihomo 2>/dev/null); do
-            if kill -0 "$pid" 2>/dev/null; then
-                printf '%s\n' "$pid"
-                return 0
-            fi
-        done
-    fi
-
-    return 1
+install_core(){
+    ensure_dirs || return 1
+    a="$(core_arch)" || return 1
+    asset="mihomo-linux-$a-v$MIHOMO_VERSION.gz"
+    url="https://github.com/MetaCubeX/mihomo/releases/download/v$MIHOMO_VERSION/$asset"
+    gz="$BASE/run/mihomo.gz"; new="$BASE/run/mihomo.new"
+    if [ -n "${MIHOMO_URL:-}" ]; then fetch_any "$gz" "$MIHOMO_URL" || return 1
+    else fetch_any "$gz" "$url" "https://ghfast.top/$url" "https://github.moeyy.xyz/$url" || return 1; fi
+    gzip -dc "$gz" > "$new" || return 1
+    chmod 755 "$new" || return 1
+    "$new" -v >/dev/null 2>&1 || { rm -f "$new"; return 1; }
+    [ -f "$BIN" ] && cp "$BIN" "$BIN.previous" 2>/dev/null || true
+    mv -f "$new" "$BIN" || return 1; rm -f "$gz"
+    say "Mihomo установлен: $($BIN -v 2>/dev/null | head -n 1)"
 }
 
-rotate_log() {
-    [ -f "$LOG_FILE" ] || return 0
-
-    size="$(wc -c < "$LOG_FILE" 2>/dev/null)"
-    [ -n "$size" ] || size=0
-
-    if [ "$size" -gt 2097152 ] 2>/dev/null; then
-        tail -n 500 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null || true
-        mv -f "$LOG_FILE.tmp" "$LOG_FILE" 2>/dev/null || true
-    fi
+install_ui(){
+    ensure_dirs || return 1
+    tgz="$BASE/run/zashboard.tar.gz"; ex="$BASE/run/zashboard.extract"
+    rm -rf "$ex"; mkdir -p "$ex" || return 1
+    if [ -n "${ZASHBOARD_URL:-}" ]; then fetch_any "$tgz" "$ZASHBOARD_URL" || return 1
+    else fetch_any "$tgz" \
+        "https://github.com/Zephyruso/zashboard/archive/refs/heads/gh-pages-no-fonts.tar.gz" \
+        "https://codeload.github.com/Zephyruso/zashboard/tar.gz/refs/heads/gh-pages-no-fonts" || return 1; fi
+    tar -xzf "$tgz" -C "$ex" >/dev/null 2>&1 || return 1
+    root=""; for d in "$ex"/*; do [ -d "$d" ] && { root="$d"; break; }; done
+    [ -n "$root" ] || return 1
+    rm -rf "$UI"; mkdir -p "$UI" || return 1; cp -R "$root"/. "$UI"/ || return 1
+    rm -rf "$ex" "$tgz"; [ -f "$UI/index.html" ] || return 1
+    say "Zashboard установлен"
 }
 
-tun_enabled() {
-    value="$(yaml_section_value "$RUNTIME_CONFIG" tun enable)"
-    is_true "$value"
+write_default_config(){
+    [ -f "$CONFIG" ] && return 0
+    ensure_dirs || return 1
+    cat > "$CONFIG" <<'CFG'
+mixed-port: 7892
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: info
+ipv6: false
+external-controller: 0.0.0.0:9090
+secret: "CHANGE_ME"
+external-ui: ui
+profile:
+  store-selected: true
+  store-fake-ip: true
+geo-auto-update: false
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver: [9.9.9.9, 1.1.1.1]
+  nameserver: [tls://1.1.1.1, tls://9.9.9.9]
+  proxy-server-nameserver: [9.9.9.9, 1.1.1.1]
+  direct-nameserver: [9.9.9.9, 1.1.1.1]
+tun:
+  enable: true
+  stack: system
+  device: mihomo0
+  auto-route: false
+  auto-redirect: false
+  auto-detect-interface: false
+  strict-route: false
+proxies: []
+proxy-groups:
+  - name: GLOBAL-PROXY
+    type: select
+    proxies: [DIRECT]
+rules:
+  - MATCH,DIRECT
+CFG
+    chmod 600 "$CONFIG" 2>/dev/null || true
+    say "Создан $CONFIG"
 }
 
-tun_device() {
-    yaml_section_value "$RUNTIME_CONFIG" tun device
+detect_dns_mode(){
+    f="$1"; e="$(yaml_section "$f" dns enable)"; is_true "$e" || { echo none; return; }
+    l="$(yaml_section "$f" dns listen)"; [ -n "$l" ] || { echo none; return; }
+    p="${l##*:}"; p="$(printf '%s' "$p" | sed 's/[^0-9].*$//')"
+    case "$p" in 53) echo exclusive53;; '') echo none;; *) echo "forward:$p";; esac
 }
 
-ensure_tun_device() {
-    if [ -c /dev/net/tun ]; then
-        return 0
+render_runtime(){
+    out="$1"; [ -f "$CONFIG" ] || return 1
+    cp "$CONFIG" "$out" || return 1; sed -i 's/\r$//' "$out" || return 1
+    sed -i -e 's/^[[:space:]]*external-controller:[[:space:]]*127\.0\.0\.1:/external-controller: 0.0.0.0:/' \
+        -e 's/^[[:space:]]*external-controller:[[:space:]]*localhost:/external-controller: 0.0.0.0:/' "$out"
+    grep -q '^[[:space:]]*external-controller:' "$out" || printf '\nexternal-controller: 0.0.0.0:9090\n' >> "$out"
+    grep -q '^[[:space:]]*external-ui:' "$out" || printf 'external-ui: ui\n' >> "$out"
+    sed -i '/^[[:space:]]*global-client-fingerprint:/d' "$out"
+    if grep -q '^[[:space:]]*geo-auto-update:' "$out"; then sed -i 's/^[[:space:]]*geo-auto-update:.*/geo-auto-update: false/' "$out"
+    else printf '\ngeo-auto-update: false\n' >> "$out"; fi
+    awk -v h="$DNS_HOST" -v p="$DNS_PORT" '
+      /^dns:[[:space:]]*($|#)/ {d=1; seen=0; print; next}
+      d && /^[^[:space:]#]/ {if(!seen) print "  listen: " h ":" p; d=0}
+      d && /^[[:space:]]+listen:[[:space:]]*/ {print "  listen: " h ":" p; seen=1; next}
+      {print}
+      END {if(d&&!seen) print "  listen: " h ":" p}
+    ' "$out" > "$out.dns" || return 1; mv -f "$out.dns" "$out" || return 1
+    awk -v b="$DNS_BOOTSTRAP" '
+      /^dns:[[:space:]]*($|#)/ {d=1; print; next}
+      d && /^[^[:space:]#]/ {d=0}
+      d && /^[[:space:]]*-[[:space:]]*system[[:space:]]*$/ {sub(/system[[:space:]]*$/,b); print; next}
+      d && /:[[:space:]]*system[[:space:]]*$/ {sub(/system[[:space:]]*$/,b); print; next}
+      {print}
+    ' "$out" > "$out.bootstrap" || return 1; mv -f "$out.bootstrap" "$out" || return 1
+    te="$(yaml_section "$CONFIG" tun enable)"; ten=false; is_true "$te" && ten=true
+    awk -v en="$ten" -v dev="$TUN_DEVICE" -v mtu="$TUN_MTU" '
+      function emit(){print "tun:"; print "  enable: " en; print "  stack: system"; print "  device: " dev; print "  mtu: " mtu; print "  auto-route: false"; print "  auto-redirect: false"; print "  auto-detect-interface: false"; print "  strict-route: false"}
+      /^tun:[[:space:]]*($|#)/ {if(!done){emit();done=1}; skip=1; next}
+      skip && /^[^[:space:]#]/ {skip=0}
+      !skip {print}
+      END {if(!done){print "";emit()}}
+    ' "$out" > "$out.tun" || return 1; mv -f "$out.tun" "$out"
+}
+
+running_pid(){
+    [ -f "$PIDFILE" ] || return 1; p="$(cat "$PIDFILE" 2>/dev/null)"; [ -n "$p" ] || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    ps 2>/dev/null | awk -v p="$p" '$1==p{print}' | grep -q '[m]ihomo' || return 1
+    echo "$p"
+}
+
+kill_mihomo(){
+    if p="$(running_pid)"; then
+        kill "$p" 2>/dev/null || true; n=0
+        while kill -0 "$p" 2>/dev/null && [ "$n" -lt 10 ]; do sleep 1; n=$((n+1)); done
+        kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true
     fi
+    rm -f "$PIDFILE"
+}
 
-    modprobe tun 2>/dev/null || true
+check_file(){ [ -x "$BIN" ] || { fail "Не найден $BIN"; return 1; }; "$BIN" -t -d "$BASE" -f "$1"; }
 
-    if [ -c /dev/net/tun ]; then
-        return 0
-    fi
-
-    mkdir -p /dev/net 2>/dev/null || true
-    mknod /dev/net/tun c 10 200 2>/dev/null || true
-    chmod 600 /dev/net/tun 2>/dev/null || true
-
+ensure_tun(){
+    [ -c /dev/net/tun ] && return 0
+    modprobe tun >/dev/null 2>&1 || true
+    m="/lib/modules/$(uname -r)/kernel/drivers/net/tun.ko"; [ -c /dev/net/tun ] || { [ -f "$m" ] && insmod "$m" >/dev/null 2>&1 || true; }
+    if [ ! -c /dev/net/tun ]; then mkdir -p /dev/net 2>/dev/null; mknod /dev/net/tun c 10 200 2>/dev/null; chmod 666 /dev/net/tun 2>/dev/null; fi
     [ -c /dev/net/tun ]
 }
 
-wait_for_tun_interface() {
-    tun_enabled || return 0
+tun_enabled(){ [ -f "$RUNTIME" ] && is_true "$(yaml_section "$RUNTIME" tun enable)"; }
+tun_device(){ x="$(yaml_section "$RUNTIME" tun device)"; [ -n "$x" ] || x="$TUN_DEVICE"; echo "$x"; }
 
-    device="$(tun_device)"
-    [ -n "$device" ] || return 0
-
-    counter=0
-    while [ "$counter" -lt 12 ]; do
-        if [ -d "/sys/class/net/$device" ]; then
-            return 0
-        fi
-
-        ifconfig "$device" >/dev/null 2>&1 && return 0
-
-        sleep 1
-        counter=$((counter + 1))
-    done
-
+wait_port(){
+    p="$1"; n=0
+    while [ "$n" -lt 15 ]; do netstat -ln 2>/dev/null | grep -Eq "[:.]$p[[:space:]]" && return 0; sleep 1; n=$((n+1)); done
     return 1
 }
 
-detect_dns_mode() {
-    file="$1"
-
-    enabled="$(yaml_section_value "$file" dns enable)"
-    if ! is_true "$enabled"; then
-        printf '%s\n' none
-        return 0
-    fi
-
-    listen="$(yaml_section_value "$file" dns listen)"
-    [ -n "$listen" ] || {
-        printf '%s\n' none
-        return 0
-    }
-
-    port="${listen##*:}"
-    port="$(printf '%s' "$port" | sed 's/[^0-9].*$//')"
-
-    case "$port" in
-        53)
-            printf '%s\n' exclusive53
-            ;;
-        '')
-            printf '%s\n' none
-            ;;
-        *)
-            printf '%s\n' "forward:$port"
-            ;;
-    esac
+wait_tun(){
+    tun_enabled || return 0; d="$(tun_device)"; n=0
+    while [ "$n" -lt 15 ]; do ip link show "$d" >/dev/null 2>&1 && return 0; ifconfig "$d" >/dev/null 2>&1 && return 0; sleep 1; n=$((n+1)); done
+    return 1
 }
 
-system_dns_is_local() {
-    grep -Eq '^[[:space:]]*nameserver[[:space:]]+(127\.0\.0\.1|0\.0\.0\.0|::1)([[:space:]]|$)' \
-        /etc/resolv.conf 2>/dev/null
+remove_routing(){
+    ifs="$(lan_ifaces)"
+    for i in $ifs; do
+        while iptables -t mangle -D PREROUTING -i "$i" -j "$MANGLE_CHAIN" 2>/dev/null; do :; done
+        while iptables -t nat -D PREROUTING -i "$i" -p udp --dport 53 -j "$DNS_CHAIN" 2>/dev/null; do :; done
+        while iptables -t nat -D PREROUTING -i "$i" -p tcp --dport 53 -j "$DNS_CHAIN" 2>/dev/null; do :; done
+    done
+    while iptables -D FORWARD -j "$FILTER_CHAIN" 2>/dev/null; do :; done
+    iptables -t mangle -F "$MANGLE_CHAIN" 2>/dev/null || true; iptables -t mangle -X "$MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t nat -F "$DNS_CHAIN" 2>/dev/null || true; iptables -t nat -X "$DNS_CHAIN" 2>/dev/null || true
+    iptables -F "$FILTER_CHAIN" 2>/dev/null || true; iptables -X "$FILTER_CHAIN" 2>/dev/null || true
+    while ip rule del pref "$TUN_PREF" 2>/dev/null; do :; done
+    ip route flush table "$TUN_TABLE" 2>/dev/null || true; ip route flush cache 2>/dev/null || true
 }
 
-render_runtime_to() {
-    output="$1"
-    [ -f "$SOURCE_CONFIG" ] || fail "Не найден $SOURCE_CONFIG" || return 1
-
-    cp "$SOURCE_CONFIG" "$output" ||
-        fail "Не удалось создать runtime-конфиг" || return 1
-
-    # Configs copied from Windows can contain CRLF. Normalize runtime only;
-    # the user's source file remains untouched.
-    sed -i 's/\r$//' "$output" || return 1
-
-    # Dashboard must be reachable from another LAN device.
-    sed -i \
-        -e 's/^[[:space:]]*external-controller:[[:space:]]*127\.0\.0\.1:/external-controller: 0.0.0.0:/' \
-        -e 's/^[[:space:]]*external-controller:[[:space:]]*localhost:/external-controller: 0.0.0.0:/' \
-        "$output"
-
-    if ! grep -q '^[[:space:]]*external-controller:' "$output"; then
-        printf '\nexternal-controller: 0.0.0.0:9090\n' >> "$output"
-    fi
-
-    if ! grep -q '^[[:space:]]*external-ui:' "$output"; then
-        printf 'external-ui: ui\n' >> "$output"
-    fi
-
-    # Removed by recent Mihomo. Keep the private source untouched.
-    sed -i '/^[[:space:]]*global-client-fingerprint:/d' "$output"
-
-    # Keep exactly the GEO rules and URLs supplied by the user,
-    # but disable periodic updates of the large GeoIP/GeoSite databases.
-    if grep -q '^[[:space:]]*geo-auto-update:' "$output"; then
-        sed -i \
-            's/^[[:space:]]*geo-auto-update:.*/geo-auto-update: false/' \
-            "$output"
-    else
-        printf '\ngeo-auto-update: false\n' >> "$output"
-    fi
-
-    # On a router, dnsmasq must keep port 53 for LAN clients and DHCP-related
-    # local name handling. Mihomo DNS therefore always listens locally on 1053
-    # in runtime.yaml. The user's original config.yaml stays unchanged.
-    awk -v host="$MIHOMO_DNS_HOST" -v port="$MIHOMO_DNS_PORT" '
-        /^dns:[[:space:]]*($|#)/ {
-            in_dns = 1
-            listen_seen = 0
-            print
-            next
-        }
-
-        in_dns && /^[^[:space:]#]/ {
-            if (!listen_seen)
-                print "  listen: " host ":" port
-            in_dns = 0
-        }
-
-        in_dns && /^[[:space:]]+listen:[[:space:]]*/ {
-            print "  listen: " host ":" port
-            listen_seen = 1
-            next
-        }
-
-        { print }
-
-        END {
-            if (in_dns && !listen_seen)
-                print "  listen: " host ":" port
-        }
-    ' "$output" > "$output.dns-listen" || return 1
-    mv -f "$output.dns-listen" "$output" || return 1
-
-    # dnsmasq forwards to Mihomo, so using "system" from inside Mihomo would
-    # create a loop: Mihomo -> dnsmasq -> Mihomo. Replace only DNS-section
-    # occurrences in runtime.yaml with a direct bootstrap resolver.
-    awk -v bootstrap="$DNS_BOOTSTRAP" '
-        /^dns:[[:space:]]*($|#)/ {
-            in_dns = 1
-            print
-            next
-        }
-
-        in_dns && /^[^[:space:]#]/ {
-            in_dns = 0
-        }
-
-        in_dns {
-            if ($0 ~ /^[[:space:]]*-[[:space:]]*system[[:space:]]*$/) {
-                line = $0
-                sub(/-[[:space:]]*system[[:space:]]*$/, "- " bootstrap, line)
-                print line
-                next
-            }
-
-            if ($0 ~ /:[[:space:]]*system[[:space:]]*$/) {
-                line = $0
-                sub(/:[[:space:]]*system[[:space:]]*$/, ": " bootstrap, line)
-                print line
-                next
-            }
-        }
-
-        { print }
-    ' "$output" > "$output.dns-bootstrap" || return 1
-    mv -f "$output.dns-bootstrap" "$output" || return 1
-
-    # Older ASUSWRT accepts a plain TUN interface but rejects Mihomo's
-    # automatic policy-routing rules. Preserve the user's enable/disable
-    # choice, then force only the compatible interface settings in runtime.
-    source_tun_enable="$(yaml_section_value "$SOURCE_CONFIG" tun enable)"
-    runtime_tun_enable=false
-
-    if [ "$TUN_MODE" = manual ] && is_true "$source_tun_enable"; then
-        runtime_tun_enable=true
-    fi
-
-    awk \
-        -v enable="$runtime_tun_enable" \
-        -v device="$TUN_DEVICE_DEFAULT" \
-        -v mtu="$TUN_MTU" '
-        function emit_tun() {
-            print "tun:"
-            print "  enable: " enable
-            print "  stack: system"
-            print "  device: " device
-            print "  mtu: " mtu
-            print "  auto-route: false"
-            print "  auto-redirect: false"
-            print "  auto-detect-interface: false"
-            print "  strict-route: false"
-        }
-
-        /^tun:[[:space:]]*($|#)/ {
-            emit_tun()
-            found = 1
-            in_tun = 1
-            next
-        }
-
-        in_tun && /^[^[:space:]#]/ {
-            in_tun = 0
-        }
-
-        !in_tun {
-            print
-        }
-
-        END {
-            if (!found) {
-                print ""
-                emit_tun()
-            }
-        }
-    ' "$output" > "$output.tun" || return 1
-    mv -f "$output.tun" "$output" || return 1
-}
-
-check_file() {
-    file="$1"
-
-    [ -x "$BIN" ] || fail "Mihomo не найден: $BIN" || return 1
-    [ -f "$file" ] || fail "Конфиг не найден: $file" || return 1
-
-    "$BIN" -t -d "$BASE" -f "$file"
-}
-
-check_source() {
-    temp="$BASE/runtime.check.yaml"
-    rm -f "$temp"
-
-    render_runtime_to "$temp" || {
-        rm -f "$temp"
-        return 1
-    }
-
-    check_file "$temp"
-    result=$?
-    rm -f "$temp"
-    return "$result"
-}
-
-check_runtime() {
-    check_file "$RUNTIME_CONFIG"
-}
-
-lan_interface() {
-    if [ -n "${GOSHACRASH_LAN_IF:-}" ]; then
-        printf '%s\n' "$GOSHACRASH_LAN_IF"
-        return 0
-    fi
-
-    value="$(nvram get lan_ifname 2>/dev/null)"
-    [ -n "$value" ] || value=br0
-    printf '%s\n' "$value"
-}
-
-lan_address() {
-    value="$(nvram get lan_ipaddr 2>/dev/null)"
-    [ -n "$value" ] || value=127.0.0.1
-    printf '%s\n' "$value"
-}
-
-tun_routing_active() {
-    ip rule show 2>/dev/null |
-        grep -q "^[[:space:]]*${TUN_RULE_PREF}:[[:space:]].*fwmark ${TUN_MARK}.*lookup ${TUN_TABLE}"
-}
-
-remove_rule_pref() {
-    counter=0
-    while ip rule show 2>/dev/null |
-          grep -q "^[[:space:]]*${TUN_RULE_PREF}:"; do
-        ip rule del pref "$TUN_RULE_PREF" 2>/dev/null || break
-        counter=$((counter + 1))
-        [ "$counter" -lt 10 ] || break
+setup_dns_hijack(){
+    iptables -t nat -N "$DNS_CHAIN" 2>/dev/null || true; iptables -t nat -F "$DNS_CHAIN" || return 1
+    iptables -t nat -A "$DNS_CHAIN" -j REDIRECT --to-ports 53 || return 1
+    for i in $(lan_ifaces); do
+        while iptables -t nat -D PREROUTING -i "$i" -p udp --dport 53 -j "$DNS_CHAIN" 2>/dev/null; do :; done
+        while iptables -t nat -D PREROUTING -i "$i" -p tcp --dport 53 -j "$DNS_CHAIN" 2>/dev/null; do :; done
+        iptables -t nat -I PREROUTING 1 -i "$i" -p udp --dport 53 -j "$DNS_CHAIN" || return 1
+        iptables -t nat -I PREROUTING 1 -i "$i" -p tcp --dport 53 -j "$DNS_CHAIN" || return 1
     done
 }
 
-save_and_set_proc_value() {
-    proc_file="$1"
-    state_name="$2"
-    new_value="$3"
-    state_file="$STATE_DIR/$state_name"
-
-    [ -f "$proc_file" ] || return 0
-    mkdir -p "$STATE_DIR" || return 1
-
-    if [ ! -f "$state_file" ]; then
-        cat "$proc_file" > "$state_file" 2>/dev/null || true
-    fi
-
-    printf '%s\n' "$new_value" > "$proc_file" 2>/dev/null || true
-}
-
-restore_proc_value() {
-    proc_file="$1"
-    state_name="$2"
-    state_file="$STATE_DIR/$state_name"
-
-    if [ -f "$proc_file" ] && [ -f "$state_file" ]; then
-        cat "$state_file" > "$proc_file" 2>/dev/null || true
-    fi
-
-    rm -f "$state_file"
-}
-
-remove_tun_routing() {
-    lan_if="$(lan_interface)"
-
-    while iptables -t nat -D PREROUTING -i "$lan_if" -p udp --dport 53 -j "$DNS_HIJACK_CHAIN" 2>/dev/null; do :; done
-    while iptables -t nat -D PREROUTING -i "$lan_if" -p tcp --dport 53 -j "$DNS_HIJACK_CHAIN" 2>/dev/null; do :; done
-    iptables -t nat -F "$DNS_HIJACK_CHAIN" 2>/dev/null || true
-    iptables -t nat -X "$DNS_HIJACK_CHAIN" 2>/dev/null || true
-
-    while iptables -t mangle -D PREROUTING -i "$lan_if" -j "$TUN_MANGLE_CHAIN" 2>/dev/null; do :; done
-    iptables -t mangle -F "$TUN_MANGLE_CHAIN" 2>/dev/null || true
-    iptables -t mangle -X "$TUN_MANGLE_CHAIN" 2>/dev/null || true
-
-    while iptables -t filter -D FORWARD -j "$TUN_FILTER_CHAIN" 2>/dev/null; do :; done
-    iptables -t filter -F "$TUN_FILTER_CHAIN" 2>/dev/null || true
-    iptables -t filter -X "$TUN_FILTER_CHAIN" 2>/dev/null || true
-
-    remove_rule_pref
-    ip route flush table "$TUN_TABLE" 2>/dev/null || true
-    ip route flush cache 2>/dev/null || true
-
-    restore_proc_value /proc/sys/net/ipv4/ip_forward ip_forward.before
-    restore_proc_value /proc/sys/net/ipv4/conf/all/rp_filter rp_filter_all.before
-    restore_proc_value "/proc/sys/net/ipv4/conf/$lan_if/rp_filter" "rp_filter_${lan_if}.before"
-    restore_proc_value "/proc/sys/net/ipv4/conf/$TUN_DEVICE_DEFAULT/rp_filter" "rp_filter_${TUN_DEVICE_DEFAULT}.before"
-
-    rm -f "$ROUTING_STATE_FILE"
-}
-
-setup_dns_hijack() {
-    [ "${GOSHACRASH_DNS_HIJACK:-1}" = 1 ] || return 0
-
-    lan_if="$(lan_interface)"
-    lan_ip="$(lan_address)"
-
-    iptables -t nat -N "$DNS_HIJACK_CHAIN" 2>/dev/null || return 1
-    iptables -t nat -A "$DNS_HIJACK_CHAIN" -d "$lan_ip/32" -j RETURN 2>/dev/null || return 1
-    iptables -t nat -A "$DNS_HIJACK_CHAIN" -p udp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null || return 1
-    iptables -t nat -A "$DNS_HIJACK_CHAIN" -p tcp --dport 53 -j REDIRECT --to-ports 53 2>/dev/null || return 1
-    iptables -t nat -I PREROUTING 1 -i "$lan_if" -p udp --dport 53 -j "$DNS_HIJACK_CHAIN" 2>/dev/null || return 1
-    iptables -t nat -I PREROUTING 1 -i "$lan_if" -p tcp --dport 53 -j "$DNS_HIJACK_CHAIN" 2>/dev/null || return 1
-}
-
-setup_tun_routing() {
-    tun_enabled || {
-        remove_tun_routing
-        return 0
-    }
-
-    device="$(tun_device)"
-    [ -n "$device" ] || device="$TUN_DEVICE_DEFAULT"
-    lan_if="$(lan_interface)"
-
-    [ -d "/sys/class/net/$device" ] || {
-        fail "TUN-интерфейс $device не найден"
-        return 1
-    }
-
-    command -v ip >/dev/null 2>&1 || {
-        fail "Не найдена команда ip"
-        return 1
-    }
-
-    command -v iptables >/dev/null 2>&1 || {
-        fail "Не найдена команда iptables"
-        return 1
-    }
-
-    remove_tun_routing
-
-    save_and_set_proc_value /proc/sys/net/ipv4/ip_forward ip_forward.before 1
-    save_and_set_proc_value /proc/sys/net/ipv4/conf/all/rp_filter rp_filter_all.before 0
-    save_and_set_proc_value "/proc/sys/net/ipv4/conf/$lan_if/rp_filter" "rp_filter_${lan_if}.before" 0
-    save_and_set_proc_value "/proc/sys/net/ipv4/conf/$device/rp_filter" "rp_filter_${device}.before" 0
-
-    ip route add default dev "$device" table "$TUN_TABLE" 2>/dev/null || {
-        warn "Не удалось создать таблицу маршрутизации $TUN_TABLE"
-        remove_tun_routing
-        return 1
-    }
-
-    ip rule add pref "$TUN_RULE_PREF" fwmark "$TUN_MARK" lookup "$TUN_TABLE" 2>/dev/null || {
-        warn "Не удалось создать ip rule для метки $TUN_MARK"
-        remove_tun_routing
-        return 1
-    }
-
-    iptables -t filter -N "$TUN_FILTER_CHAIN" 2>/dev/null || {
-        remove_tun_routing
-        return 1
-    }
-    iptables -t filter -A "$TUN_FILTER_CHAIN" -i "$lan_if" -o "$device" -j ACCEPT 2>/dev/null || {
-        remove_tun_routing
-        return 1
-    }
-    iptables -t filter -A "$TUN_FILTER_CHAIN" -i "$device" -o "$lan_if" -j ACCEPT 2>/dev/null || {
-        remove_tun_routing
-        return 1
-    }
-    iptables -t filter -I FORWARD 1 -j "$TUN_FILTER_CHAIN" 2>/dev/null || {
-        remove_tun_routing
-        return 1
-    }
-
-    iptables -t mangle -N "$TUN_MANGLE_CHAIN" 2>/dev/null || {
-        remove_tun_routing
-        return 1
-    }
-
-    for network in \
-        0.0.0.0/8 \
-        10.0.0.0/8 \
-        100.64.0.0/10 \
-        127.0.0.0/8 \
-        169.254.0.0/16 \
-        172.16.0.0/12 \
-        192.168.0.0/16 \
-        224.0.0.0/4 \
-        240.0.0.0/4 \
-        255.255.255.255/32
-    do
-        iptables -t mangle -A "$TUN_MANGLE_CHAIN" -d "$network" -j RETURN 2>/dev/null || {
-            remove_tun_routing
-            return 1
-        }
+setup_routing(){
+    tun_enabled || { remove_routing; return 0; }
+    d="$(tun_device)"; ip link show "$d" >/dev/null 2>&1 || ifconfig "$d" >/dev/null 2>&1 || return 1
+    remove_routing; ip link set "$d" up 2>/dev/null || true
+    echo 0 > "/proc/sys/net/ipv4/conf/$d/rp_filter" 2>/dev/null || true
+    ip route add default dev "$d" table "$TUN_TABLE" 2>/dev/null || { remove_routing; return 1; }
+    ip rule add fwmark "$TUN_MARK" table "$TUN_TABLE" pref "$TUN_PREF" 2>/dev/null || { remove_routing; return 1; }
+    iptables -t mangle -N "$MANGLE_CHAIN" 2>/dev/null || true; iptables -t mangle -F "$MANGLE_CHAIN" || return 1
+    iptables -t mangle -A "$MANGLE_CHAIN" -p udp --dport 53 -j RETURN || return 1
+    iptables -t mangle -A "$MANGLE_CHAIN" -p tcp --dport 53 -j RETURN || return 1
+    for n in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
+        iptables -t mangle -A "$MANGLE_CHAIN" -d "$n" -j RETURN || { remove_routing; return 1; }
     done
-
-    iptables -t mangle -A "$TUN_MANGLE_CHAIN" -j MARK --set-mark "$TUN_MARK" 2>/dev/null || {
-        remove_tun_routing
-        return 1
-    }
-
-    # Attach only after the route, rule and filter path are ready.
-    iptables -t mangle -I PREROUTING 1 -i "$lan_if" -j "$TUN_MANGLE_CHAIN" 2>/dev/null || {
-        remove_tun_routing
-        return 1
-    }
-
-    if ! setup_dns_hijack; then
-        warn "Не удалось включить перехват стороннего DNS; основной DNS через DHCP продолжит работать"
-        while iptables -t nat -D PREROUTING -i "$lan_if" -p udp --dport 53 -j "$DNS_HIJACK_CHAIN" 2>/dev/null; do :; done
-        while iptables -t nat -D PREROUTING -i "$lan_if" -p tcp --dport 53 -j "$DNS_HIJACK_CHAIN" 2>/dev/null; do :; done
-        iptables -t nat -F "$DNS_HIJACK_CHAIN" 2>/dev/null || true
-        iptables -t nat -X "$DNS_HIJACK_CHAIN" 2>/dev/null || true
-    fi
-
+    iptables -t mangle -A "$MANGLE_CHAIN" -j MARK --set-mark "$TUN_MARK" || { remove_routing; return 1; }
+    for i in $(lan_ifaces); do
+        echo 0 > "/proc/sys/net/ipv4/conf/$i/rp_filter" 2>/dev/null || true
+        iptables -t mangle -I PREROUTING 1 -i "$i" -j "$MANGLE_CHAIN" || { remove_routing; return 1; }
+    done
+    iptables -N "$FILTER_CHAIN" 2>/dev/null || true; iptables -F "$FILTER_CHAIN" || return 1
+    for i in $(lan_ifaces); do
+        iptables -A "$FILTER_CHAIN" -i "$i" -o "$d" -j ACCEPT || return 1
+        iptables -A "$FILTER_CHAIN" -i "$d" -o "$i" -j ACCEPT || return 1
+    done
+    iptables -I FORWARD 1 -j "$FILTER_CHAIN" || { remove_routing; return 1; }
+    setup_dns_hijack || warn "Не включён принудительный DNS-перехват"
     ip route flush cache 2>/dev/null || true
-    mkdir -p "$STATE_DIR"
-    printf '%s\n' "$device" > "$ROUTING_STATE_FILE"
-
-    say "TUN-маршрутизация включена: $lan_if -> mark $TUN_MARK -> table $TUN_TABLE -> $device"
+    say "TUN включён: $(lan_ifaces) -> table $TUN_TABLE -> $d"
 }
 
-start_mihomo() {
-    if pid="$(running_pid)"; then
-        if tun_enabled; then
-            setup_tun_routing || return 1
-        fi
-        echo "Mihomo уже запущен, PID=$pid"
-        return 0
-    fi
+write_dns_state(){ mkdir -p "$JFFS_BASE" || return 1; echo "$1" > "$JFFS_DNS_MODE"; }
+read_dns_state(){ [ -f "$JFFS_DNS_MODE" ] && cat "$JFFS_DNS_MODE" || echo none; }
 
-    [ -f "$RUNTIME_CONFIG" ] || {
-        fail "Сначала выполни: goshacrash apply"
-        return 1
-    }
-
-    remove_tun_routing
-
-    if tun_enabled && ! ensure_tun_device; then
-        fail "В системе нет рабочего /dev/net/tun"
-        return 1
-    fi
-
-    check_runtime || return 1
-
-    desired_dns_mode="$(detect_dns_mode "$RUNTIME_CONFIG")"
-
-    # Keep native ASUS DNS while Mihomo starts. Switch dnsmasq only after the
-    # local Mihomo DNS listener is confirmed.
-    if [ "$desired_dns_mode" != none ]; then
-        write_dnsmasq_mode none >/dev/null 2>&1 || true
-        restart_dnsmasq >/dev/null 2>&1 || true
-        sleep 1
-    fi
-
-    mkdir -p "$BASE/run" "$BASE/logs"
-    rotate_log
-    rm -f "$PID_FILE"
-
-    GOGC="${GOGC:-50}" "$BIN" -d "$BASE" -f "$RUNTIME_CONFIG" >> "$LOG_FILE" 2>&1 &
-    pid=$!
-    printf '%s\n' "$pid" > "$PID_FILE"
-
-    sleep 2
-
-    if ! running_pid >/dev/null 2>&1; then
-        echo "Mihomo завершился при запуске" >&2
-        rm -f "$PID_FILE"
-        tail -n 80 "$LOG_FILE" 2>/dev/null
-        restore_system_dns
-        remove_tun_routing
-        return 1
-    fi
-
-    case "$desired_dns_mode" in
-        forward:*)
-            dns_port="${desired_dns_mode#forward:}"
-            if ! wait_mihomo_dns_port "$dns_port"; then
-                warn "Mihomo не занял DNS-порт $dns_port"
-                port_listeners "$dns_port" >&2 || true
-                kill_mihomo_process >/dev/null 2>&1 || true
-                restore_system_dns
-                remove_tun_routing
-                tail -n 80 "$LOG_FILE" 2>/dev/null
-                return 1
-            fi
-            ;;
-
-        exclusive53)
-            if ! wait_mihomo_dns_port 53; then
-                warn "Mihomo не занял DNS-порт 53"
-                port_listeners 53 >&2 || true
-                kill_mihomo_process >/dev/null 2>&1 || true
-                restore_system_dns
-                remove_tun_routing
-                tail -n 80 "$LOG_FILE" 2>/dev/null
-                return 1
-            fi
-            ;;
-    esac
-
-    if [ "$desired_dns_mode" != none ]; then
-        say "Переключаю dnsmasq на Mihomo DNS: $desired_dns_mode"
-        if ! activate_dns_mode "$desired_dns_mode"; then
-            warn "Не удалось направить dnsmasq в Mihomo"
-            kill_mihomo_process >/dev/null 2>&1 || true
-            restore_system_dns
-            remove_tun_routing
-            tail -n 80 "$LOG_FILE" 2>/dev/null
-            return 1
-        fi
-    fi
-
-    if ! wait_for_tun_interface; then
-        warn "Mihomo запущен, но TUN-интерфейс не появился"
-        kill_mihomo_process >/dev/null 2>&1 || true
-        restore_system_dns
-        remove_tun_routing
-        tail -n 80 "$LOG_FILE" 2>/dev/null
-        return 1
-    fi
-
-    if tun_enabled && ! setup_tun_routing; then
-        warn "TUN создан, но ручная маршрутизация не установилась"
-        kill_mihomo_process >/dev/null 2>&1 || true
-        restore_system_dns
-        remove_tun_routing
-        tail -n 80 "$LOG_FILE" 2>/dev/null
-        return 1
-    fi
-
-    pid="$(running_pid)"
-    echo "Mihomo запущен, PID=$pid"
-}
-
-
-kill_mihomo_process() {
-    if pid="$(running_pid)"; then
-        kill "$pid" 2>/dev/null || true
-
-        counter=0
-        while kill -0 "$pid" 2>/dev/null && [ "$counter" -lt 10 ]; do
-            sleep 1
-            counter=$((counter + 1))
-        done
-
-        if kill -0 "$pid" 2>/dev/null; then
-            kill -9 "$pid" 2>/dev/null || true
-        fi
-
-        rm -f "$PID_FILE"
-        echo "Mihomo остановлен"
-        return 0
-    fi
-
-    rm -f "$PID_FILE"
-    echo "Mihomo не запущен"
-}
-
-remove_dnsmasq_managed_block() {
-    input="$1"
-    output="$2"
-
-    [ -f "$input" ] || : > "$input"
-
-    awk \
-        -v begin="$DNS_MARK_BEGIN" \
-        -v end="$DNS_MARK_END" \
-        -v old_begin="$DNS_OLD_MARK_BEGIN" \
-        -v old_end="$DNS_OLD_MARK_END" '
-        $0 == begin || $0 == old_begin { skip = 1; next }
-        $0 == end || $0 == old_end     { skip = 0; next }
-        !skip                           { print }
-    ' "$input" > "$output"
-}
-
-write_dnsmasq_mode() {
-    mode="$1"
-
-    mkdir -p /jffs/configs "$JFFS_BASE" || return 1
-    [ -f "$DNSMASQ_ADD" ] || : > "$DNSMASQ_ADD"
-
-    clean="$DNSMASQ_ADD.goshacrash.clean"
-    next="$DNSMASQ_ADD.goshacrash.next"
-
-    remove_dnsmasq_managed_block "$DNSMASQ_ADD" "$clean" || {
-        rm -f "$clean" "$next"
-        return 1
-    }
-
-    cat "$clean" > "$next" || {
-        rm -f "$clean" "$next"
-        return 1
-    }
-
+write_dns(){
+    mode="$1"; next="$RESOLV.goshacrash.next"; mkdir -p "$STATE" "$JFFS_BASE" || return 1
+    [ -f "$RESOLV" ] || { fail "Не найден $RESOLV"; return 1; }
     case "$mode" in
-        exclusive53)
-            {
-                printf '%s\n' "$DNS_MARK_BEGIN"
-                printf '%s\n' 'port=0'
-                printf '%s\n' "$DNS_MARK_END"
-            } >> "$next" || return 1
-            ;;
-
         forward:*)
-            port="${mode#forward:}"
-            {
-                printf '%s\n' "$DNS_MARK_BEGIN"
-                printf '%s\n' 'no-resolv'
-                printf '%s\n' "server=127.0.0.1#$port"
-                printf '%s\n' "$DNS_MARK_END"
-            } >> "$next" || return 1
-            ;;
-
+            p="${mode#forward:}"
+            grep -Fqx "$DNS_MARK" "$RESOLV" 2>/dev/null || cp "$RESOLV" "$RESOLV_BACKUP" || return 1
+            src="$RESOLV_BACKUP"; [ -f "$src" ] || src="$RESOLV"
+            { echo "$DNS_MARK"; echo "server=$DNS_HOST#$p"; awk '/^[[:space:]]*server=\//{print}' "$src"; } > "$next" || return 1
+            mv -f "$next" "$RESOLV" || return 1;;
         none)
-            ;;
-
-        *)
-            rm -f "$clean" "$next"
-            return 1
-            ;;
-    esac
-
-    mv -f "$next" "$DNSMASQ_ADD" || {
-        rm -f "$clean" "$next"
-        return 1
-    }
-    rm -f "$clean"
-
-    write_dns_mode "$mode"
-}
-
-port_listeners() {
-    port="$1"
-    netstat -lnp 2>/dev/null | grep ":$port[[:space:]]"
-}
-
-port_53_listeners() {
-    port_listeners 53
-}
-
-wait_port_53_free() {
-    counter=0
-    while [ "$counter" -lt 10 ]; do
-        if ! port_53_listeners >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 1
-        counter=$((counter + 1))
-    done
-    return 1
-}
-
-wait_mihomo_dns_port() {
-    port="$1"
-    counter=0
-
-    while [ "$counter" -lt 10 ]; do
-        if port_listeners "$port" 2>/dev/null | grep -q 'mihomo'; then
-            return 0
-        fi
-        sleep 1
-        counter=$((counter + 1))
-    done
-
-    return 1
-}
-
-restore_system_dns() {
-    write_dnsmasq_mode none >/dev/null 2>&1 || true
-    restart_dnsmasq >/dev/null 2>&1 || true
-}
-
-activate_dns_mode() {
-    mode="$1"
-
-    write_dnsmasq_mode "$mode" || return 1
-
-    restart_dnsmasq || return 1
-    sleep 2
-
-    case "$mode" in
-        exclusive53)
-            if ! wait_port_53_free; then
-                warn "Порт 53 не освободился"
-                port_53_listeners >&2 || true
-                return 1
+            if grep -Fqx "$DNS_MARK" "$RESOLV" 2>/dev/null; then
+                if [ -f "$RESOLV_BACKUP" ]; then cp "$RESOLV_BACKUP" "$RESOLV" || return 1
+                else awk -v m="$DNS_MARK" -v l="server=$DNS_HOST#$DNS_PORT" '$0!=m&&$0!=l{print}' "$RESOLV" > "$next" && mv -f "$next" "$RESOLV"; fi
             fi
-            ;;
+            rm -f "$RESOLV_BACKUP";;
+        exclusive53) fail "На stock ASUSWRT порт 53 остаётся у dnsmasq"; return 1;;
+        *) return 1;;
     esac
-
-    return 0
+    write_dns_state "$mode"
 }
 
-stop_mihomo() {
-    say "Убираю TUN-маршрутизацию"
-    remove_tun_routing
-    kill_mihomo_process
-    say "Возвращаю штатный DNS ASUS"
-    restore_system_dns
+reload_dnsmasq(){ killall -HUP dnsmasq >/dev/null 2>&1; }
+restore_dns(){ write_dns none >/dev/null 2>&1 || true; reload_dnsmasq >/dev/null 2>&1 || true; }
+activate_dns(){ write_dns "$1" || return 1; reload_dnsmasq || return 1; sleep 1; }
+
+start_mihomo(){
+    if p="$(running_pid)"; then
+        mode="$(detect_dns_mode "$RUNTIME")"; [ "$mode" = none ] || activate_dns "$mode" >/dev/null 2>&1 || true
+        tun_enabled && setup_routing || true; echo "Mihomo уже запущен, PID=$p"; return 0
+    fi
+    [ -f "$RUNTIME" ] || { fail "Сначала выполни: goshacrash apply"; return 1; }
+    tun_enabled && ensure_tun || { tun_enabled && { fail "Нет /dev/net/tun"; return 1; }; }
+    check_file "$RUNTIME" || return 1
+    mode="$(detect_dns_mode "$RUNTIME")"
+    [ "$mode" = none ] || { write_dns none >/dev/null 2>&1 || true; reload_dnsmasq >/dev/null 2>&1 || true; }
+    remove_routing; ensure_dirs || return 1; rm -f "$PIDFILE"
+    [ -f "$LOGFILE" ] && [ "$(wc -c < "$LOGFILE" 2>/dev/null)" -gt 1048576 ] 2>/dev/null && mv -f "$LOGFILE" "$LOGFILE.previous"
+    GOGC="${GOGC:-50}" "$BIN" -d "$BASE" -f "$RUNTIME" >> "$LOGFILE" 2>&1 & p=$!; echo "$p" > "$PIDFILE"; sleep 2
+    running_pid >/dev/null 2>&1 || { fail "Mihomo завершился"; tail -n 80 "$LOGFILE"; restore_dns; return 1; }
+    case "$mode" in forward:*) wait_port "${mode#forward:}" || { kill_mihomo; restore_dns; return 1; };; exclusive53) wait_port 53 || { kill_mihomo; restore_dns; return 1; };; esac
+    [ "$mode" = none ] || { say "Переключаю dnsmasq: $mode"; activate_dns "$mode" || { kill_mihomo; restore_dns; return 1; }; }
+    if tun_enabled; then wait_tun || { kill_mihomo; restore_dns; return 1; }; setup_routing || { kill_mihomo; restore_dns; return 1; }; fi
+    echo "Mihomo запущен, PID=$p"
 }
 
+stop_mihomo(){ remove_routing; kill_mihomo; restore_dns; echo "Mihomo остановлен"; }
 
-restart_dnsmasq() {
-    if service restart_dnsmasq >/dev/null 2>&1; then
-        return 0
-    fi
-
-    if rc_service restart_dnsmasq >/dev/null 2>&1; then
-        return 0
-    fi
-
-    return 1
+backup_config(){
+    ensure_dirs || return 1; [ -f "$CONFIG" ] || return 1
+    s="$(date '+%Y%m%d-%H%M%S' 2>/dev/null)"; [ -n "$s" ] || s=backup
+    f="$BACKUPS/config-$s.yaml"; cp "$CONFIG" "$f" || return 1; echo "$f"
 }
 
-write_dns_mode() {
-    mode="$1"
-
-    mkdir -p "$JFFS_BASE" || return 1
-    printf '%s\n' "$mode" > "$JFFS_DNS_MODE"
-}
-
-read_dns_mode() {
-    if [ -f "$JFFS_DNS_MODE" ]; then
-        cat "$JFFS_DNS_MODE"
-    else
-        printf '%s\n' none
-    fi
-}
-
-backup_source() {
-    mkdir -p "$BACKUP_DIR" || return 1
-
-    stamp="$(date '+%Y%m%d-%H%M%S' 2>/dev/null)"
-    [ -n "$stamp" ] || stamp="$(date +%s 2>/dev/null)"
-    [ -n "$stamp" ] || stamp="backup"
-
-    target="$BACKUP_DIR/config-$stamp.yaml"
-    cp "$SOURCE_CONFIG" "$target" || return 1
-
-    echo "$target"
-}
-
-apply_config() {
-    [ -f "$SOURCE_CONFIG" ] || {
-        fail "Не найден личный config.yaml"
-        return 1
-    }
-
-    mkdir -p "$BACKUP_DIR" "$STATE_DIR" "$BASE/run" "$BASE/logs"
-
-    backup="$(backup_source)" || {
-        fail "Не удалось создать резервную копию config.yaml"
-        return 1
-    }
-
-    say "Резервная копия: $backup"
-
-    candidate="$BASE/runtime.candidate.yaml"
-    rm -f "$candidate"
-
-    render_runtime_to "$candidate" || {
-        rm -f "$candidate"
-        return 1
-    }
-
-    if [ -f "$RUNTIME_CONFIG" ]; then
-        cp "$RUNTIME_CONFIG" "$PREVIOUS_RUNTIME" 2>/dev/null || true
-    else
-        rm -f "$PREVIOUS_RUNTIME"
-    fi
-
-    # GeoSite/GeoIP can consume most RAM on this router. Stop the old process
-    # before `mihomo -t`, otherwise two simultaneous loaders can OOM.
-    stop_mihomo >/dev/null 2>&1 || true
-
-    say "Проверяю подготовленный runtime.yaml"
-    if ! check_file "$candidate"; then
-        rm -f "$candidate"
-
-        if [ -f "$PREVIOUS_RUNTIME" ]; then
-            cp "$PREVIOUS_RUNTIME" "$RUNTIME_CONFIG" 2>/dev/null || true
-            start_mihomo >/dev/null 2>&1 || true
-        fi
-
-        fail "Исходный config.yaml не применён"
-        return 1
-    fi
-
-    mv -f "$candidate" "$RUNTIME_CONFIG" || {
-        fail "Не удалось установить runtime.yaml"
-        return 1
-    }
-
-    install_hooks || return 1
-
-    say "Запускаю Mihomo"
-    if ! start_mihomo; then
-        rollback_apply
-        fail "Новый конфиг не запустился, выполнен откат"
-        return 1
-    fi
-
-    say "Конфиг применён"
-    status_mihomo
-}
-
-
-rollback_apply() {
-    remove_tun_routing
-    kill_mihomo_process >/dev/null 2>&1 || true
-    restore_system_dns
-
-    if [ -f "$PREVIOUS_RUNTIME" ]; then
-        cp "$PREVIOUS_RUNTIME" "$RUNTIME_CONFIG" 2>/dev/null || true
-    else
-        rm -f "$RUNTIME_CONFIG"
-    fi
-
-    if [ -f "$RUNTIME_CONFIG" ]; then
-        start_mihomo >/dev/null 2>&1 || true
-    fi
-}
-
-
-status_mihomo() {
-    if pid="$(running_pid)"; then
-        echo "Mihomo: работает, PID=$pid"
-    else
-        echo "Mihomo: остановлен"
-    fi
-
-    echo "GoshaCrash: $GOSHACRASH_VERSION"
-    echo "Личный конфиг: $SOURCE_CONFIG"
-    echo "Runtime-конфиг: $RUNTIME_CONFIG"
-    echo "DNS-режим: $(read_dns_mode)"
-
-    if [ -f "$RUNTIME_CONFIG" ] && tun_enabled; then
-        device="$(tun_device)"
-        [ -n "$device" ] || device="$TUN_DEVICE_DEFAULT"
-
-        if [ -d "/sys/class/net/$device" ] || ifconfig "$device" >/dev/null 2>&1; then
-            echo "TUN: работает ($device)"
-        else
-            echo "TUN: включён в конфиге, интерфейс $device не найден"
-        fi
-
-        if tun_routing_active; then
-            echo "Маршрутизация TUN: работает (mark $TUN_MARK, table $TUN_TABLE)"
-        else
-            echo "Маршрутизация TUN: не установлена"
-        fi
-    else
-        echo "TUN: выключен"
-        echo "Маршрутизация TUN: выключена"
-    fi
-
-    show_ui
-}
-
-
-show_ui() {
-    lan_ip="$(nvram get lan_ipaddr 2>/dev/null)"
-    [ -n "$lan_ip" ] || lan_ip="IP_РОУТЕРА"
-
-    controller="$(yaml_top_value "$RUNTIME_CONFIG" external-controller)"
-    port="${controller##*:}"
-
-    case "$port" in
-        ''|*[!0-9]*)
-            port=9090
-            ;;
-    esac
-
-    secret="$(yaml_top_value "$RUNTIME_CONFIG" secret)"
-
-    echo "Zashboard: http://$lan_ip:$port/ui/"
-    [ -n "$secret" ] && echo "API secret: $secret"
-}
-
-edit_source() {
-    for editor in \
-        /opt/bin/nano \
-        "$USB_MOUNT/asusware.arm/bin/nano" \
-        /usr/bin/nano \
-        /bin/nano
-    do
-        if [ -x "$editor" ]; then
-            exec "$editor" "$SOURCE_CONFIG"
-        fi
-    done
-
-    echo "nano не найден, открываю vi"
-    exec vi "$SOURCE_CONFIG"
-}
-
-setup_config() {
-    editor_found=""
-
-    for editor in \
-        /opt/bin/nano \
-        "$USB_MOUNT/asusware.arm/bin/nano" \
-        /usr/bin/nano \
-        /bin/nano
-    do
-        if [ -x "$editor" ]; then
-            editor_found="$editor"
-            break
-        fi
-    done
-
-    if [ -n "$editor_found" ]; then
-        "$editor_found" "$SOURCE_CONFIG" || return 1
-    else
-        vi "$SOURCE_CONFIG" || return 1
-    fi
-
-    echo
-    say "Редактор закрыт, проверяю и применяю config.yaml"
-    apply_config
-}
-
-ensure_hook() {
-    target="$1"
-    command_line="$2"
-    marker="$3"
-    temp="$target.goshacrash.tmp"
-
-    mkdir -p /jffs/scripts || return 1
-
-    if [ ! -f "$target" ]; then
-        printf '%s\n' '#!/bin/sh' > "$target" || return 1
-    fi
-
-    grep -v "$marker" "$target" > "$temp" 2>/dev/null || true
-    printf '%s\n' "$command_line # $marker" >> "$temp" || return 1
-    mv -f "$temp" "$target" || return 1
-    chmod 755 "$target" || return 1
-}
-
-install_hooks() {
-    mkdir -p "$JFFS_BASE" /jffs/scripts || {
-        fail "Не удалось создать JFFS-каталоги"
-        return 1
-    }
-
-    printf '%s\n' "$BASE" > "$JFFS_BASE_FILE" || return 1
-
-    if [ ! -f "$JFFS_DNS_MODE" ]; then
-        printf '%s\n' none > "$JFFS_DNS_MODE"
-    fi
-
-    cat > "$JFFS_BASE/hook.sh" <<'HOOK'
+install_hooks(){
+    opt="$USB_MOUNT/asusware.arm"; [ -d "$opt" ] || { fail "Не найден Download Master: $opt"; return 1; }
+    init="$opt/etc/init.d/S99goshacrash"; ctl="$opt/lib/ipkg/info/goshacrash.control"
+    mkdir -p "$(dirname "$init")" "$(dirname "$ctl")" "$JFFS_BASE" || return 1
+    echo "$BASE" > "$JFFS_BASE_FILE" || return 1
+    cat > "$init" <<HOOK
 #!/bin/sh
-
-BASE_FILE="/jffs/addons/goshacrash/base"
-[ -f "$BASE_FILE" ] || exit 0
-
-BASE="$(cat "$BASE_FILE" 2>/dev/null)"
-CTL="$BASE/goshacrash"
-ACTION="$1"
-ARGUMENT="$2"
-
-case "$ACTION" in
-    post-mount)
-        [ "$ARGUMENT" = "$(dirname "$BASE")" ] || exit 0
-        sleep 2
-        [ -x "$CTL" ] && "$CTL" boot
-        ;;
-
-    services-start)
-        counter=0
-        while [ ! -x "$CTL" ] && [ "$counter" -lt 60 ]; do
-            sleep 2
-            counter=$((counter + 1))
-        done
-        [ -x "$CTL" ] && "$CTL" boot
-        ;;
-
-    firewall-start)
-        sleep 5
-        [ -x "$CTL" ] && "$CTL" firewall-reload
-        ;;
-
-    dnsmasq-postconf)
-        [ -x "$CTL" ] && "$CTL" dnsmasq-postconf "$ARGUMENT"
-        ;;
+BASE_FILE="$JFFS_BASE_FILE"
+BASE="$BASE"
+[ -f "\$BASE_FILE" ] && { x="\$(cat "\$BASE_FILE" 2>/dev/null)"; [ -n "\$x" ] && BASE="\$x"; }
+CTL="\$BASE/goshacrash"
+case "\$1" in
+ start) sleep 5; [ -x "\$CTL" ] && GOSHACRASH_BASE="\$BASE" "\$CTL" boot;;
+ restart|force-reload) [ -x "\$CTL" ] && GOSHACRASH_BASE="\$BASE" "\$CTL" restart;;
+ stop) [ -x "\$CTL" ] && GOSHACRASH_BASE="\$BASE" "\$CTL" stop;;
+ firewall-start|firewall-restart) [ -x "\$CTL" ] && GOSHACRASH_BASE="\$BASE" "\$CTL" firewall-reload;;
+ *) exit 0;;
 esac
-
 exit 0
 HOOK
-
-    chmod 755 "$JFFS_BASE/hook.sh" || return 1
-
-    ensure_hook \
-        /jffs/scripts/post-mount \
-        '/jffs/addons/goshacrash/hook.sh post-mount "$1" &' \
-        'GOSHACRASH_POST_MOUNT' ||
-        return 1
-
-    ensure_hook \
-        /jffs/scripts/services-start \
-        '/jffs/addons/goshacrash/hook.sh services-start &' \
-        'GOSHACRASH_SERVICES_START' ||
-        return 1
-
-    ensure_hook \
-        /jffs/scripts/firewall-start \
-        '/jffs/addons/goshacrash/hook.sh firewall-start &' \
-        'GOSHACRASH_FIREWALL_START' ||
-        return 1
-
-    ensure_hook \
-        /jffs/scripts/dnsmasq.postconf \
-        '/jffs/addons/goshacrash/hook.sh dnsmasq-postconf "$1"' \
-        'GOSHACRASH_DNSMASQ_POSTCONF' ||
-        return 1
-
-    nvram set jffs2_scripts=1 >/dev/null 2>&1 || true
-    nvram commit >/dev/null 2>&1 || true
-
-    echo "JFFS-хуки установлены"
+    chmod 755 "$init" || return 1
+    cat > "$ctl" <<CONTROL
+Package: goshacrash
+Architecture: arm
+Priority: optional
+Section: net
+Version: $VERSION
+Maintainer: GoshaCrash
+Source: local
+Description: Mihomo and Zashboard controller for stock ASUSWRT
+Depends:
+Suggests:
+Conflicts:
+Enabled: yes
+CONTROL
+    mkdir -p /opt/lib/ipkg/info 2>/dev/null || true; cp "$ctl" /opt/lib/ipkg/info/goshacrash.control 2>/dev/null || true
+    say "Автозапуск установлен: $init"
 }
 
-dnsmasq_postconf() {
-    config_file="$1"
-    [ -n "$config_file" ] || exit 0
-    [ -f "$config_file" ] || exit 0
-
-    mode="$(read_dns_mode)"
-
-    case "$mode" in
-        exclusive53)
-            sed -i '/^[[:space:]]*port=/d' "$config_file"
-            printf '%s\n' 'port=0' >> "$config_file"
-            ;;
-
-        forward:*)
-            port="${mode#forward:}"
-            grep -qx 'no-resolv' "$config_file" 2>/dev/null ||
-                printf '%s\n' 'no-resolv' >> "$config_file"
-            grep -Fqx "server=127.0.0.1#$port" "$config_file" 2>/dev/null ||
-                printf '%s\n' "server=127.0.0.1#$port" >> "$config_file"
-            ;;
-
-        *)
-            ;;
-    esac
-
-    exit 0
+uninstall_hooks(){
+    stop_mihomo >/dev/null 2>&1 || true; opt="$USB_MOUNT/asusware.arm"
+    rm -f "$opt/etc/init.d/S99goshacrash" "$opt/lib/ipkg/info/goshacrash.control" /opt/lib/ipkg/info/goshacrash.control
+    rm -rf "$JFFS_BASE"; say "Автозапуск удалён"
 }
 
+apply_config(){
+    [ -f "$CONFIG" ] || { fail "Не найден $CONFIG"; return 1; }; ensure_dirs || return 1
+    b="$(backup_config)" || return 1; say "Резервная копия: $b"
+    cand="$BASE/run/runtime.candidate.yaml"; rm -f "$cand"; render_runtime "$cand" || return 1
+    [ -f "$RUNTIME" ] && cp "$RUNTIME" "$PREVIOUS" 2>/dev/null || rm -f "$PREVIOUS"
+    stop_mihomo >/dev/null 2>&1 || true
+    say "Проверяю runtime.yaml"; check_file "$cand" || { rm -f "$cand"; [ -f "$PREVIOUS" ] && { cp "$PREVIOUS" "$RUNTIME"; start_mihomo >/dev/null 2>&1 || true; }; return 1; }
+    mv -f "$cand" "$RUNTIME" || return 1; install_hooks || return 1
+    start_mihomo || { fail "Новый конфиг не запустился"; [ -f "$PREVIOUS" ] && { cp "$PREVIOUS" "$RUNTIME"; start_mihomo >/dev/null 2>&1 || true; }; return 1; }
+    say "Конфиг применён"; status
+}
 
-boot_service() {
-    counter=0
-    while [ ! -x "$BIN" ] && [ "$counter" -lt 30 ]; do
-        sleep 2
-        counter=$((counter + 1))
-    done
+check_config(){ ensure_dirs || return 1; t="$BASE/run/check.yaml"; render_runtime "$t" || return 1; check_file "$t"; r=$?; rm -f "$t"; return "$r"; }
 
-    [ -x "$BIN" ] || return 1
-    [ -f "$RUNTIME_CONFIG" ] || return 0
-
+boot_service(){
+    n=0; while [ ! -x "$BIN" ] && [ "$n" -lt 30 ]; do sleep 2; n=$((n+1)); done
+    [ -x "$BIN" ] || return 1; [ -f "$RUNTIME" ] || return 0
+    n=0; while [ ! -f "$RESOLV" ] && [ "$n" -lt 30 ]; do sleep 2; n=$((n+1)); done
     start_mihomo
 }
 
-firewall_reload() {
-    if running_pid >/dev/null 2>&1; then
-        say "Firewall перезапущен, восстанавливаю правила GoshaCrash"
-        if tun_enabled; then
-            setup_tun_routing
-        else
-            remove_tun_routing
-        fi
-    fi
+firewall_reload(){
+    running_pid >/dev/null 2>&1 || return 0; say "Восстанавливаю DNS и iptables"
+    m="$(detect_dns_mode "$RUNTIME")"; [ "$m" = none ] || { write_dns "$m" || warn "DNS не восстановлен"; reload_dnsmasq >/dev/null 2>&1 || true; }
+    tun_enabled && setup_routing || remove_routing
 }
 
-
-doctor() {
-    echo "=== GoshaCrash doctor ==="
-    echo "BASE=$BASE"
-    echo "USB=$USB_MOUNT"
-    echo "ARCH=$(uname -m 2>/dev/null)"
-    echo "LAN_IF=$(lan_interface)"
-    echo "LAN_IP=$(lan_address)"
-    echo
-
-    [ -x "$BIN" ] && "$BIN" -v || echo "Mihomo: не найден"
-    [ -c /dev/net/tun ] && echo "/dev/net/tun: OK" || echo "/dev/net/tun: NOT FOUND"
-
-    echo
-    if [ -f "$SOURCE_CONFIG" ]; then
-        echo "config.yaml: найден"
-    else
-        echo "config.yaml: не найден"
-    fi
-
-    echo
-    status_mihomo
-
-    echo
-    echo "Управляемый блок dnsmasq:"
-    sed -n "/$DNS_MARK_BEGIN/,/$DNS_MARK_END/p" "$DNSMASQ_ADD" 2>/dev/null || true
-
-    echo
-    echo "Слушающие порты:"
-    netstat -lnp 2>/dev/null |
-        grep -E '(:53[[:space:]]|:1053[[:space:]]|:9090[[:space:]]|:7892[[:space:]])' ||
-        echo "Нужные порты не найдены в netstat"
-
-    echo
-    echo "TUN-интерфейс:"
-    device="$(tun_device)"
-    [ -n "$device" ] || device="$TUN_DEVICE_DEFAULT"
-    ip link show "$device" 2>&1 || true
-
-    echo
-    echo "Policy routing:"
-    ip rule show 2>/dev/null | grep -E "(^|[[:space:]])${TUN_RULE_PREF}:|fwmark ${TUN_MARK}" || echo "Правило GoshaCrash не найдено"
-    ip route show table "$TUN_TABLE" 2>/dev/null || true
-
-    echo
-    echo "iptables mangle:"
-    iptables -t mangle -L "$TUN_MANGLE_CHAIN" -n -v 2>/dev/null || echo "Цепочка не найдена"
-
-    echo
-    echo "iptables DNS hijack:"
-    iptables -t nat -L "$DNS_HIJACK_CHAIN" -n -v 2>/dev/null || echo "Цепочка не найдена"
-
-    echo
-    echo "Память:"
-    free 2>/dev/null || cat /proc/meminfo 2>/dev/null | head -n 8
-
-    echo
-    echo "Последние строки журнала:"
-    tail -n 40 "$LOG_FILE" 2>/dev/null || echo "Журнал пуст"
+status(){
+    if p="$(running_pid)"; then echo "Mihomo: работает, PID=$p"; else echo "Mihomo: не запущен"; fi
+    echo "GoshaCrash: $VERSION"; echo "BASE: $BASE"; echo "DNS: $(read_dns_state)"
+    if tun_enabled; then d="$(tun_device)"; ip link show "$d" >/dev/null 2>&1 && echo "TUN: $d работает" || echo "TUN: $d не найден"; else echo "TUN: выключен"; fi
+    c="$(yaml_top "$RUNTIME" external-controller)"; [ -n "$c" ] || c=0.0.0.0:9090; p="${c##*:}"; p="$(echo "$p" | sed 's/[^0-9].*$//')"; [ -n "$p" ] || p=9090
+    echo "Zashboard: http://$(lan_ip):$p/ui/"; s="$(yaml_top "$RUNTIME" secret)"; [ -n "$s" ] && echo "API secret: $s"
 }
 
-
-restore_source() {
-    requested="$1"
-
-    if [ -n "$requested" ]; then
-        source_file="$requested"
-    else
-        source_file="$(ls -1t "$BACKUP_DIR"/config-*.yaml 2>/dev/null | head -n 1)"
-    fi
-
-    [ -n "$source_file" ] && [ -f "$source_file" ] || {
-        fail "Резервная копия не найдена"
-        return 1
-    }
-
-    cp "$source_file" "$SOURCE_CONFIG" || return 1
-    echo "Восстановлено: $source_file"
-    echo "Для применения выполни: goshacrash apply"
+doctor(){
+    echo "=== GoshaCrash doctor ==="; echo "BASE=$BASE"; echo "USB=$USB_MOUNT"; echo "ARCH=$(uname -m)"; echo "LAN=$(lan_ifaces)"; echo "IP=$(lan_ip)"; echo
+    [ -x "$BIN" ] && "$BIN" -v || echo "Mihomo: NOT FOUND"; [ -c /dev/net/tun ] && echo "/dev/net/tun: OK" || echo "/dev/net/tun: NOT FOUND"; echo
+    status; echo; echo "=== $RESOLV ==="; cat "$RESOLV" 2>/dev/null || true; echo
+    echo "=== ports ==="; netstat -lnp 2>/dev/null | grep -E '(:53[[:space:]]|:1053[[:space:]]|:9090[[:space:]]|:7892[[:space:]])' || true; echo
+    echo "=== routes ==="; ip rule show 2>/dev/null | grep -E "($TUN_PREF|$TUN_TABLE|$TUN_MARK)" || true; ip route show table "$TUN_TABLE" 2>/dev/null || true; echo
+    echo "=== iptables ==="; iptables -t mangle -L "$MANGLE_CHAIN" -n -v 2>/dev/null || true; iptables -t nat -L "$DNS_CHAIN" -n -v 2>/dev/null || true; echo
+    echo "=== log ==="; tail -n 60 "$LOGFILE" 2>/dev/null || true
 }
 
-update_goshacrash() {
-    installer="/tmp/goshacrash-install.sh"
-    url="https://raw.githubusercontent.com/${REPO}/${BRANCH}/install.sh?$(date +%s 2>/dev/null)"
-
-    fetch "$url" "$installer" ||
-        fail "Не удалось скачать install.sh" ||
-        return 1
-
-    sh "$installer"
+edit_config(){
+    write_default_config || return 1; e="${EDITOR:-}"
+    if [ -z "$e" ]; then for x in nano mcedit vi; do have "$x" && { e="$x"; break; }; done; fi
+    [ -n "$e" ] || { fail "Нет редактора"; return 1; }; "$e" "$CONFIG"
 }
 
-geo_status() {
-    echo "GEO-настройки runtime.yaml:"
-    grep -E \
-        '^[[:space:]]*(geo-auto-update|geodata-mode|geo-update-interval|geox-url:|mmdb:|geoip:|geosite:)|^[[:space:]]*-[[:space:]]*(GEOIP|GEOSITE),' \
-        "$RUNTIME_CONFIG" 2>/dev/null ||
-        echo "GEO-настройки не найдены"
-
-    echo
-    echo "GEO-файлы:"
-    for file in \
-        "$BASE/geoip.dat" \
-        "$BASE/geosite.dat" \
-        "$BASE/Country.mmdb" \
-        "$BASE/country.mmdb" \
-        "$BASE/GeoLite2-ASN.mmdb"
-    do
-        [ -f "$file" ] && ls -lh "$file"
-    done
+restore_config(){
+    f="${1:-}"; [ -n "$f" ] || f="$(ls -1t "$BACKUPS"/config-*.yaml 2>/dev/null | head -n 1)"
+    [ -f "$f" ] || { fail "Резервная копия не найдена"; return 1; }; cp "$f" "$CONFIG" || return 1; apply_config
 }
 
-case "${1:-}" in
-    start)
-        start_mihomo
-        ;;
+install_all(){ ensure_dirs && write_default_config && install_core && install_ui && install_hooks && apply_config; }
+update_all(){ stop_mihomo >/dev/null 2>&1 || true; install_core && install_ui && apply_config; }
 
-    stop)
-        stop_mihomo
-        ;;
+usage(){ cat <<'USAGE'
+GoshaCrash — Mihomo + Zashboard для stock ASUSWRT
 
-    restart|reload)
-        stop_mihomo
-        start_mihomo
-        ;;
+Команды:
+  install           установить Mihomo, Zashboard и автозапуск
+  setup             открыть config.yaml и применить
+  edit              открыть config.yaml
+  check             проверить итоговый runtime.yaml
+  apply             применить config.yaml
+  start|stop|restart
+  status            состояние
+  doctor            полная диагностика
+  logs [N]          последние строки лога
+  ui                адрес Zashboard
+  backup            резервная копия config.yaml
+  restore [FILE]    восстановление config.yaml
+  install-hooks     установить автозапуск Download Master
+  uninstall-hooks   удалить автозапуск
+  tun-enable        восстановить TUN/iptables
+  tun-disable       убрать TUN/iptables без остановки Mihomo
+  firewall-reload   восстановить DNS и iptables
+  update            обновить Mihomo и Zashboard
+  version
+USAGE
+}
 
-    status)
-        status_mihomo
-        ;;
-
-    check)
-        check_source
-        ;;
-
-    apply)
-        apply_config
-        ;;
-
-    render)
-        render_runtime_to "$RUNTIME_CONFIG"
-        echo "Создан: $RUNTIME_CONFIG"
-        ;;
-
-    edit)
-        edit_source
-        ;;
-
-    setup)
-        setup_config
-        ;;
-
-    logs)
-        lines="${2:-100}"
-        tail -n "$lines" "$LOG_FILE" 2>/dev/null ||
-            echo "Журнал пока пуст"
-        ;;
-
-    version)
-        echo "GoshaCrash $GOSHACRASH_VERSION"
-        "$BIN" -v
-        ;;
-
-    ui)
-        show_ui
-        ;;
-
-    doctor)
-        doctor
-        ;;
-
-    backup)
-        backup_source
-        ;;
-
-    restore)
-        restore_source "${2:-}"
-        ;;
-
-    install-hooks)
-        install_hooks
-        ;;
-
-    dnsmasq-postconf)
-        dnsmasq_postconf "${2:-}"
-        ;;
-
-    boot)
-        boot_service
-        ;;
-
-    firewall-reload)
-        firewall_reload
-        ;;
-
-    tun-enable)
-        setup_tun_routing
-        ;;
-
-    tun-disable)
-        remove_tun_routing
-        echo "TUN-маршрутизация отключена; процесс Mihomo оставлен запущенным"
-        ;;
-
-    update)
-        update_goshacrash
-        ;;
-
-    geo-status)
-        geo_status
-        ;;
-
-    *)
-        cat <<'EOF'
-Использование:
-  goshacrash setup             открыть config.yaml и применить после выхода
-  goshacrash edit              только открыть/изменить личный config.yaml
-  goshacrash check             проверить личный конфиг
-  goshacrash apply             безопасно применить конфиг к ASUS
-  goshacrash status            состояние Mihomo, DNS и TUN
-  goshacrash doctor            полная диагностика
-  goshacrash start
-  goshacrash stop
-  goshacrash restart
-  goshacrash tun-enable        восстановить ручную TUN-маршрутизацию
-  goshacrash tun-disable       убрать маршрутизацию, не останавливая Mihomo
-  goshacrash logs [строки]
-  goshacrash ui
-  goshacrash version
-  goshacrash backup
-  goshacrash restore [файл]
-  goshacrash geo-status
-  goshacrash update
-EOF
-        ;;
+ensure_dirs >/dev/null 2>&1 || true
+case "${1:-help}" in
+ install) install_all;;
+ setup) edit_config && apply_config;;
+ edit) edit_config;;
+ check) check_config;;
+ apply) apply_config;;
+ start) start_mihomo;;
+ stop) stop_mihomo;;
+ restart) stop_mihomo; start_mihomo;;
+ status) status;;
+ doctor) doctor;;
+ logs) tail -n "${2:-100}" "$LOGFILE" 2>/dev/null || true;;
+ ui) c="$(yaml_top "$RUNTIME" external-controller)"; [ -n "$c" ] || c=0.0.0.0:9090; p="${c##*:}"; p="$(echo "$p"|sed 's/[^0-9].*$//')"; echo "http://$(lan_ip):${p:-9090}/ui/";;
+ backup) backup_config;;
+ restore) restore_config "${2:-}";;
+ install-hooks) install_hooks;;
+ uninstall-hooks) uninstall_hooks;;
+ boot) boot_service;;
+ firewall-reload) firewall_reload;;
+ tun-enable) setup_routing;;
+ tun-disable) remove_routing; echo "TUN-маршрутизация отключена";;
+ update) update_all;;
+ version) echo "$VERSION";;
+ help|-h|--help|'') usage;;
+ *) usage; exit 1;;
 esac
