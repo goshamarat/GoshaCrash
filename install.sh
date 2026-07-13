@@ -25,7 +25,7 @@ fail() {
 }
 
 have() {
-    command -v "$1" >/dev/null 2>&1
+    which "$1" >/dev/null 2>&1
 }
 
 fetch() {
@@ -39,10 +39,10 @@ fetch() {
         downloader=/usr/sbin/wget
         kind=wget
     elif have wget; then
-        downloader="$(command -v wget)"
+        downloader="$(which wget)"
         kind=wget
     elif have curl; then
-        downloader="$(command -v curl)"
+        downloader="$(which curl)"
         kind=curl
     else
         fail "Не найден wget или curl"
