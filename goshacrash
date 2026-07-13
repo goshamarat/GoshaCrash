@@ -264,10 +264,69 @@ CFG
 }
 
 detect_dns_mode(){
-    f="$1"; e="$(yaml_section "$f" dns enable)"; is_true "$e" || { echo none; return; }
-    l="$(yaml_section "$f" dns listen)"; [ -n "$l" ] || { echo none; return; }
-    p="${l##*:}"; p="$(printf '%s' "$p" | sed 's/[^0-9].*$//')"
-    case "$p" in 53) echo exclusive53;; '') echo none;; *) echo "forward:$p";; esac
+    f="$1"
+
+    listen="$(
+        awk '
+        {
+            line=$0
+            sub(/[[:space:]]*#.*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+
+            if (line == "dns:") {
+                inside=1
+                next
+            }
+
+            if (inside && line ~ /^[^[:space:]]/) {
+                exit
+            }
+
+            if (inside && line ~ /^[[:space:]]+enable:[[:space:]]*/) {
+                sub(/^[[:space:]]+enable:[[:space:]]*/, "", line)
+                enabled=line
+            }
+
+            if (inside && line ~ /^[[:space:]]+listen:[[:space:]]*/) {
+                sub(/^[[:space:]]+listen:[[:space:]]*/, "", line)
+                listen=line
+            }
+        }
+
+        END {
+            if (
+                enabled == "true" ||
+                enabled == "True" ||
+                enabled == "TRUE" ||
+                enabled == "1" ||
+                enabled == "yes" ||
+                enabled == "on"
+            ) {
+                print listen
+            }
+        }
+        ' "$f" 2>/dev/null
+    )"
+
+    [ -n "$listen" ] || {
+        echo none
+        return
+    }
+
+    port="${listen##*:}"
+    port="$(printf '%s\n' "$port" | sed 's/[^0-9].*$//')"
+
+    case "$port" in
+        53)
+            echo exclusive53
+            ;;
+        "")
+            echo none
+            ;;
+        *)
+            echo "forward:$port"
+            ;;
+    esac
 }
 
 render_runtime(){
