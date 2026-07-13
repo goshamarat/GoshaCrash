@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-13-slim-menu-070
-# GoshaCrash 0.7.0 — slim installer and menu for Mihomo + Zashboard on stock ASUSWRT.
+# BUILD: 2026-07-13-dns-detect-fix-072
+# GoshaCrash 0.7.2 — slim installer, menu, nano detection and fixed DNS forwarding for stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-VERSION="0.7.0-stock-asuswrt"
-BUILD_ID="2026-07-13-slim-menu-070"
+VERSION="0.7.2-stock-asuswrt"
+BUILD_ID="2026-07-13-dns-detect-fix-072"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
@@ -40,7 +40,7 @@ MANGLE_CHAIN="GOSHACRASH_TUN"
 FILTER_CHAIN="GOSHACRASH_FORWARD"
 DNS_CHAIN="GOSHACRASH_DNS_HIJACK"
 
-PATH="/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin:/opt/sbin:$USB_MOUNT/asusware.arm/bin:$USB_MOUNT/asusware.arm/sbin"
+PATH="/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$USB_MOUNT/asusware.arm/bin:$USB_MOUNT/asusware.arm/sbin:$USB_MOUNT/asusware.arm/opt/bin:$USB_MOUNT/asusware.arm/opt/sbin:$USB_MOUNT/asusware.arm/usr/bin"
 export PATH
 
 say(){ printf '%s\n' "[GoshaCrash] $*"; }
@@ -265,67 +265,57 @@ CFG
 
 detect_dns_mode(){
     f="$1"
-
     listen="$(
         awk '
         {
             line=$0
+            sub(/\r$/, "", line)
             sub(/[[:space:]]*#.*/, "", line)
             sub(/[[:space:]]*$/, "", line)
 
-            if (line == "dns:") {
+            if (line ~ /^dns:[[:space:]]*$/) {
                 inside=1
                 next
             }
 
             if (inside && line ~ /^[^[:space:]]/) {
-                exit
+                inside=0
             }
 
             if (inside && line ~ /^[[:space:]]+enable:[[:space:]]*/) {
-                sub(/^[[:space:]]+enable:[[:space:]]*/, "", line)
-                enabled=line
+                x=line
+                sub(/^[[:space:]]+enable:[[:space:]]*/, "", x)
+                enabled=x
             }
 
             if (inside && line ~ /^[[:space:]]+listen:[[:space:]]*/) {
-                sub(/^[[:space:]]+listen:[[:space:]]*/, "", line)
-                listen=line
+                x=line
+                sub(/^[[:space:]]+listen:[[:space:]]*/, "", x)
+                listen=x
             }
         }
 
         END {
-            if (
-                enabled == "true" ||
-                enabled == "True" ||
-                enabled == "TRUE" ||
-                enabled == "1" ||
-                enabled == "yes" ||
-                enabled == "on"
-            ) {
+            if ((enabled == "true" || enabled == "True" || enabled == "TRUE" ||
+                 enabled == "yes"  || enabled == "Yes"  || enabled == "YES"  ||
+                 enabled == "1"    || enabled == "on"   || enabled == "On"   ||
+                 enabled == "ON") && listen != "") {
                 print listen
             }
         }
         ' "$f" 2>/dev/null
     )"
 
-    [ -n "$listen" ] || {
-        echo none
-        return
-    }
+    listen="$(strip_value "$listen")"
+    [ -n "$listen" ] || { echo none; return; }
 
-    port="${listen##*:}"
-    port="$(printf '%s\n' "$port" | sed 's/[^0-9].*$//')"
+    p="${listen##*:}"
+    p="$(printf '%s\n' "$p" | sed 's/[^0-9].*$//')"
 
-    case "$port" in
-        53)
-            echo exclusive53
-            ;;
-        "")
-            echo none
-            ;;
-        *)
-            echo "forward:$port"
-            ;;
+    case "$p" in
+        53) echo exclusive53 ;;
+        '') echo none ;;
+        *) echo "forward:$p" ;;
     esac
 }
 
@@ -476,7 +466,13 @@ setup_routing(){
 }
 
 write_dns_state(){ mkdir -p "$JFFS_BASE" || return 1; echo "$1" > "$JFFS_DNS_MODE"; }
-read_dns_state(){ [ -f "$JFFS_DNS_MODE" ] && cat "$JFFS_DNS_MODE" || echo none; }
+read_dns_state(){
+    if [ -f "$RESOLV" ]; then
+        actual="$(sed -n 's/^server=127\.0\.0\.1#\([0-9][0-9]*\)$/forward:\1/p' "$RESOLV" 2>/dev/null | head -n 1)"
+        [ -n "$actual" ] && { echo "$actual"; return; }
+    fi
+    [ -f "$JFFS_DNS_MODE" ] && cat "$JFFS_DNS_MODE" || echo none
+}
 
 write_dns(){
     mode="$1"; next="$RESOLV.goshacrash.next"; mkdir -p "$STATE" "$JFFS_BASE" || return 1
@@ -502,7 +498,21 @@ write_dns(){
 
 reload_dnsmasq(){ killall -HUP dnsmasq >/dev/null 2>&1; }
 restore_dns(){ write_dns none >/dev/null 2>&1 || true; reload_dnsmasq >/dev/null 2>&1 || true; }
-activate_dns(){ write_dns "$1" || return 1; reload_dnsmasq || return 1; sleep 1; }
+activate_dns(){
+    mode="$1"
+    write_dns "$mode" || return 1
+    case "$mode" in
+        forward:*)
+            p="${mode#forward:}"
+            grep -Fqx "server=$DNS_HOST#$p" "$RESOLV" 2>/dev/null || {
+                fail "dnsmasq не переключён на $DNS_HOST:$p"
+                return 1
+            }
+            ;;
+    esac
+    reload_dnsmasq || return 1
+    sleep 1
+}
 
 start_mihomo(){
     if p="$(running_pid)"; then
@@ -622,8 +632,53 @@ doctor(){
     echo "=== log ==="; tail -n 60 "$LOGFILE" 2>/dev/null || true
 }
 
+prepend_path(){
+    d="$1"
+    [ -n "$d" ] || return 0
+    case ":$PATH:" in
+        *":$d:"*) ;;
+        *) PATH="$d:$PATH"; export PATH;;
+    esac
+}
+
+find_nano(){
+    if have nano; then
+        which nano
+        return 0
+    fi
+
+    for p in \
+        /opt/bin/nano \
+        /tmp/opt/bin/nano \
+        "$USB_MOUNT/asusware.arm/bin/nano" \
+        "$USB_MOUNT/asusware.arm/opt/bin/nano" \
+        "$USB_MOUNT/asusware.arm/usr/bin/nano"; do
+        if [ -x "$p" ]; then
+            prepend_path "${p%/*}"
+            printf '%s\n' "$p"
+            return 0
+        fi
+    done
+
+    if [ -d "$USB_MOUNT/asusware.arm" ]; then
+        p="$(find "$USB_MOUNT/asusware.arm" -type f -name nano 2>/dev/null | head -n 1)"
+        if [ -n "$p" ] && [ -x "$p" ]; then
+            prepend_path "${p%/*}"
+            printf '%s\n' "$p"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 find_ipkg(){
-    for p in /opt/bin/ipkg "$USB_MOUNT/asusware.arm/bin/ipkg" "$USB_MOUNT/asusware.arm/sbin/ipkg"; do
+    for p in \
+        /opt/bin/ipkg \
+        /tmp/opt/bin/ipkg \
+        "$USB_MOUNT/asusware.arm/bin/ipkg" \
+        "$USB_MOUNT/asusware.arm/sbin/ipkg" \
+        "$USB_MOUNT/asusware.arm/opt/bin/ipkg"; do
         [ -x "$p" ] && { echo "$p"; return 0; }
     done
     have ipkg && { which ipkg; return 0; }
@@ -631,8 +686,9 @@ find_ipkg(){
 }
 
 install_editor(){
-    if have nano; then
-        say "Текстовый редактор уже установлен: $(which nano)"
+    nano_bin="$(find_nano)"
+    if [ -n "$nano_bin" ] && [ -x "$nano_bin" ]; then
+        say "Текстовый редактор уже установлен: $nano_bin"
         return 0
     fi
 
@@ -649,19 +705,42 @@ install_editor(){
         return 1
     }
 
-    if have nano || [ -x /opt/bin/nano ] || [ -x "$USB_MOUNT/asusware.arm/bin/nano" ]; then
-        say "nano установлен"
+    nano_bin="$(find_nano)"
+    if [ -n "$nano_bin" ] && [ -x "$nano_bin" ]; then
+        say "nano установлен: $nano_bin"
         return 0
     fi
 
-    fail "Пакет nano установился, но команда nano не найдена"
+    fail "Пакет nano установлен, но исполняемый файл не найден в каталогах Download Master"
+    return 1
+}
+
+find_editor(){
+    requested="${EDITOR:-}"
+    if [ -n "$requested" ]; then
+        case "$requested" in
+            */*) [ -x "$requested" ] && { printf '%s\n' "$requested"; return 0; };;
+            *) have "$requested" && { which "$requested"; return 0; };;
+        esac
+    fi
+
+    nano_bin="$(find_nano)"
+    [ -n "$nano_bin" ] && [ -x "$nano_bin" ] && { printf '%s\n' "$nano_bin"; return 0; }
+
+    for x in mcedit vi; do
+        have "$x" && { which "$x"; return 0; }
+    done
     return 1
 }
 
 edit_config(){
-    write_default_config || return 1; e="${EDITOR:-}"
-    if [ -z "$e" ]; then for x in nano mcedit vi; do have "$x" && { e="$x"; break; }; done; fi
-    [ -n "$e" ] || { fail "Нет редактора"; return 1; }; "$e" "$CONFIG"
+    write_default_config || return 1
+    editor_bin="$(find_editor)" || {
+        fail "Текстовый редактор не найден; выбери в меню пункт установки nano"
+        return 1
+    }
+    say "Редактор: $editor_bin"
+    "$editor_bin" "$CONFIG"
 }
 
 restore_config(){
