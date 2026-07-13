@@ -1,8 +1,10 @@
 #!/bin/sh
-# GoshaCrash 0.6.0 — network installer for Mihomo + Zashboard on stock ASUSWRT.
+# BUILD: 2026-07-13-network-fresh-063
+# GoshaCrash 0.6.3 — network installer for Mihomo + Zashboard on stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-VERSION="0.6.0-stock-asuswrt"
+VERSION="0.6.3-stock-asuswrt"
+BUILD_ID="2026-07-13-network-fresh-063"
 MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.28}"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
@@ -83,22 +85,56 @@ lan_ifaces(){
 lan_ip(){ x="$(nvram get lan_ipaddr 2>/dev/null)"; [ -n "$x" ] || x=192.168.1.1; echo "$x"; }
 
 fetch(){
-    url="$1"; out="$2"; part="$out.part.$$"
-    rm -f "$part" "$out"
-    n=1
-    while [ "$n" -le 2 ]; do
-        if have curl; then
-            curl -kfsSL --connect-timeout 15 --max-time 900 -o "$part" "$url" 2>/dev/null &&
-                [ -s "$part" ] && { mv -f "$part" "$out"; return 0; }
-        fi
+    url="$1"; out="$2"; part="$out.part.$$"; err="/tmp/goshacrash-fetch.err.$$"
+    rm -f "$part" "$out" "$err"
+
+    wget_list="$(command -v wget 2>/dev/null) /opt/bin/wget /usr/bin/wget /bin/wget /usr/sbin/wget /sbin/wget"
+    for wget_bin in $wget_list; do
+        [ -n "$wget_bin" ] || continue
+        [ -x "$wget_bin" ] || continue
+
+        rm -f "$part" "$err"
+        say "Загрузчик: $wget_bin"
+        "$wget_bin" --no-check-certificate -O "$part" "$url" >"$err" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] && [ -s "$part" ] && {
+            mv -f "$part" "$out"; rm -f "$err"; return 0;
+        }
+
         rm -f "$part"
-        if have wget; then
-            wget -q --no-check-certificate -O "$part" "$url" 2>/dev/null &&
-                [ -s "$part" ] && { mv -f "$part" "$out"; return 0; }
-        fi
-        rm -f "$part"; n=$((n+1)); sleep 1
+        "$wget_bin" -O "$part" "$url" >"$err" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] && [ -s "$part" ] && {
+            mv -f "$part" "$out"; rm -f "$err"; return 0;
+        }
     done
-    rm -f "$part" "$out"; return 1
+
+    if [ -x /bin/busybox ]; then
+        rm -f "$part" "$err"
+        /bin/busybox wget --no-check-certificate -O "$part" "$url" >"$err" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] && [ -s "$part" ] && {
+            mv -f "$part" "$out"; rm -f "$err"; return 0;
+        }
+    fi
+
+    curl_list="$(command -v curl 2>/dev/null) /opt/bin/curl /usr/bin/curl /bin/curl"
+    for curl_bin in $curl_list; do
+        [ -n "$curl_bin" ] || continue
+        [ -x "$curl_bin" ] || continue
+
+        rm -f "$part" "$err"
+        "$curl_bin" -k -f -L -o "$part" "$url" >"$err" 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] && [ -s "$part" ] && {
+            mv -f "$part" "$out"; rm -f "$err"; return 0;
+        }
+    done
+
+    warn "Не удалось скачать $url"
+    [ -s "$err" ] && { warn "Последняя ошибка загрузчика:"; cat "$err" >&2; }
+    rm -f "$part" "$out" "$err"
+    return 1
 }
 
 fetch_any(){

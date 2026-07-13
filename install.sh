@@ -1,9 +1,11 @@
 #!/bin/sh
+# BUILD: 2026-07-13-network-fresh-063
 # GoshaCrash bootstrap installer for stock ASUSWRT.
 # Installs the controller to USB storage, then installs Mihomo, Zashboard,
 # DNS integration, TUN routing and Download Master autostart.
 
-INSTALLER_VERSION="0.6.0"
+INSTALLER_VERSION="0.6.3"
+BUILD_ID="2026-07-13-network-fresh-063"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 ACTION="${1:-install}"
@@ -29,35 +31,72 @@ fetch() {
     url="$1"
     output="$2"
     part="$output.part.$$"
-    rm -f "$part" "$output"
+    err="/tmp/goshacrash-fetch.err.$$"
+    rm -f "$part" "$output" "$err"
 
-    attempt=1
-    while [ "$attempt" -le 2 ]; do
-        if have curl; then
-            curl -kfsSL --connect-timeout 15 --max-time 900 \
-                -o "$part" "$url" 2>/dev/null &&
-                [ -s "$part" ] && {
-                    mv -f "$part" "$output"
-                    return 0
-                }
+    # First use exactly the wget that works in the interactive ASUS shell.
+    wget_list="$(command -v wget 2>/dev/null) /opt/bin/wget /usr/bin/wget /bin/wget /usr/sbin/wget /sbin/wget"
+
+    for wget_bin in $wget_list; do
+        [ -n "$wget_bin" ] || continue
+        [ -x "$wget_bin" ] || continue
+
+        rm -f "$part" "$err"
+        say "Загрузчик: $wget_bin"
+        "$wget_bin" --no-check-certificate -O "$part" "$url" >"$err" 2>&1
+        rc=$?
+
+        if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
+            mv -f "$part" "$output"
+            rm -f "$err"
+            return 0
         fi
 
         rm -f "$part"
+        "$wget_bin" -O "$part" "$url" >"$err" 2>&1
+        rc=$?
 
-        if have wget; then
-            wget -q --no-check-certificate -O "$part" "$url" 2>/dev/null &&
-                [ -s "$part" ] && {
-                    mv -f "$part" "$output"
-                    return 0
-                }
+        if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
+            mv -f "$part" "$output"
+            rm -f "$err"
+            return 0
         fi
-
-        rm -f "$part"
-        attempt=$((attempt + 1))
-        sleep 1
     done
 
-    rm -f "$part" "$output"
+    if [ -x /bin/busybox ]; then
+        rm -f "$part" "$err"
+        /bin/busybox wget --no-check-certificate -O "$part" "$url" >"$err" 2>&1
+        rc=$?
+        if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
+            mv -f "$part" "$output"
+            rm -f "$err"
+            return 0
+        fi
+    fi
+
+    curl_list="$(command -v curl 2>/dev/null) /opt/bin/curl /usr/bin/curl /bin/curl"
+    for curl_bin in $curl_list; do
+        [ -n "$curl_bin" ] || continue
+        [ -x "$curl_bin" ] || continue
+
+        rm -f "$part" "$err"
+        "$curl_bin" -k -f -L -o "$part" "$url" >"$err" 2>&1
+        rc=$?
+
+        if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
+            mv -f "$part" "$output"
+            rm -f "$err"
+            return 0
+        fi
+    done
+
+    warn "Не удалось скачать $url"
+    if [ -s "$err" ]; then
+        warn "Последняя ошибка загрузчика:"
+        cat "$err" >&2
+    fi
+
+    rm -f "$part" "$output" "$err"
     return 1
 }
 
@@ -70,12 +109,12 @@ fetch_controller() {
         return $?
     fi
 
-    raw_url="https://raw.githubusercontent.com/$REPO/$BRANCH/goshacrash"
     jsdelivr_url="https://testingcf.jsdelivr.net/gh/$REPO@$BRANCH/goshacrash"
+    raw_url="https://raw.githubusercontent.com/$REPO/$BRANCH/goshacrash"
     jsdelivr2_url="https://cdn.jsdelivr.net/gh/$REPO@$BRANCH/goshacrash"
     github_url="https://github.com/$REPO/raw/$BRANCH/goshacrash"
 
-    for url in "$raw_url" "$jsdelivr_url" "$jsdelivr2_url" "$github_url"; do
+    for url in "$jsdelivr_url" "$raw_url" "$jsdelivr2_url" "$github_url"; do
         say "Скачиваю $url"
         if fetch "$url" "$output"; then
             return 0
@@ -284,8 +323,8 @@ HELP_EOF
             ;;
     esac
 
-    [ "$(id -u 2>/dev/null)" = 0 ] ||
-        warn "Скрипт желательно запускать от admin/root"
+    [ -w /jffs ] ||
+        warn "Нет прав записи в /jffs; запускай из SSH-пользователя admin"
 
     mount="$(find_usb_mount)" || return 1
 
@@ -295,6 +334,7 @@ HELP_EOF
     }
 
     say "Версия инсталлятора: $INSTALLER_VERSION"
+    say "Build ID: $BUILD_ID"
     say "Флешка: $mount"
     say "Действие: $ACTION"
 
