@@ -1,15 +1,15 @@
 #!/bin/sh
-# BUILD: 2026-07-13-network-ifs-fixed-066
+# BUILD: 2026-07-13-slim-menu-070
 # GoshaCrash bootstrap installer for stock ASUSWRT.
 # Installs the controller to USB storage, then installs Mihomo, Zashboard,
 # DNS integration, TUN routing and Download Master autostart.
 
-INSTALLER_VERSION="0.6.6"
-BUILD_ID="2026-07-13-network-ifs-fixed-066"
+INSTALLER_VERSION="0.7.0"
+BUILD_ID="2026-07-13-slim-menu-070"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 ACTION="${1:-install}"
-EXPECTED_CONTROLLER_VERSION="0.6.6-stock-asuswrt"
+EXPECTED_CONTROLLER_VERSION="0.7.0-stock-asuswrt"
 
 say() {
     printf '%s\n' "[GoshaCrash installer] $*"
@@ -32,142 +32,71 @@ fetch() {
     url="$1"
     output="$2"
     part="$output.part.$$"
-    errors="/tmp/goshacrash-fetch-errors.$$"
-    rm -f "$part" "$output" "$errors"
+    log="/tmp/goshacrash-fetch.$$"
+    rm -f "$part" "$output" "$log"
 
-    # ASUSWRT has several unrelated wget binaries. The firmware GNU wget at
-    # /usr/sbin/wget is known to work on RT-AC68U, so try it first. Never call
-    # `busybox wget` blindly: many ASUS BusyBox builds do not include that applet.
-    if [ -n "${GOSHACRASH_WGET_CANDIDATES:-}" ]; then
-        saved_ifs="$IFS"
-        IFS=' '
-        set -- $GOSHACRASH_WGET_CANDIDATES
-        IFS="$saved_ifs"
+    if [ -x /usr/sbin/wget ]; then
+        downloader=/usr/sbin/wget
+        kind=wget
+    elif have wget; then
+        downloader="$(command -v wget)"
+        kind=wget
+    elif have curl; then
+        downloader="$(command -v curl)"
+        kind=curl
     else
-        detected_wget="$(command -v wget 2>/dev/null)"
-        set -- /usr/sbin/wget "$detected_wget" /opt/bin/wget /usr/bin/wget /bin/wget /sbin/wget
+        fail "Не найден wget или curl"
+        return 1
     fi
 
-    tried=" "
-    for wget_bin do
-        [ -n "$wget_bin" ] || continue
-        [ -x "$wget_bin" ] || continue
-        case "$tried" in *" $wget_bin "*) continue;; esac
-        tried="$tried$wget_bin "
-
-        for tls_mode in insecure normal; do
-            rm -f "$part"
-            attempt="/tmp/goshacrash-fetch-attempt.$$"
-            rm -f "$attempt"
-            say "Загрузчик: $wget_bin ($tls_mode)"
-
-            if [ "$tls_mode" = insecure ]; then
-                "$wget_bin" --no-check-certificate -O "$part" "$url" >"$attempt" 2>&1
-            else
-                "$wget_bin" -O "$part" "$url" >"$attempt" 2>&1
-            fi
-            rc=$?
-
-            if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
-                mv -f "$part" "$output"
-                rm -f "$attempt" "$errors"
-                return 0
-            fi
-
-            {
-                printf '%s
-' "--- $wget_bin ($tls_mode), code=$rc ---"
-                [ -s "$attempt" ] && cat "$attempt" || printf '%s
-' '(нет текста ошибки)'
-            } >> "$errors"
-            rm -f "$part" "$attempt"
-        done
-    done
-
-    if [ -n "${GOSHACRASH_CURL_CANDIDATES:-}" ]; then
-        saved_ifs="$IFS"
-        IFS=' '
-        set -- $GOSHACRASH_CURL_CANDIDATES
-        IFS="$saved_ifs"
+    say "Загрузчик: $downloader"
+    if [ "$kind" = wget ]; then
+        "$downloader" --no-check-certificate -O "$part" "$url" >"$log" 2>&1
     else
-        detected_curl="$(command -v curl 2>/dev/null)"
-        set -- "$detected_curl" /opt/bin/curl /usr/bin/curl /bin/curl
+        "$downloader" -k -f -L -o "$part" "$url" >"$log" 2>&1
     fi
+    rc=$?
 
-    tried=" "
-    for curl_bin do
-        [ -n "$curl_bin" ] || continue
-        [ -x "$curl_bin" ] || continue
-        case "$tried" in *" $curl_bin "*) continue;; esac
-        tried="$tried$curl_bin "
-
-        attempt="/tmp/goshacrash-fetch-attempt.$$"
-        rm -f "$part" "$attempt"
-        say "Загрузчик: $curl_bin"
-        "$curl_bin" -k -f -L -o "$part" "$url" >"$attempt" 2>&1
-        rc=$?
-
-        if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
-            mv -f "$part" "$output"
-            rm -f "$attempt" "$errors"
-            return 0
-        fi
-
-        {
-            printf '%s
-' "--- $curl_bin, code=$rc ---"
-            [ -s "$attempt" ] && cat "$attempt" || printf '%s
-' '(нет текста ошибки)'
-        } >> "$errors"
-        rm -f "$part" "$attempt"
-    done
+    if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
+        mv -f "$part" "$output"
+        rm -f "$log"
+        return 0
+    fi
 
     warn "Не удалось скачать $url"
-    if [ -s "$errors" ]; then
-        warn "Ошибки всех доступных загрузчиков:"
-        cat "$errors" >&2
-    else
-        warn "Не найден рабочий wget или curl"
-    fi
-
-    rm -f "$part" "$output" "$errors"
+    [ -s "$log" ] && cat "$log" >&2
+    rm -f "$part" "$output" "$log"
     return 1
 }
 
 fetch_controller() {
     output="$1"
-    urls=""
-
     nonce="${BUILD_ID}-$$"
-    defaults="https://raw.githubusercontent.com/$REPO/$BRANCH/goshacrash?build=$nonce
-https://github.com/$REPO/raw/refs/heads/$BRANCH/goshacrash?build=$nonce
-https://testingcf.jsdelivr.net/gh/$REPO@$BRANCH/goshacrash?build=$nonce
-https://cdn.jsdelivr.net/gh/$REPO@$BRANCH/goshacrash?build=$nonce"
+    url="${GOSHACRASH_URL:-https://raw.githubusercontent.com/$REPO/$BRANCH/goshacrash?build=$nonce}"
 
-    if [ -n "${GOSHACRASH_URL:-}" ]; then
-        urls="$GOSHACRASH_URL
-$defaults"
-    else
-        urls="$defaults"
-    fi
+    say "Скачиваю $url"
+    fetch "$url" "$output" || return 1
 
-    while IFS= read -r url; do
-        [ -n "$url" ] || continue
-        say "Скачиваю $url"
-        if fetch "$url" "$output"; then
-            sed -i 's/\r$//' "$output" 2>/dev/null || true
-            first_line="$(sed -n '1p' "$output" 2>/dev/null)"
-            got_version="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$output" 2>/dev/null | head -n 1)"
-            if [ "$first_line" = '#!/bin/sh' ] && sh -n "$output" >/dev/null 2>&1 && [ "$got_version" = "$EXPECTED_CONTROLLER_VERSION" ]; then
-                return 0
-            fi
-            warn "Отклонён контроллер: версия '${got_version:-не определена}', ожидалась '$EXPECTED_CONTROLLER_VERSION'"
-        fi
+    sed -i 's/\r$//' "$output" 2>/dev/null || true
+    first_line="$(sed -n '1p' "$output" 2>/dev/null)"
+    got_version="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$output" 2>/dev/null | head -n 1)"
+
+    [ "$first_line" = '#!/bin/sh' ] || {
+        warn "Загружен не shell-скрипт"
         rm -f "$output"
-    done <<URLS_EOF
-$urls
-URLS_EOF
-    return 1
+        return 1
+    }
+    sh -n "$output" >/dev/null 2>&1 || {
+        warn "Загруженный контроллер содержит синтаксическую ошибку"
+        rm -f "$output"
+        return 1
+    }
+    [ "$got_version" = "$EXPECTED_CONTROLLER_VERSION" ] || {
+        warn "Получена версия '${got_version:-не определена}', ожидалась '$EXPECTED_CONTROLLER_VERSION'"
+        rm -f "$output"
+        return 1
+    }
+    return 0
 }
 
 find_usb_mount() {
@@ -298,7 +227,8 @@ install_controller() {
             ;;
 
         controller-only)
-            say "Установлен только контроллер; компоненты не запускались"
+            GOSHACRASH_BASE="$base" "$target" install-editor || return 1
+            say "Контроллер и nano установлены; Mihomo/TUN не перезапускались"
             ;;
 
         update)
@@ -350,8 +280,8 @@ main() {
             cat <<'HELP_EOF'
 Использование:
   sh install.sh install          полная установка
-  sh install.sh controller-only  установить только контроллер
-  sh install.sh update           обновить Mihomo и Zashboard
+  sh install.sh controller-only  обновить контроллер и установить nano без перезапуска Mihomo
+  sh install.sh update           установить nano и обновить Mihomo/Zashboard
   sh install.sh remove           удалить GoshaCrash
 
 Переменные:
@@ -362,8 +292,8 @@ main() {
   GOSHACRASH_URL=https://.../goshacrash
   KEEP_CONFIG=1
 
-Все компоненты полной установки загружаются по сети:
-контроллер — из этого репозитория, Mihomo и Zashboard — контроллером.
+Все компоненты загружаются по сети из одного основного источника каждый:
+контроллер — GitHub GoshaCrash, Mihomo и Zashboard — репозиторий ShellCrash.
 HELP_EOF
             return 0
             ;;

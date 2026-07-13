@@ -1,11 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-13-network-ifs-fixed-066
-# GoshaCrash 0.6.6 — network installer for Mihomo + Zashboard on stock ASUSWRT.
+# BUILD: 2026-07-13-slim-menu-070
+# GoshaCrash 0.7.0 — slim installer and menu for Mihomo + Zashboard on stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-VERSION="0.6.6-stock-asuswrt"
-BUILD_ID="2026-07-13-network-ifs-fixed-066"
-MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.28}"
+VERSION="0.7.0-stock-asuswrt"
+BUILD_ID="2026-07-13-slim-menu-070"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
@@ -85,102 +84,40 @@ lan_ifaces(){
 lan_ip(){ x="$(nvram get lan_ipaddr 2>/dev/null)"; [ -n "$x" ] || x=192.168.1.1; echo "$x"; }
 
 fetch(){
-    url="$1"; out="$2"; part="$out.part.$$"; errors="/tmp/goshacrash-fetch-errors.$$"
-    rm -f "$part" "$out" "$errors"
+    url="$1"; out="$2"; part="$out.part.$$"; log="/tmp/goshacrash-fetch.$$"
+    rm -f "$part" "$out" "$log"
 
-    if [ -n "${GOSHACRASH_WGET_CANDIDATES:-}" ]; then
-        saved_ifs="$IFS"
-        IFS=' '
-        set -- $GOSHACRASH_WGET_CANDIDATES
-        IFS="$saved_ifs"
+    if [ -x /usr/sbin/wget ]; then
+        downloader=/usr/sbin/wget; kind=wget
+    elif have wget; then
+        downloader="$(command -v wget)"; kind=wget
+    elif have curl; then
+        downloader="$(command -v curl)"; kind=curl
     else
-        detected_wget="$(command -v wget 2>/dev/null)"
-        set -- /usr/sbin/wget "$detected_wget" /opt/bin/wget /usr/bin/wget /bin/wget /sbin/wget
+        fail "Не найден wget или curl"
+        return 1
     fi
 
-    tried=" "
-    for wget_bin do
-        [ -n "$wget_bin" ] || continue
-        [ -x "$wget_bin" ] || continue
-        case "$tried" in *" $wget_bin "*) continue;; esac
-        tried="$tried$wget_bin "
-
-        for tls_mode in insecure normal; do
-            attempt="/tmp/goshacrash-fetch-attempt.$$"
-            rm -f "$part" "$attempt"
-            say "Загрузчик: $wget_bin ($tls_mode)"
-            if [ "$tls_mode" = insecure ]; then
-                "$wget_bin" --no-check-certificate -O "$part" "$url" >"$attempt" 2>&1
-            else
-                "$wget_bin" -O "$part" "$url" >"$attempt" 2>&1
-            fi
-            rc=$?
-            if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
-                mv -f "$part" "$out"; rm -f "$attempt" "$errors"; return 0
-            fi
-            {
-                printf '%s
-' "--- $wget_bin ($tls_mode), code=$rc ---"
-                [ -s "$attempt" ] && cat "$attempt" || printf '%s
-' '(нет текста ошибки)'
-            } >> "$errors"
-            rm -f "$part" "$attempt"
-        done
-    done
-
-    if [ -n "${GOSHACRASH_CURL_CANDIDATES:-}" ]; then
-        saved_ifs="$IFS"
-        IFS=' '
-        set -- $GOSHACRASH_CURL_CANDIDATES
-        IFS="$saved_ifs"
+    say "Загрузчик: $downloader"
+    if [ "$kind" = wget ]; then
+        "$downloader" --no-check-certificate -O "$part" "$url" >"$log" 2>&1
     else
-        detected_curl="$(command -v curl 2>/dev/null)"
-        set -- "$detected_curl" /opt/bin/curl /usr/bin/curl /bin/curl
+        "$downloader" -k -f -L -o "$part" "$url" >"$log" 2>&1
     fi
+    rc=$?
 
-    tried=" "
-    for curl_bin do
-        [ -n "$curl_bin" ] || continue
-        [ -x "$curl_bin" ] || continue
-        case "$tried" in *" $curl_bin "*) continue;; esac
-        tried="$tried$curl_bin "
-        attempt="/tmp/goshacrash-fetch-attempt.$$"
-        rm -f "$part" "$attempt"
-        say "Загрузчик: $curl_bin"
-        "$curl_bin" -k -f -L -o "$part" "$url" >"$attempt" 2>&1
-        rc=$?
-        if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
-            mv -f "$part" "$out"; rm -f "$attempt" "$errors"; return 0
-        fi
-        {
-            printf '%s
-' "--- $curl_bin, code=$rc ---"
-            [ -s "$attempt" ] && cat "$attempt" || printf '%s
-' '(нет текста ошибки)'
-        } >> "$errors"
-        rm -f "$part" "$attempt"
-    done
+    if [ "$rc" -eq 0 ] && [ -s "$part" ]; then
+        mv -f "$part" "$out"
+        rm -f "$log"
+        return 0
+    fi
 
     warn "Не удалось скачать $url"
-    if [ -s "$errors" ]; then
-        warn "Ошибки всех доступных загрузчиков:"
-        cat "$errors" >&2
-    else
-        warn "Не найден рабочий wget или curl"
-    fi
-    rm -f "$part" "$out" "$errors"
+    [ -s "$log" ] && cat "$log" >&2
+    rm -f "$part" "$out" "$log"
     return 1
 }
 
-fetch_any(){
-    out="$1"; shift
-    for u in "$@"; do
-        say "Скачиваю $u"
-        if fetch "$u" "$out"; then return 0; fi
-        warn "Источник недоступен: $u"
-    done
-    return 1
-}
 
 is_asus(){
     have nvram && [ -n "$(nvram get productid 2>/dev/null)" ] && return 0
@@ -203,12 +140,10 @@ core_arch(){
 install_core_from_shellcrash(){
     a="$1"; pkg="$BASE/run/mihomo-shellcrash.tar.gz"; ex="$BASE/run/mihomo.extract"; new="$BASE/run/mihomo.new"
     asset="clash-linux-$a.tar.gz"
-    base1="https://github.com/$SHELLCRASH_REPO/raw/$SHELLCRASH_BRANCH/bin/meta/$asset"
-    base2="https://raw.githubusercontent.com/$SHELLCRASH_REPO/$SHELLCRASH_BRANCH/bin/meta/$asset"
-    base3="https://testingcf.jsdelivr.net/gh/$SHELLCRASH_REPO@$SHELLCRASH_BRANCH/bin/meta/$asset"
-    base4="https://cdn.jsdelivr.net/gh/$SHELLCRASH_REPO@$SHELLCRASH_BRANCH/bin/meta/$asset"
+    url="${MIHOMO_URL:-https://github.com/$SHELLCRASH_REPO/raw/$SHELLCRASH_BRANCH/bin/meta/$asset}"
 
-    fetch_any "$pkg" "$base1" "$base2" "$base3" "$base4" "https://ghfast.top/$base1" || return 1
+    say "Скачиваю Mihomo: $url"
+    fetch "$url" "$pkg" || return 1
     tar -tzf "$pkg" >/dev/null 2>&1 || { warn "Получен повреждённый архив Mihomo"; rm -f "$pkg"; return 1; }
     rm -rf "$ex"; mkdir -p "$ex" || return 1
     tar -xzf "$pkg" -C "$ex" >/dev/null 2>&1 || { rm -rf "$ex" "$pkg"; return 1; }
@@ -219,28 +154,12 @@ install_core_from_shellcrash(){
         candidate="$f"
         break
     done
-    if [ -z "$candidate" ] && have find; then
-        candidate="$(find "$ex" -type f 2>/dev/null | head -n 1)"
-    fi
-    [ -n "$candidate" ] && [ -f "$candidate" ] || { rm -rf "$ex" "$pkg"; return 1; }
+    [ -n "$candidate" ] && [ -f "$candidate" ] || { rm -rf "$ex" "$pkg"; fail "В архиве Mihomo не найден бинарник"; return 1; }
 
     cp "$candidate" "$new" || return 1
     chmod 755 "$new" || return 1
-    "$new" -v >/dev/null 2>&1 || { warn "Скачанное ядро ShellCrash не запускается"; rm -rf "$ex" "$pkg" "$new"; return 1; }
+    "$new" -v >/dev/null 2>&1 || { warn "Скачанное ядро Mihomo не запускается"; rm -rf "$ex" "$pkg" "$new"; return 1; }
     rm -rf "$ex" "$pkg"
-    return 0
-}
-
-install_core_from_release(){
-    a="$1"; gz="$BASE/run/mihomo-release.gz"; new="$BASE/run/mihomo.new"
-    asset="mihomo-linux-$a-v$MIHOMO_VERSION.gz"
-    url="https://github.com/MetaCubeX/mihomo/releases/download/v$MIHOMO_VERSION/$asset"
-    fetch_any "$gz" "$url" "https://ghfast.top/$url" "https://mirror.ghproxy.com/$url" || return 1
-    gzip -t "$gz" >/dev/null 2>&1 || { warn "Получен повреждённый gzip Mihomo"; rm -f "$gz"; return 1; }
-    gzip -dc "$gz" > "$new" || { rm -f "$gz" "$new"; return 1; }
-    chmod 755 "$new" || return 1
-    "$new" -v >/dev/null 2>&1 || { rm -f "$gz" "$new"; return 1; }
-    rm -f "$gz"
     return 0
 }
 
@@ -250,30 +169,11 @@ install_core(){
     new="$BASE/run/mihomo.new"
     rm -f "$new"
 
-    if [ -n "${MIHOMO_URL:-}" ]; then
-        say "Использую пользовательский сетевой MIHOMO_URL"
-        gz="$BASE/run/mihomo-custom.gz"
-        fetch_any "$gz" "$MIHOMO_URL" || return 1
-        gzip -t "$gz" >/dev/null 2>&1 || { fail "MIHOMO_URL вернул не gzip"; rm -f "$gz"; return 1; }
-        gzip -dc "$gz" > "$new" || return 1
-        chmod 755 "$new" || return 1
-        "$new" -v >/dev/null 2>&1 || { fail "Ядро из MIHOMO_URL не запускается"; rm -f "$new"; return 1; }
-        rm -f "$gz"
-    else
-        say "Архитектура ядра: $a"
-        install_core_from_shellcrash "$a" || {
-            warn "Сборка ShellCrash недоступна, пробую официальный релиз Mihomo"
-            install_core_from_release "$a" || {
-                if [ "$a" = armv5 ]; then
-                    warn "Официального armv5 нет или он недоступен; пробую armv7 как последний резерв"
-                    install_core_from_release armv7 || { fail "Не удалось скачать рабочее ядро Mihomo"; return 1; }
-                else
-                    fail "Не удалось скачать рабочее ядро Mihomo"
-                    return 1
-                fi
-            }
-        }
-    fi
+    say "Архитектура ядра: $a"
+    install_core_from_shellcrash "$a" || {
+        fail "Не удалось скачать рабочее ядро Mihomo из основного источника"
+        return 1
+    }
 
     [ -f "$BIN" ] && cp "$BIN" "$BIN.previous" 2>/dev/null || true
     mv -f "$new" "$BIN" || return 1
@@ -299,17 +199,9 @@ install_ui(){
     tgz="$BASE/run/zashboard.tar.gz"; ex="$BASE/run/zashboard.extract"; newui="$BASE/run/ui.new"
     rm -rf "$ex" "$newui"; mkdir -p "$ex" "$newui" || return 1
 
-    if [ -n "${ZASHBOARD_URL:-}" ]; then
-        fetch_any "$tgz" "$ZASHBOARD_URL" || return 1
-    else
-        sc1="https://github.com/$SHELLCRASH_REPO/raw/$SHELLCRASH_BRANCH/bin/dashboard/zashboard.tar.gz"
-        sc2="https://raw.githubusercontent.com/$SHELLCRASH_REPO/$SHELLCRASH_BRANCH/bin/dashboard/zashboard.tar.gz"
-        sc3="https://testingcf.jsdelivr.net/gh/$SHELLCRASH_REPO@$SHELLCRASH_BRANCH/bin/dashboard/zashboard.tar.gz"
-        sc4="https://cdn.jsdelivr.net/gh/$SHELLCRASH_REPO@$SHELLCRASH_BRANCH/bin/dashboard/zashboard.tar.gz"
-        official1="https://github.com/Zephyruso/zashboard/archive/refs/heads/gh-pages-no-fonts.tar.gz"
-        official2="https://codeload.github.com/Zephyruso/zashboard/tar.gz/refs/heads/gh-pages-no-fonts"
-        fetch_any "$tgz" "$sc1" "$sc2" "$sc3" "$sc4" "https://ghfast.top/$sc1" "$official1" "$official2" || return 1
-    fi
+    url="${ZASHBOARD_URL:-https://github.com/$SHELLCRASH_REPO/raw/$SHELLCRASH_BRANCH/bin/dashboard/zashboard.tar.gz}"
+    say "Скачиваю Zashboard: $url"
+    fetch "$url" "$tgz" || return 1
 
     tar -tzf "$tgz" >/dev/null 2>&1 || { fail "Получен повреждённый архив Zashboard"; rm -f "$tgz"; return 1; }
     tar -xzf "$tgz" -C "$ex" >/dev/null 2>&1 || return 1
@@ -671,6 +563,42 @@ doctor(){
     echo "=== log ==="; tail -n 60 "$LOGFILE" 2>/dev/null || true
 }
 
+find_ipkg(){
+    for p in /opt/bin/ipkg "$USB_MOUNT/asusware.arm/bin/ipkg" "$USB_MOUNT/asusware.arm/sbin/ipkg"; do
+        [ -x "$p" ] && { echo "$p"; return 0; }
+    done
+    have ipkg && { command -v ipkg; return 0; }
+    return 1
+}
+
+install_editor(){
+    if have nano; then
+        say "Текстовый редактор уже установлен: $(command -v nano)"
+        return 0
+    fi
+
+    ipkg_bin="$(find_ipkg)" || {
+        fail "Не найден ipkg от Download Master; nano установить невозможно"
+        return 1
+    }
+
+    say "Обновляю список пакетов через $ipkg_bin"
+    "$ipkg_bin" update || warn "ipkg update завершился с ошибкой; пробую установить nano из текущего списка"
+    say "Устанавливаю nano"
+    "$ipkg_bin" install nano || {
+        fail "Не удалось установить nano через $ipkg_bin"
+        return 1
+    }
+
+    if have nano || [ -x /opt/bin/nano ] || [ -x "$USB_MOUNT/asusware.arm/bin/nano" ]; then
+        say "nano установлен"
+        return 0
+    fi
+
+    fail "Пакет nano установился, но команда nano не найдена"
+    return 1
+}
+
 edit_config(){
     write_default_config || return 1; e="${EDITOR:-}"
     if [ -z "$e" ]; then for x in nano mcedit vi; do have "$x" && { e="$x"; break; }; done; fi
@@ -684,6 +612,7 @@ restore_config(){
 
 install_all(){
     ensure_dirs || return 1
+    install_editor || return 1
     write_default_config || return 1
     install_core || { fail "Установка Mihomo не завершена"; return 1; }
     install_ui || { fail "Установка Zashboard не завершена"; return 1; }
@@ -691,17 +620,68 @@ install_all(){
     apply_config
 }
 update_all(){
+    install_editor || return 1
     stop_mihomo >/dev/null 2>&1 || true
     install_core || return 1
     install_ui || return 1
     apply_config
 }
 
+pause_menu(){
+    printf '\nНажми Enter для продолжения...'
+    read _dummy
+}
+
+menu(){
+    while :; do
+        printf '\033[2J\033[H'
+        echo '========================================'
+        echo '             GoshaCrash'
+        echo '========================================'
+        status
+        echo
+        echo '1) Запустить Mihomo'
+        echo '2) Остановить Mihomo'
+        echo '3) Перезапустить Mihomo'
+        echo '4) Редактировать config.yaml и применить'
+        echo '5) Применить config.yaml'
+        echo '6) Включить TUN-маршрутизацию'
+        echo '7) Отключить TUN-маршрутизацию'
+        echo '8) Показать последние логи'
+        echo '9) Полная диагностика'
+        echo '10) Показать адрес Zashboard'
+        echo '11) Обновить Mihomo и Zashboard'
+        echo '12) Установить/проверить nano'
+        echo '0) Выход'
+        echo '========================================'
+        printf 'Выбери пункт: '
+        read choice
+        case "$choice" in
+            1) start_mihomo;;
+            2) stop_mihomo;;
+            3) stop_mihomo; start_mihomo;;
+            4) edit_config && apply_config;;
+            5) apply_config;;
+            6) setup_routing;;
+            7) remove_routing; echo 'TUN-маршрутизация отключена';;
+            8) tail -n 100 "$LOGFILE" 2>/dev/null || true;;
+            9) doctor;;
+            10) c="$(yaml_top "$RUNTIME" external-controller)"; [ -n "$c" ] || c=0.0.0.0:9090; p="${c##*:}"; p="$(echo "$p"|sed 's/[^0-9].*$//')"; echo "http://$(lan_ip):${p:-9090}/ui/";;
+            11) update_all;;
+            12) install_editor;;
+            0) return 0;;
+            *) echo 'Неизвестный пункт';;
+        esac
+        pause_menu
+    done
+}
+
 usage(){ cat <<'USAGE'
 GoshaCrash — Mihomo + Zashboard для stock ASUSWRT
 
 Команды:
-  install           установить Mihomo, Zashboard и автозапуск
+  menu              открыть интерактивное меню
+  install           установить nano, Mihomo, Zashboard и автозапуск
   setup             открыть config.yaml и применить
   edit              открыть config.yaml
   check             проверить итоговый runtime.yaml
@@ -719,12 +699,14 @@ GoshaCrash — Mihomo + Zashboard для stock ASUSWRT
   tun-disable       убрать TUN/iptables без остановки Mihomo
   firewall-reload   восстановить DNS и iptables
   update            обновить Mihomo и Zashboard
+  install-editor    установить nano через ipkg
   version
 USAGE
 }
 
 ensure_dirs >/dev/null 2>&1 || true
-case "${1:-help}" in
+case "${1:-menu}" in
+ menu) menu;;
  install) install_all;;
  setup) edit_config && apply_config;;
  edit) edit_config;;
@@ -746,7 +728,8 @@ case "${1:-help}" in
  tun-enable) setup_routing;;
  tun-disable) remove_routing; echo "TUN-маршрутизация отключена";;
  update) update_all;;
+ install-editor) install_editor;;
  version) echo "$VERSION";;
- help|-h|--help|'') usage;;
+ help|-h|--help) usage;;
  *) usage; exit 1;;
 esac
