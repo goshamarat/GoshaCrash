@@ -1,9 +1,11 @@
 #!/bin/sh
-# GoshaCrash 0.5.0 — Mihomo + Zashboard for stock ASUSWRT.
+# GoshaCrash 0.6.0 — network installer for Mihomo + Zashboard on stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-VERSION="0.5.0-stock-asuswrt"
+VERSION="0.6.0-stock-asuswrt"
 MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.28}"
+SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
+SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -81,17 +83,45 @@ lan_ifaces(){
 lan_ip(){ x="$(nvram get lan_ipaddr 2>/dev/null)"; [ -n "$x" ] || x=192.168.1.1; echo "$x"; }
 
 fetch(){
-    url="$1"; out="$2"; rm -f "$out"
-    if have curl; then curl -fL --connect-timeout 20 --retry 2 -o "$out" "$url" >/dev/null 2>&1 && [ -s "$out" ] && return 0; fi
-    if have wget; then wget -q --no-check-certificate -O "$out" "$url" && [ -s "$out" ] && return 0; fi
-    rm -f "$out"; return 1
+    url="$1"; out="$2"; part="$out.part.$$"
+    rm -f "$part" "$out"
+    n=1
+    while [ "$n" -le 2 ]; do
+        if have curl; then
+            curl -kfsSL --connect-timeout 15 --max-time 900 -o "$part" "$url" 2>/dev/null &&
+                [ -s "$part" ] && { mv -f "$part" "$out"; return 0; }
+        fi
+        rm -f "$part"
+        if have wget; then
+            wget -q --no-check-certificate -O "$part" "$url" 2>/dev/null &&
+                [ -s "$part" ] && { mv -f "$part" "$out"; return 0; }
+        fi
+        rm -f "$part"; n=$((n+1)); sleep 1
+    done
+    rm -f "$part" "$out"; return 1
 }
 
-fetch_any(){ out="$1"; shift; for u in "$@"; do say "Скачиваю $u"; fetch "$u" "$out" && return 0; done; return 1; }
+fetch_any(){
+    out="$1"; shift
+    for u in "$@"; do
+        say "Скачиваю $u"
+        if fetch "$u" "$out"; then return 0; fi
+        warn "Источник недоступен: $u"
+    done
+    return 1
+}
+
+is_asus(){
+    have nvram && [ -n "$(nvram get productid 2>/dev/null)" ] && return 0
+    uname -a 2>/dev/null | grep -qiE 'asus|brcmarm'
+}
 
 core_arch(){
     case "$(uname -m 2>/dev/null)" in
-        armv7l|armv7*|armhf) echo armv7;;
+        armv7l|armv7*|armhf)
+            # ShellCrash uses armv5 on old ASUS armv7 devices to avoid crashes.
+            if is_asus; then echo armv5; else echo armv7; fi;;
+        armv5*|armv6*) echo armv5;;
         aarch64|arm64) echo arm64;;
         x86_64|amd64) echo amd64;;
         i?86|x86) echo 386;;
@@ -99,36 +129,128 @@ core_arch(){
     esac
 }
 
+install_core_from_shellcrash(){
+    a="$1"; pkg="$BASE/run/mihomo-shellcrash.tar.gz"; ex="$BASE/run/mihomo.extract"; new="$BASE/run/mihomo.new"
+    asset="clash-linux-$a.tar.gz"
+    base1="https://github.com/$SHELLCRASH_REPO/raw/$SHELLCRASH_BRANCH/bin/meta/$asset"
+    base2="https://raw.githubusercontent.com/$SHELLCRASH_REPO/$SHELLCRASH_BRANCH/bin/meta/$asset"
+    base3="https://testingcf.jsdelivr.net/gh/$SHELLCRASH_REPO@$SHELLCRASH_BRANCH/bin/meta/$asset"
+    base4="https://cdn.jsdelivr.net/gh/$SHELLCRASH_REPO@$SHELLCRASH_BRANCH/bin/meta/$asset"
+
+    fetch_any "$pkg" "$base1" "$base2" "$base3" "$base4" "https://ghfast.top/$base1" || return 1
+    tar -tzf "$pkg" >/dev/null 2>&1 || { warn "Получен повреждённый архив Mihomo"; rm -f "$pkg"; return 1; }
+    rm -rf "$ex"; mkdir -p "$ex" || return 1
+    tar -xzf "$pkg" -C "$ex" >/dev/null 2>&1 || { rm -rf "$ex" "$pkg"; return 1; }
+
+    candidate=""
+    for f in "$ex/CrashCore" "$ex/clash" "$ex/mihomo" "$ex"/*; do
+        [ -f "$f" ] || continue
+        candidate="$f"
+        break
+    done
+    if [ -z "$candidate" ] && have find; then
+        candidate="$(find "$ex" -type f 2>/dev/null | head -n 1)"
+    fi
+    [ -n "$candidate" ] && [ -f "$candidate" ] || { rm -rf "$ex" "$pkg"; return 1; }
+
+    cp "$candidate" "$new" || return 1
+    chmod 755 "$new" || return 1
+    "$new" -v >/dev/null 2>&1 || { warn "Скачанное ядро ShellCrash не запускается"; rm -rf "$ex" "$pkg" "$new"; return 1; }
+    rm -rf "$ex" "$pkg"
+    return 0
+}
+
+install_core_from_release(){
+    a="$1"; gz="$BASE/run/mihomo-release.gz"; new="$BASE/run/mihomo.new"
+    asset="mihomo-linux-$a-v$MIHOMO_VERSION.gz"
+    url="https://github.com/MetaCubeX/mihomo/releases/download/v$MIHOMO_VERSION/$asset"
+    fetch_any "$gz" "$url" "https://ghfast.top/$url" "https://mirror.ghproxy.com/$url" || return 1
+    gzip -t "$gz" >/dev/null 2>&1 || { warn "Получен повреждённый gzip Mihomo"; rm -f "$gz"; return 1; }
+    gzip -dc "$gz" > "$new" || { rm -f "$gz" "$new"; return 1; }
+    chmod 755 "$new" || return 1
+    "$new" -v >/dev/null 2>&1 || { rm -f "$gz" "$new"; return 1; }
+    rm -f "$gz"
+    return 0
+}
+
 install_core(){
     ensure_dirs || return 1
     a="$(core_arch)" || return 1
-    asset="mihomo-linux-$a-v$MIHOMO_VERSION.gz"
-    url="https://github.com/MetaCubeX/mihomo/releases/download/v$MIHOMO_VERSION/$asset"
-    gz="$BASE/run/mihomo.gz"; new="$BASE/run/mihomo.new"
-    if [ -n "${MIHOMO_URL:-}" ]; then fetch_any "$gz" "$MIHOMO_URL" || return 1
-    else fetch_any "$gz" "$url" "https://ghfast.top/$url" "https://github.moeyy.xyz/$url" || return 1; fi
-    gzip -dc "$gz" > "$new" || return 1
-    chmod 755 "$new" || return 1
-    "$new" -v >/dev/null 2>&1 || { rm -f "$new"; return 1; }
+    new="$BASE/run/mihomo.new"
+    rm -f "$new"
+
+    if [ -n "${MIHOMO_URL:-}" ]; then
+        say "Использую пользовательский сетевой MIHOMO_URL"
+        gz="$BASE/run/mihomo-custom.gz"
+        fetch_any "$gz" "$MIHOMO_URL" || return 1
+        gzip -t "$gz" >/dev/null 2>&1 || { fail "MIHOMO_URL вернул не gzip"; rm -f "$gz"; return 1; }
+        gzip -dc "$gz" > "$new" || return 1
+        chmod 755 "$new" || return 1
+        "$new" -v >/dev/null 2>&1 || { fail "Ядро из MIHOMO_URL не запускается"; rm -f "$new"; return 1; }
+        rm -f "$gz"
+    else
+        say "Архитектура ядра: $a"
+        install_core_from_shellcrash "$a" || {
+            warn "Сборка ShellCrash недоступна, пробую официальный релиз Mihomo"
+            install_core_from_release "$a" || {
+                if [ "$a" = armv5 ]; then
+                    warn "Официального armv5 нет или он недоступен; пробую armv7 как последний резерв"
+                    install_core_from_release armv7 || { fail "Не удалось скачать рабочее ядро Mihomo"; return 1; }
+                else
+                    fail "Не удалось скачать рабочее ядро Mihomo"
+                    return 1
+                fi
+            }
+        }
+    fi
+
     [ -f "$BIN" ] && cp "$BIN" "$BIN.previous" 2>/dev/null || true
-    mv -f "$new" "$BIN" || return 1; rm -f "$gz"
+    mv -f "$new" "$BIN" || return 1
+    chmod 755 "$BIN" || return 1
     say "Mihomo установлен: $($BIN -v 2>/dev/null | head -n 1)"
+}
+
+find_ui_root(){
+    ex="$1"
+    [ -f "$ex/index.html" ] && { echo "$ex"; return 0; }
+    for d in "$ex"/*; do
+        [ -d "$d" ] && [ -f "$d/index.html" ] && { echo "$d"; return 0; }
+    done
+    if have find; then
+        idx="$(find "$ex" -name index.html -type f 2>/dev/null | head -n 1)"
+        [ -n "$idx" ] && { dirname "$idx"; return 0; }
+    fi
+    return 1
 }
 
 install_ui(){
     ensure_dirs || return 1
-    tgz="$BASE/run/zashboard.tar.gz"; ex="$BASE/run/zashboard.extract"
-    rm -rf "$ex"; mkdir -p "$ex" || return 1
-    if [ -n "${ZASHBOARD_URL:-}" ]; then fetch_any "$tgz" "$ZASHBOARD_URL" || return 1
-    else fetch_any "$tgz" \
-        "https://github.com/Zephyruso/zashboard/archive/refs/heads/gh-pages-no-fonts.tar.gz" \
-        "https://codeload.github.com/Zephyruso/zashboard/tar.gz/refs/heads/gh-pages-no-fonts" || return 1; fi
+    tgz="$BASE/run/zashboard.tar.gz"; ex="$BASE/run/zashboard.extract"; newui="$BASE/run/ui.new"
+    rm -rf "$ex" "$newui"; mkdir -p "$ex" "$newui" || return 1
+
+    if [ -n "${ZASHBOARD_URL:-}" ]; then
+        fetch_any "$tgz" "$ZASHBOARD_URL" || return 1
+    else
+        sc1="https://github.com/$SHELLCRASH_REPO/raw/$SHELLCRASH_BRANCH/bin/dashboard/zashboard.tar.gz"
+        sc2="https://raw.githubusercontent.com/$SHELLCRASH_REPO/$SHELLCRASH_BRANCH/bin/dashboard/zashboard.tar.gz"
+        sc3="https://testingcf.jsdelivr.net/gh/$SHELLCRASH_REPO@$SHELLCRASH_BRANCH/bin/dashboard/zashboard.tar.gz"
+        sc4="https://cdn.jsdelivr.net/gh/$SHELLCRASH_REPO@$SHELLCRASH_BRANCH/bin/dashboard/zashboard.tar.gz"
+        official1="https://github.com/Zephyruso/zashboard/archive/refs/heads/gh-pages-no-fonts.tar.gz"
+        official2="https://codeload.github.com/Zephyruso/zashboard/tar.gz/refs/heads/gh-pages-no-fonts"
+        fetch_any "$tgz" "$sc1" "$sc2" "$sc3" "$sc4" "https://ghfast.top/$sc1" "$official1" "$official2" || return 1
+    fi
+
+    tar -tzf "$tgz" >/dev/null 2>&1 || { fail "Получен повреждённый архив Zashboard"; rm -f "$tgz"; return 1; }
     tar -xzf "$tgz" -C "$ex" >/dev/null 2>&1 || return 1
-    root=""; for d in "$ex"/*; do [ -d "$d" ] && { root="$d"; break; }; done
-    [ -n "$root" ] || return 1
-    rm -rf "$UI"; mkdir -p "$UI" || return 1; cp -R "$root"/. "$UI"/ || return 1
-    rm -rf "$ex" "$tgz"; [ -f "$UI/index.html" ] || return 1
-    say "Zashboard установлен"
+    root="$(find_ui_root "$ex")" || { fail "В архиве Zashboard нет index.html"; rm -rf "$ex" "$tgz"; return 1; }
+    cp -R "$root"/. "$newui"/ || return 1
+    [ -f "$newui/index.html" ] || return 1
+
+    rm -rf "$UI.previous"
+    [ -d "$UI" ] && mv "$UI" "$UI.previous" 2>/dev/null || true
+    mv "$newui" "$UI" || { [ -d "$UI.previous" ] && mv "$UI.previous" "$UI"; return 1; }
+    rm -rf "$ex" "$tgz"
+    say "Zashboard установлен по сети"
 }
 
 write_default_config(){
@@ -473,8 +595,20 @@ restore_config(){
     [ -f "$f" ] || { fail "Резервная копия не найдена"; return 1; }; cp "$f" "$CONFIG" || return 1; apply_config
 }
 
-install_all(){ ensure_dirs && write_default_config && install_core && install_ui && install_hooks && apply_config; }
-update_all(){ stop_mihomo >/dev/null 2>&1 || true; install_core && install_ui && apply_config; }
+install_all(){
+    ensure_dirs || return 1
+    write_default_config || return 1
+    install_core || { fail "Установка Mihomo не завершена"; return 1; }
+    install_ui || { fail "Установка Zashboard не завершена"; return 1; }
+    install_hooks || return 1
+    apply_config
+}
+update_all(){
+    stop_mihomo >/dev/null 2>&1 || true
+    install_core || return 1
+    install_ui || return 1
+    apply_config
+}
 
 usage(){ cat <<'USAGE'
 GoshaCrash — Mihomo + Zashboard для stock ASUSWRT

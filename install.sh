@@ -3,7 +3,7 @@
 # Installs the controller to USB storage, then installs Mihomo, Zashboard,
 # DNS integration, TUN routing and Download Master autostart.
 
-INSTALLER_VERSION="0.5.0"
+INSTALLER_VERSION="0.6.0"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 ACTION="${1:-install}"
@@ -28,37 +28,41 @@ have() {
 fetch() {
     url="$1"
     output="$2"
-    rm -f "$output"
+    part="$output.part.$$"
+    rm -f "$part" "$output"
 
-    if have curl; then
-        curl -fL --connect-timeout 20 --retry 2 \
-            -o "$output" "$url" >/dev/null 2>&1 &&
-            [ -s "$output" ] &&
-            return 0
-    fi
+    attempt=1
+    while [ "$attempt" -le 2 ]; do
+        if have curl; then
+            curl -kfsSL --connect-timeout 15 --max-time 900 \
+                -o "$part" "$url" 2>/dev/null &&
+                [ -s "$part" ] && {
+                    mv -f "$part" "$output"
+                    return 0
+                }
+        fi
 
-    if have wget; then
-        wget -q --no-check-certificate -O "$output" "$url" &&
-            [ -s "$output" ] &&
-            return 0
-    fi
+        rm -f "$part"
 
-    rm -f "$output"
+        if have wget; then
+            wget -q --no-check-certificate -O "$part" "$url" 2>/dev/null &&
+                [ -s "$part" ] && {
+                    mv -f "$part" "$output"
+                    return 0
+                }
+        fi
+
+        rm -f "$part"
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+
+    rm -f "$part" "$output"
     return 1
 }
 
 fetch_controller() {
     output="$1"
-
-    if [ -n "${CONTROLLER_FILE:-}" ]; then
-        [ -f "$CONTROLLER_FILE" ] || {
-            fail "CONTROLLER_FILE не найден: $CONTROLLER_FILE"
-            return 1
-        }
-
-        cp "$CONTROLLER_FILE" "$output" || return 1
-        return 0
-    fi
 
     if [ -n "${GOSHACRASH_URL:-}" ]; then
         say "Скачиваю контроллер из GOSHACRASH_URL"
@@ -66,10 +70,12 @@ fetch_controller() {
         return $?
     fi
 
-    raw_url="https://raw.githubusercontent.com/$REPO/refs/heads/$BRANCH/goshacrash"
-    github_url="https://github.com/$REPO/raw/refs/heads/$BRANCH/goshacrash"
+    raw_url="https://raw.githubusercontent.com/$REPO/$BRANCH/goshacrash"
+    jsdelivr_url="https://testingcf.jsdelivr.net/gh/$REPO@$BRANCH/goshacrash"
+    jsdelivr2_url="https://cdn.jsdelivr.net/gh/$REPO@$BRANCH/goshacrash"
+    github_url="https://github.com/$REPO/raw/$BRANCH/goshacrash"
 
-    for url in "$raw_url" "$github_url"; do
+    for url in "$raw_url" "$jsdelivr_url" "$jsdelivr2_url" "$github_url"; do
         say "Скачиваю $url"
         if fetch "$url" "$output"; then
             return 0
@@ -145,8 +151,8 @@ WRAPPER_EOF
 
     chmod 755 "$wrapper" || return 1
 
-    if [ -d /opt/bin ] && [ ! -e /opt/bin/goshacrash ]; then
-        ln -s "$wrapper" /opt/bin/goshacrash 2>/dev/null || true
+    if [ -d /opt/bin ]; then
+        ln -sf "$wrapper" /opt/bin/goshacrash 2>/dev/null || true
     fi
 
     say "Команда управления установлена: $wrapper"
@@ -167,6 +173,7 @@ install_controller() {
         return 1
     }
 
+    sed -i 's/\r$//' "$temporary" 2>/dev/null || true
     first_line="$(sed -n '1p' "$temporary" 2>/dev/null)"
     [ "$first_line" = '#!/bin/sh' ] || {
         rm -f "$temporary"
@@ -263,8 +270,10 @@ main() {
   REPO=goshamarat/GoshaCrash
   BRANCH=main
   GOSHACRASH_URL=https://.../goshacrash
-  CONTROLLER_FILE=/путь/к/goshacrash
   KEEP_CONFIG=1
+
+Все компоненты полной установки загружаются по сети:
+контроллер — из этого репозитория, Mihomo и Zashboard — контроллером.
 HELP_EOF
             return 0
             ;;
