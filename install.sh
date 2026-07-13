@@ -1,119 +1,80 @@
 #!/bin/sh
-# GoshaCrash installer for ASUSWRT / Asuswrt-Merlin.
-# Installs Mihomo, Zashboard, controller and persistent JFFS hooks.
-# The user's private config.yaml is never overwritten.
+# GoshaCrash bootstrap installer for stock ASUSWRT.
+# Installs the controller to USB storage, then installs Mihomo, Zashboard,
+# DNS integration, TUN routing and Download Master autostart.
 
+INSTALLER_VERSION="0.5.0"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
-MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.28}"
-GOSHACRASH_VERSION="0.4.0-manual-tun"
-
-RAW_BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
-ZASHBOARD_URL="https://codeload.github.com/Zephyruso/zashboard/tar.gz/refs/heads/gh-pages-no-fonts"
+ACTION="${1:-install}"
 
 say() {
-    printf '%s\n' "[GoshaCrash] $*"
+    printf '%s\n' "[GoshaCrash installer] $*"
 }
 
 warn() {
-    printf '%s\n' "[GoshaCrash:WARN] $*" >&2
+    printf '%s\n' "[GoshaCrash installer:WARN] $*" >&2
 }
 
 fail() {
-    printf '%s\n' "[GoshaCrash:ERROR] $*" >&2
-    exit 1
-}
-
-find_program() {
-    program="$1"
-    old_ifs="$IFS"
-    IFS=:
-
-    for directory in $PATH; do
-        if [ -x "$directory/$program" ]; then
-            printf '%s\n' "$directory/$program"
-            IFS="$old_ifs"
-            return 0
-        fi
-    done
-
-    IFS="$old_ifs"
+    printf '%s\n' "[GoshaCrash installer:ERROR] $*" >&2
     return 1
 }
 
-# Prefer wget: the legacy Download Master curl on ASUS often has a broken CA path.
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
 fetch() {
     url="$1"
     output="$2"
-
     rm -f "$output"
 
-    # Always prefer firmware utilities. Old Download Master /opt binaries
-    # can shadow them and may have broken TLS options or CA paths.
-    for wget_bin in \
-        /usr/bin/wget \
-        /bin/wget \
-        /usr/sbin/wget \
-        /sbin/wget
-    do
-        [ -x "$wget_bin" ] || continue
-
-        if "$wget_bin" --help 2>&1 | grep -q -- '--no-check-certificate'; then
-            "$wget_bin" --no-check-certificate -O "$output" "$url" &&
-                return 0
-        else
-            "$wget_bin" -O "$output" "$url" &&
-                return 0
-        fi
-
-        rm -f "$output"
-    done
-
-    if [ -x /bin/busybox ]; then
-        if /bin/busybox wget --help 2>&1 | grep -q -- '--no-check-certificate'; then
-            /bin/busybox wget --no-check-certificate -O "$output" "$url" &&
-                return 0
-        else
-            /bin/busybox wget -O "$output" "$url" &&
-                return 0
-        fi
-
-        rm -f "$output"
+    if have curl; then
+        curl -fL --connect-timeout 20 --retry 2 \
+            -o "$output" "$url" >/dev/null 2>&1 &&
+            [ -s "$output" ] &&
+            return 0
     fi
 
-    # Last resort: optional userland tools.
-    for wget_bin in \
-        /opt/bin/wget \
-        "$USB_MOUNT/asusware.arm/bin/wget"
-    do
-        [ -x "$wget_bin" ] || continue
-
-        if "$wget_bin" --help 2>&1 | grep -q -- '--no-check-certificate'; then
-            "$wget_bin" --no-check-certificate -O "$output" "$url" &&
-                return 0
-        else
-            "$wget_bin" -O "$output" "$url" &&
-                return 0
-        fi
-
-        rm -f "$output"
-    done
-
-    for curl_bin in \
-        /usr/bin/curl \
-        /bin/curl \
-        /opt/bin/curl \
-        "$USB_MOUNT/asusware.arm/bin/curl"
-    do
-        [ -x "$curl_bin" ] || continue
-
-        "$curl_bin" -k -fL \
-            --connect-timeout 20 \
-            --max-time 180 \
-            -o "$output" "$url" &&
+    if have wget; then
+        wget -q --no-check-certificate -O "$output" "$url" &&
+            [ -s "$output" ] &&
             return 0
+    fi
 
-        rm -f "$output"
+    rm -f "$output"
+    return 1
+}
+
+fetch_controller() {
+    output="$1"
+
+    if [ -n "${CONTROLLER_FILE:-}" ]; then
+        [ -f "$CONTROLLER_FILE" ] || {
+            fail "CONTROLLER_FILE не найден: $CONTROLLER_FILE"
+            return 1
+        }
+
+        cp "$CONTROLLER_FILE" "$output" || return 1
+        return 0
+    fi
+
+    if [ -n "${GOSHACRASH_URL:-}" ]; then
+        say "Скачиваю контроллер из GOSHACRASH_URL"
+        fetch "$GOSHACRASH_URL" "$output"
+        return $?
+    fi
+
+    raw_url="https://raw.githubusercontent.com/$REPO/refs/heads/$BRANCH/goshacrash"
+    github_url="https://github.com/$REPO/raw/refs/heads/$BRANCH/goshacrash"
+
+    for url in "$raw_url" "$github_url"; do
+        say "Скачиваю $url"
+        if fetch "$url" "$output"; then
+            return 0
+        fi
+        warn "Не удалось скачать $url"
     done
 
     return 1
@@ -121,305 +82,229 @@ fetch() {
 
 find_usb_mount() {
     if [ -n "${INSTALL_ROOT:-}" ]; then
-        [ -d "$INSTALL_ROOT" ] || fail "INSTALL_ROOT не существует: $INSTALL_ROOT"
+        [ -d "$INSTALL_ROOT" ] || {
+            fail "INSTALL_ROOT не существует: $INSTALL_ROOT"
+            return 1
+        }
+
         printf '%s\n' "$INSTALL_ROOT"
         return 0
     fi
 
-    if [ -d /tmp/mnt/GOSHACRASH ] && [ -w /tmp/mnt/GOSHACRASH ]; then
+    if [ -d /tmp/mnt/GOSHACRASH/asusware.arm ]; then
         printf '%s\n' /tmp/mnt/GOSHACRASH
         return 0
     fi
 
-    for mountpoint in /tmp/mnt/*; do
-        [ -d "$mountpoint" ] || continue
-        [ -w "$mountpoint" ] || continue
-        printf '%s\n' "$mountpoint"
-        return 0
+    found=""
+    count=0
+
+    for candidate in /tmp/mnt/*; do
+        [ -d "$candidate" ] || continue
+        [ -d "$candidate/asusware.arm" ] || continue
+        [ -w "$candidate" ] || continue
+
+        found="$candidate"
+        count=$((count + 1))
     done
 
+    if [ "$count" -eq 1 ]; then
+        printf '%s\n' "$found"
+        return 0
+    fi
+
+    if [ "$count" -gt 1 ]; then
+        fail "Найдено несколько флешек Download Master. Укажи INSTALL_ROOT=/tmp/mnt/ИМЯ"
+        return 1
+    fi
+
+    fail "Не найдена флешка с Download Master (/tmp/mnt/*/asusware.arm)"
     return 1
 }
 
-arch_candidates() {
-    machine="$(uname -m 2>/dev/null)"
+write_wrapper() {
+    mount="$1"
+    base="$2"
+    wrapper_dir="$mount/asusware.arm/bin"
+    wrapper="$wrapper_dir/goshacrash"
 
-    case "$machine" in
-        armv7*|armv8l)
-            # Some older Broadcom ASUS kernels report armv7 but need armv5.
-            printf '%s\n' armv7 armv5
+    mkdir -p "$wrapper_dir" || return 1
+
+    cat > "$wrapper" <<WRAPPER_EOF
+#!/bin/sh
+BASE_FILE="/jffs/addons/goshacrash/base"
+BASE="$base"
+
+if [ -f "\$BASE_FILE" ]; then
+    saved_base="\$(cat "\$BASE_FILE" 2>/dev/null)"
+    [ -n "\$saved_base" ] && BASE="\$saved_base"
+fi
+
+exec "\$BASE/goshacrash" "\$@"
+WRAPPER_EOF
+
+    chmod 755 "$wrapper" || return 1
+
+    if [ -d /opt/bin ] && [ ! -e /opt/bin/goshacrash ]; then
+        ln -s "$wrapper" /opt/bin/goshacrash 2>/dev/null || true
+    fi
+
+    say "Команда управления установлена: $wrapper"
+}
+
+install_controller() {
+    mount="$1"
+    base="${INSTALL_DIR:-$mount/goshacrash}"
+    target="$base/goshacrash"
+    temporary="/tmp/goshacrash.controller.$$"
+    backup="$base/goshacrash.previous"
+
+    mkdir -p "$base" "$base/run" "$base/logs" "$base/state" || return 1
+
+    fetch_controller "$temporary" || {
+        rm -f "$temporary"
+        fail "Не удалось получить goshacrash"
+        return 1
+    }
+
+    first_line="$(sed -n '1p' "$temporary" 2>/dev/null)"
+    [ "$first_line" = '#!/bin/sh' ] || {
+        rm -f "$temporary"
+        fail "Вместо shell-скрипта загружен неверный файл"
+        return 1
+    }
+
+    sh -n "$temporary" || {
+        rm -f "$temporary"
+        fail "Контроллер содержит синтаксическую ошибку"
+        return 1
+    }
+
+    chmod 755 "$temporary" || return 1
+
+    if [ -f "$target" ]; then
+        cp "$target" "$backup" || return 1
+    fi
+
+    mv -f "$temporary" "$target" || return 1
+    chmod 755 "$target" || return 1
+
+    printf '%s\n' "$base" > /tmp/goshacrash-install-base
+    say "Контроллер установлен: $target"
+    "$target" version 2>/dev/null || true
+
+    write_wrapper "$mount" "$base" || return 1
+
+    case "$ACTION" in
+        install)
+            GOSHACRASH_BASE="$base" "$target" install
             ;;
-        armv6*)
-            printf '%s\n' armv6 armv5
+
+        controller-only)
+            say "Установлен только контроллер; компоненты не запускались"
             ;;
-        armv5*)
-            printf '%s\n' armv5
+
+        update)
+            GOSHACRASH_BASE="$base" "$target" update
             ;;
-        aarch64|arm64)
-            printf '%s\n' arm64
-            ;;
-        x86_64|amd64)
-            printf '%s\n' amd64
-            ;;
-        i386|i486|i586|i686)
-            printf '%s\n' 386
-            ;;
+
         *)
+            fail "Неизвестное действие: $ACTION"
             return 1
             ;;
     esac
 }
 
-cleanup_obsolete_files() {
+remove_installation() {
+    mount="$(find_usb_mount)" || return 1
+    base="${INSTALL_DIR:-$mount/goshacrash}"
+    controller="$base/goshacrash"
+
+    if [ -x "$controller" ]; then
+        GOSHACRASH_BASE="$base" "$controller" stop >/dev/null 2>&1 || true
+        GOSHACRASH_BASE="$base" "$controller" uninstall-hooks >/dev/null 2>&1 || true
+    fi
+
     rm -f \
-        "$BASE/dns-test.sh" \
-        "$BASE/restore-dns.sh" \
-        "$BASE/install-local.sh"
-}
+        "$mount/asusware.arm/bin/goshacrash" \
+        /opt/bin/goshacrash
 
-install_repository_files() {
-    say "Устанавливаю управляющий скрипт"
-
-    fetch "$RAW_BASE/goshacrash" "$BASE/goshacrash.new" ||
-        fail "Не удалось скачать goshacrash"
-
-    chmod 755 "$BASE/goshacrash.new" 2>/dev/null || true
-    mv -f "$BASE/goshacrash.new" "$BASE/goshacrash" ||
-        fail "Не удалось установить управляющий скрипт"
-
-    if [ -f "$SOURCE_CONFIG" ]; then
-        say "Личный config.yaml сохранён без изменений"
-    else
-        latest_backup="$(ls -1t "$USB_MOUNT"/config-backup-*.yaml 2>/dev/null | head -n 1)"
-
-        if [ "${RESTORE_CONFIG_BACKUP:-1}" = "1" ] &&
-           [ -n "$latest_backup" ] && [ -f "$latest_backup" ]; then
-            cp "$latest_backup" "$SOURCE_CONFIG" ||
-                fail "Не удалось восстановить config.yaml из резервной копии"
-            say "Восстановлен личный конфиг: $latest_backup"
-        else
-            say "Создаю безопасный стартовый config.yaml"
-
-            fetch "$RAW_BASE/templates/config.yaml" "$SOURCE_CONFIG.new" ||
-                fail "Не удалось скачать templates/config.yaml"
-
-            mv -f "$SOURCE_CONFIG.new" "$SOURCE_CONFIG" ||
-                fail "Не удалось установить стартовый config.yaml"
-        fi
-    fi
-}
-
-install_mihomo() {
-    if [ "${FORCE_MIHOMO_UPDATE:-0}" != "1" ] &&
-       [ -x "$BIN_DIR/mihomo" ] &&
-       "$BIN_DIR/mihomo" -v >/dev/null 2>&1
-    then
-        say "Использую уже установленный рабочий Mihomo"
-        return 0
+    if [ "${KEEP_CONFIG:-0}" = 1 ] && [ -f "$base/config.yaml" ]; then
+        saved="$mount/goshacrash-config.yaml"
+        cp "$base/config.yaml" "$saved" || return 1
+        say "config.yaml сохранён: $saved"
     fi
 
-    gzip_bin="$(find_program gzip 2>/dev/null)"
-    [ -n "$gzip_bin" ] || fail "Не найден gzip"
-
-    candidates="$(arch_candidates)" ||
-        fail "Неподдерживаемая архитектура: $(uname -m 2>/dev/null)"
-
-    for arch in $candidates; do
-        archive="$TMP_DIR/mihomo-${arch}.gz"
-        candidate="$TMP_DIR/mihomo-${arch}"
-        url="https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}/mihomo-linux-${arch}-v${MIHOMO_VERSION}.gz"
-
-        say "Пробую Mihomo v${MIHOMO_VERSION} для ${arch}"
-
-        rm -f "$archive" "$candidate"
-
-        if ! fetch "$url" "$archive"; then
-            warn "Не удалось скачать сборку ${arch}"
-            continue
-        fi
-
-        if ! "$gzip_bin" -dc "$archive" > "$candidate"; then
-            warn "Не удалось распаковать сборку ${arch}"
-            continue
-        fi
-
-        chmod 755 "$candidate" 2>/dev/null || true
-
-        if "$candidate" -v >/dev/null 2>&1; then
-            mv -f "$candidate" "$BIN_DIR/mihomo" ||
-                fail "Не удалось установить Mihomo"
-            chmod 755 "$BIN_DIR/mihomo" 2>/dev/null || true
-            say "Mihomo установлен: ${arch}"
-            return 0
-        fi
-
-        warn "Сборка ${arch} не запускается, пробую следующую"
-    done
-
-    fail "Не удалось подобрать рабочую сборку Mihomo"
+    rm -rf "$base"
+    say "GoshaCrash удалён: $base"
 }
 
-install_zashboard() {
-    tar_bin="$(find_program tar 2>/dev/null)"
-    [ -n "$tar_bin" ] || fail "Не найден tar"
-
-    archive="$TMP_DIR/zashboard.tar.gz"
-    unpacked="$TMP_DIR/zashboard"
-
-    rm -rf "$archive" "$unpacked" "$UI_DIR.new"
-    mkdir -p "$unpacked" "$UI_DIR.new" ||
-        fail "Не удалось создать временные каталоги"
-
-    say "Скачиваю Zashboard без встроенных шрифтов"
-
-    fetch "$ZASHBOARD_URL" "$archive" ||
-        fail "Не удалось скачать Zashboard"
-
-    "$tar_bin" -xzf "$archive" -C "$unpacked" ||
-        fail "Не удалось распаковать Zashboard"
-
-    source_dir=""
-
-    for directory in "$unpacked"/*; do
-        [ -d "$directory" ] || continue
-        source_dir="$directory"
-        break
-    done
-
-    [ -n "$source_dir" ] ||
-        fail "В архиве Zashboard не найден каталог интерфейса"
-
-    cp -R "$source_dir"/. "$UI_DIR.new"/ ||
-        fail "Не удалось скопировать Zashboard"
-
-    rm -rf "$UI_DIR"
-    mv "$UI_DIR.new" "$UI_DIR" ||
-        fail "Не удалось установить Zashboard"
-}
-
-install_optional_tools() {
-    package_manager=""
-
-    for candidate in \
-        /opt/bin/opkg \
-        /opt/bin/ipkg \
-        "$USB_MOUNT/asusware.arm/bin/opkg" \
-        "$USB_MOUNT/asusware.arm/bin/ipkg"
-    do
-        if [ -x "$candidate" ]; then
-            package_manager="$candidate"
-            break
-        fi
-    done
-
-    if [ -z "$package_manager" ]; then
-        warn "opkg/ipkg не найден: nano не установлен"
-        warn "Mihomo и Zashboard от этого не зависят"
-        return 0
-    fi
-
-    say "Пакетный менеджер: $package_manager"
-    "$package_manager" update ||
-        warn "Не удалось обновить список пакетов"
-
-    case "$package_manager" in
-        *opkg)
-            "$package_manager" install nano unzip ca-certificates ||
-                warn "Часть дополнительных пакетов не установилась"
+main() {
+    case "$ACTION" in
+        remove|uninstall)
+            remove_installation
+            return $?
             ;;
-        *ipkg)
-            "$package_manager" install nano unzip ||
-                warn "Часть дополнительных пакетов не установилась"
+
+        install|controller-only|update)
+            ;;
+
+        help|-h|--help)
+            cat <<'HELP_EOF'
+Использование:
+  sh install.sh install          полная установка
+  sh install.sh controller-only  установить только контроллер
+  sh install.sh update           обновить Mihomo и Zashboard
+  sh install.sh remove           удалить GoshaCrash
+
+Переменные:
+  INSTALL_ROOT=/tmp/mnt/GOSHACRASH
+  INSTALL_DIR=/tmp/mnt/GOSHACRASH/goshacrash
+  REPO=goshamarat/GoshaCrash
+  BRANCH=main
+  GOSHACRASH_URL=https://.../goshacrash
+  CONTROLLER_FILE=/путь/к/goshacrash
+  KEEP_CONFIG=1
+HELP_EOF
+            return 0
+            ;;
+
+        *)
+            fail "Неизвестное действие: $ACTION"
+            return 1
             ;;
     esac
-}
 
-install_command_wrappers() {
-    mkdir -p /jffs/scripts 2>/dev/null || true
+    [ "$(id -u 2>/dev/null)" = 0 ] ||
+        warn "Скрипт желательно запускать от admin/root"
 
-    cat > /jffs/scripts/goshacrash <<EOF
-#!/bin/sh
-exec "$BASE/goshacrash" "\$@"
-EOF
-    chmod 755 /jffs/scripts/goshacrash 2>/dev/null || true
+    mount="$(find_usb_mount)" || return 1
 
-    if [ -d /opt/bin ] && [ -w /opt/bin ]; then
-        cat > /opt/bin/goshacrash <<EOF
-#!/bin/sh
-exec "$BASE/goshacrash" "\$@"
-EOF
-        chmod 755 /opt/bin/goshacrash 2>/dev/null || true
+    [ -d "$mount/asusware.arm" ] || {
+        fail "Download Master не найден: $mount/asusware.arm"
+        return 1
+    }
+
+    say "Версия инсталлятора: $INSTALLER_VERSION"
+    say "Флешка: $mount"
+    say "Действие: $ACTION"
+
+    install_controller "$mount" || {
+        fail "Установка не завершена"
+        return 1
+    }
+
+    base="${INSTALL_DIR:-$mount/goshacrash}"
+    controller="$base/goshacrash"
+
+    if [ "$ACTION" != controller-only ]; then
+        echo
+        GOSHACRASH_BASE="$base" "$controller" status || true
+        echo
+        say "Диагностика: goshacrash doctor"
+        say "Конфиг: $base/config.yaml"
+        say "Панель: http://$(nvram get lan_ipaddr 2>/dev/null):9090/ui/"
     fi
 }
 
-USB_MOUNT="$(find_usb_mount)" ||
-    fail "Не найдена доступная USB-флешка в /tmp/mnt"
-
-BASE="$USB_MOUNT/goshacrash"
-BIN_DIR="$BASE/bin"
-UI_DIR="$BASE/ui"
-RUN_DIR="$BASE/run"
-LOG_DIR="$BASE/logs"
-RULESET_DIR="$BASE/rulesets"
-BACKUP_DIR="$BASE/backups"
-STATE_DIR="$BASE/state"
-SOURCE_CONFIG="$BASE/config.yaml"
-TMP_DIR="$BASE/.install-tmp"
-
-PATH="/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin:/opt/sbin:$USB_MOUNT/asusware.arm/bin:$USB_MOUNT/asusware.arm/sbin"
-export PATH
-
-say "GoshaCrash ${GOSHACRASH_VERSION}"
-say "Флешка: $USB_MOUNT"
-say "Каталог установки: $BASE"
-
-mkdir -p \
-    "$BIN_DIR" \
-    "$RUN_DIR" \
-    "$LOG_DIR" \
-    "$RULESET_DIR" \
-    "$BACKUP_DIR" \
-    "$STATE_DIR" \
-    "$TMP_DIR" ||
-    fail "Не удалось создать каталоги установки"
-
-install_repository_files
-cleanup_obsolete_files
-install_mihomo
-install_zashboard
-
-if [ "${INSTALL_OPTIONAL_TOOLS:-0}" = "1" ]; then
-    install_optional_tools
-else
-    say "Пропускаю необязательные пакеты Optware/Entware"
-fi
-
-install_command_wrappers
-
-rm -rf "$TMP_DIR"
-
-say "Устанавливаю JFFS-хуки"
-GOSHACRASH_BASE="$BASE" "$BASE/goshacrash" install-hooks ||
-    fail "Не удалось установить хуки"
-
-say "Создаю новый runtime.yaml и применяю конфигурацию"
-GOSHACRASH_BASE="$BASE" "$BASE/goshacrash" apply ||
-    fail "config.yaml не удалось применить"
-
-LAN_IP="$(nvram get lan_ipaddr 2>/dev/null)"
-[ -n "$LAN_IP" ] || LAN_IP="IP_РОУТЕРА"
-
-printf '\n%s\n' "============================================================"
-printf '%s\n' " GoshaCrash установлен"
-printf '%s\n' " Каталог: $BASE"
-printf '%s\n' " Личный конфиг: $SOURCE_CONFIG"
-printf '%s\n' " Zashboard: http://$LAN_IP:9090/ui/"
-printf '%s\n' ""
-printf '%s\n' " После вставки своего config.yaml:"
-printf '%s\n' "   goshacrash apply"
-printf '%s\n' ""
-printf '%s\n' " Проверка:"
-printf '%s\n' "   goshacrash doctor"
-printf '%s\n' ""
-printf '%s\n' " Режим: dnsmasq:53 -> Mihomo:1053; ручной TUN через table 2022"
-printf '%s\n' "============================================================"
+main "$@"
