@@ -46,7 +46,7 @@ export PATH
 say(){ printf '%s\n' "[GoshaCrash] $*"; }
 warn(){ printf '%s\n' "[GoshaCrash:WARN] $*" >&2; }
 fail(){ printf '%s\n' "[GoshaCrash:ERROR] $*" >&2; return 1; }
-have(){ command -v "$1" >/dev/null 2>&1; }
+have(){ which "$1" >/dev/null 2>&1; }
 
 ensure_dirs(){ mkdir -p "$BASE/bin" "$UI" "$BASE/run" "$BASE/logs" "$BACKUPS" "$STATE"; }
 
@@ -90,9 +90,9 @@ fetch(){
     if [ -x /usr/sbin/wget ]; then
         downloader=/usr/sbin/wget; kind=wget
     elif have wget; then
-        downloader="$(command -v wget)"; kind=wget
+        downloader="$(which wget)"; kind=wget
     elif have curl; then
-        downloader="$(command -v curl)"; kind=curl
+        downloader="$(which curl)"; kind=curl
     else
         fail "Не найден wget или curl"
         return 1
@@ -567,13 +567,13 @@ find_ipkg(){
     for p in /opt/bin/ipkg "$USB_MOUNT/asusware.arm/bin/ipkg" "$USB_MOUNT/asusware.arm/sbin/ipkg"; do
         [ -x "$p" ] && { echo "$p"; return 0; }
     done
-    have ipkg && { command -v ipkg; return 0; }
+    have ipkg && { which ipkg; return 0; }
     return 1
 }
 
 install_editor(){
     if have nano; then
-        say "Текстовый редактор уже установлен: $(command -v nano)"
+        say "Текстовый редактор уже установлен: $(which nano)"
         return 0
     fi
 
