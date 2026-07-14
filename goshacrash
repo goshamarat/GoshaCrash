@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-13-shellcrash-dns-hijack-073
-# GoshaCrash 0.7.3 — ShellCrash-style DNS hijack for stock ASUSWRT.
+# BUILD: 2026-07-14-two-file-dnsmasq-hybrid-090rc1
+# GoshaCrash 0.9.0-rc1 — single-file controller for Mihomo, Zashboard and stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-VERSION="0.7.3-stock-asuswrt"
-BUILD_ID="2026-07-13-shellcrash-dns-hijack-073"
+VERSION="0.9.0-rc1"
+BUILD_ID="2026-07-14-two-file-dnsmasq-hybrid-090rc1"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
@@ -25,7 +25,15 @@ JFFS_BASE="/jffs/addons/goshacrash"
 JFFS_BASE_FILE="$JFFS_BASE/base"
 RESOLV="${STOCK_RESOLV_DNSMASQ:-/tmp/resolv.dnsmasq}"
 DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
-DNS_BOOTSTRAP="${DNS_BOOTSTRAP:-9.9.9.9}"
+DNS_BOOTSTRAP="${DNS_BOOTSTRAP:-}"
+if [ -z "$DNS_BOOTSTRAP" ] && [ -f "$RESOLV" ]; then
+    DNS_BOOTSTRAP="$(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2; exit}' "$RESOLV" 2>/dev/null)"
+fi
+case "$DNS_BOOTSTRAP" in
+    ''|127.*|0.0.0.0) DNS_BOOTSTRAP=1.1.1.1 ;;
+esac
+REDIR_PORT_DEFAULT="${GOSHACRASH_REDIR_PORT_DEFAULT:-7893}"
+OUTBOUND_MARK="${GOSHACRASH_OUTBOUND_MARK:-9012}"
 
 TUN_DEVICE="${GOSHACRASH_TUN_DEVICE:-mihomo0}"
 TUN_MTU="${GOSHACRASH_TUN_MTU:-1500}"
@@ -34,7 +42,12 @@ TUN_MARK="${GOSHACRASH_TUN_MARK:-0x2333}"
 TUN_PREF="${GOSHACRASH_TUN_PREF:-10010}"
 MANGLE_CHAIN="GOSHACRASH_TUN"
 FILTER_CHAIN="GOSHACRASH_FORWARD"
-DNS_CHAIN="GOSHACRASH_DNS_HIJACK"
+DNS_CHAIN="GOSHACRASH_DNS_HIJACK" # legacy cleanup only
+REDIR_CHAIN="GOSHACRASH_TCP_REDIR"
+ROUTER_TCP_CHAIN="GOSHACRASH_ROUTER_TCP"
+ROUTER_DNS_CHAIN="GOSHACRASH_DNSMASQ_UPSTREAM"
+ROUTER_PROXY_STATE="$STATE/router-proxy.enabled"
+OUTBOUND_MARK_HEX="${GOSHACRASH_OUTBOUND_MARK_HEX:-0x2334}"
 
 PATH="/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$USB_MOUNT/asusware.arm/bin:$USB_MOUNT/asusware.arm/sbin:$USB_MOUNT/asusware.arm/opt/bin:$USB_MOUNT/asusware.arm/opt/sbin:$USB_MOUNT/asusware.arm/usr/bin"
 export PATH
@@ -68,6 +81,35 @@ yaml_section(){
         $0 ~ "^" s ":[[:space:]]*($|#)" {inside=1; next}
         inside && /^[^[:space:]#]/ {exit}
         inside && $0 ~ "^[[:space:]]+" k ":[[:space:]]*" {x=$0; sub("^[[:space:]]+" k ":[[:space:]]*","",x); print x; exit}
+    ' "$f" 2>/dev/null)"
+    strip_value "$v"
+}
+
+yaml_dns_first(){
+    f="$1"; k="$2"
+    v="$(awk -v k="$k" '
+        /^dns:[[:space:]]*($|#)/ {dns=1; next}
+        dns && /^[^[:space:]#]/ {exit}
+        dns && $0 ~ "^[[:space:]]+" k ":[[:space:]]*" {
+            x=$0
+            sub("^[[:space:]]+" k ":[[:space:]]*", "", x)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", x)
+            if (x != "" && x != "[]") {
+                gsub(/^\[/, "", x); gsub(/\]$/, "", x)
+                split(x, a, ",")
+                print a[1]
+                exit
+            }
+            list=1
+            next
+        }
+        list && /^[[:space:]][[:space:]][[:space:]][[:space:]]*-[[:space:]]*/ {
+            x=$0
+            sub(/^[[:space:]]*-[[:space:]]*/, "", x)
+            print x
+            exit
+        }
+        list && /^[[:space:]][[:space:]][^[:space:]#][^:]*:/ {exit}
     ' "$f" 2>/dev/null)"
     strip_value "$v"
 }
@@ -114,6 +156,18 @@ fetch(){
     return 1
 }
 
+fetch_any(){
+    out="$1"
+    shift
+    for url in "$@"; do
+        [ -n "$url" ] || continue
+        say "Пробую скачать: $url"
+        if fetch "$url" "$out"; then
+            return 0
+        fi
+    done
+    return 1
+}
 
 is_asus(){
     have nvram && [ -n "$(nvram get productid 2>/dev/null)" ] && return 0
@@ -134,15 +188,34 @@ core_arch(){
 }
 
 install_core_from_shellcrash(){
-    a="$1"; pkg="$BASE/run/mihomo-shellcrash.tar.gz"; ex="$BASE/run/mihomo.extract"; new="$BASE/run/mihomo.new"
+    a="$1"
+    pkg="$BASE/run/mihomo-shellcrash.tar.gz"
+    ex="$BASE/run/mihomo.extract"
+    new="$BASE/run/mihomo.new"
     asset="clash-linux-$a.tar.gz"
-    url="${MIHOMO_URL:-https://github.com/$SHELLCRASH_REPO/raw/$SHELLCRASH_BRANCH/bin/meta/$asset}"
 
-    say "Скачиваю Mihomo: $url"
-    fetch "$url" "$pkg" || return 1
-    tar -tzf "$pkg" >/dev/null 2>&1 || { warn "Получен повреждённый архив Mihomo"; rm -f "$pkg"; return 1; }
-    rm -rf "$ex"; mkdir -p "$ex" || return 1
-    tar -xzf "$pkg" -C "$ex" >/dev/null 2>&1 || { rm -rf "$ex" "$pkg"; return 1; }
+    if [ -n "${MIHOMO_URL:-}" ]; then
+        fetch_any "$pkg" "$MIHOMO_URL" || return 1
+    else
+        fetch_any "$pkg" \
+            "https://testingcf.jsdelivr.net/gh/$SHELLCRASH_REPO@$SHELLCRASH_BRANCH/bin/meta/$asset" \
+            "https://cdn.jsdelivr.net/gh/$SHELLCRASH_REPO@$SHELLCRASH_BRANCH/bin/meta/$asset" \
+            "https://raw.githubusercontent.com/$SHELLCRASH_REPO/$SHELLCRASH_BRANCH/bin/meta/$asset" \
+            "https://github.com/$SHELLCRASH_REPO/raw/$SHELLCRASH_BRANCH/bin/meta/$asset" || return 1
+    fi
+
+    tar -tzf "$pkg" >/dev/null 2>&1 || {
+        warn "Получен повреждённый архив Mihomo"
+        rm -f "$pkg"
+        return 1
+    }
+
+    rm -rf "$ex"
+    mkdir -p "$ex" || return 1
+    tar -xzf "$pkg" -C "$ex" >/dev/null 2>&1 || {
+        rm -rf "$ex" "$pkg"
+        return 1
+    }
 
     candidate=""
     for f in "$ex/CrashCore" "$ex/clash" "$ex/mihomo" "$ex"/*; do
@@ -150,11 +223,21 @@ install_core_from_shellcrash(){
         candidate="$f"
         break
     done
-    [ -n "$candidate" ] && [ -f "$candidate" ] || { rm -rf "$ex" "$pkg"; fail "В архиве Mihomo не найден бинарник"; return 1; }
+
+    [ -n "$candidate" ] && [ -f "$candidate" ] || {
+        rm -rf "$ex" "$pkg"
+        fail "В архиве Mihomo не найден бинарник"
+        return 1
+    }
 
     cp "$candidate" "$new" || return 1
     chmod 755 "$new" || return 1
-    "$new" -v >/dev/null 2>&1 || { warn "Скачанное ядро Mihomo не запускается"; rm -rf "$ex" "$pkg" "$new"; return 1; }
+    "$new" -v >/dev/null 2>&1 || {
+        warn "Скачанное ядро Mihomo не запускается"
+        rm -rf "$ex" "$pkg" "$new"
+        return 1
+    }
+
     rm -rf "$ex" "$pkg"
     return 0
 }
@@ -192,22 +275,42 @@ find_ui_root(){
 
 install_ui(){
     ensure_dirs || return 1
-    tgz="$BASE/run/zashboard.tar.gz"; ex="$BASE/run/zashboard.extract"; newui="$BASE/run/ui.new"
-    rm -rf "$ex" "$newui"; mkdir -p "$ex" "$newui" || return 1
+    tgz="$BASE/run/zashboard.tar.gz"
+    ex="$BASE/run/zashboard.extract"
+    newui="$BASE/run/ui.new"
+    rm -rf "$ex" "$newui"
+    mkdir -p "$ex" "$newui" || return 1
 
-    url="${ZASHBOARD_URL:-https://github.com/$SHELLCRASH_REPO/raw/$SHELLCRASH_BRANCH/bin/dashboard/zashboard.tar.gz}"
-    say "Скачиваю Zashboard: $url"
-    fetch "$url" "$tgz" || return 1
+    if [ -n "${ZASHBOARD_URL:-}" ]; then
+        fetch_any "$tgz" "$ZASHBOARD_URL" || return 1
+    else
+        fetch_any "$tgz" \
+            "https://testingcf.jsdelivr.net/gh/$SHELLCRASH_REPO@$SHELLCRASH_BRANCH/bin/dashboard/zashboard.tar.gz" \
+            "https://cdn.jsdelivr.net/gh/$SHELLCRASH_REPO@$SHELLCRASH_BRANCH/bin/dashboard/zashboard.tar.gz" \
+            "https://raw.githubusercontent.com/$SHELLCRASH_REPO/$SHELLCRASH_BRANCH/bin/dashboard/zashboard.tar.gz" \
+            "https://github.com/$SHELLCRASH_REPO/raw/$SHELLCRASH_BRANCH/bin/dashboard/zashboard.tar.gz" || return 1
+    fi
 
-    tar -tzf "$tgz" >/dev/null 2>&1 || { fail "Получен повреждённый архив Zashboard"; rm -f "$tgz"; return 1; }
+    tar -tzf "$tgz" >/dev/null 2>&1 || {
+        fail "Получен повреждённый архив Zashboard"
+        rm -f "$tgz"
+        return 1
+    }
     tar -xzf "$tgz" -C "$ex" >/dev/null 2>&1 || return 1
-    root="$(find_ui_root "$ex")" || { fail "В архиве Zashboard нет index.html"; rm -rf "$ex" "$tgz"; return 1; }
-    cp -R "$root"/. "$newui"/ || return 1
+    ui_root="$(find_ui_root "$ex")" || {
+        fail "В архиве Zashboard нет index.html"
+        rm -rf "$ex" "$tgz"
+        return 1
+    }
+    cp -R "$ui_root"/. "$newui"/ || return 1
     [ -f "$newui/index.html" ] || return 1
 
     rm -rf "$UI.previous"
     [ -d "$UI" ] && mv "$UI" "$UI.previous" 2>/dev/null || true
-    mv "$newui" "$UI" || { [ -d "$UI.previous" ] && mv "$UI.previous" "$UI"; return 1; }
+    mv "$newui" "$UI" || {
+        [ -d "$UI.previous" ] && mv "$UI.previous" "$UI"
+        return 1
+    }
     rm -rf "$ex" "$tgz"
     say "Zashboard установлен по сети"
 }
@@ -216,42 +319,61 @@ write_default_config(){
     [ -f "$CONFIG" ] && return 0
     ensure_dirs || return 1
     cat > "$CONFIG" <<'CFG'
+# Пользовательский конфиг. GoshaCrash сохраняет его и создаёт отдельный runtime.yaml.
 mixed-port: 7892
 allow-lan: true
 bind-address: "*"
 mode: rule
 log-level: info
 ipv6: false
+find-process-mode: off
+
 external-controller: 0.0.0.0:9090
 secret: "CHANGE_ME"
 external-ui: ui
+
 profile:
   store-selected: true
   store-fake-ip: true
+
 geo-auto-update: false
+
+hosts:
+  "www.asusrouter.com": 192.168.1.1
+  "router.asus.com": 192.168.1.1
+
 dns:
   enable: true
   listen: :1053
   ipv6: false
+  use-hosts: true
+  use-system-hosts: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
-  default-nameserver: [9.9.9.9, 1.1.1.1]
-  nameserver: [tls://1.1.1.1, tls://9.9.9.9]
-  proxy-server-nameserver: [9.9.9.9, 1.1.1.1]
-  direct-nameserver: [9.9.9.9, 1.1.1.1]
+  default-nameserver:
+    - 9.9.9.9
+    - 1.1.1.1
+  nameserver:
+    - 1.1.1.1
+    - 9.9.9.9
+  proxy-server-nameserver:
+    - 9.9.9.9
+    - 1.1.1.1
+  direct-nameserver:
+    - 9.9.9.9
+    - 1.1.1.1
+
 tun:
   enable: true
-  stack: system
-  device: mihomo0
-  auto-route: false
-  auto-redirect: false
-  auto-detect-interface: false
-  strict-route: false
+
 proxies: []
+
 proxy-groups:
   - name: GLOBAL-PROXY
     type: select
-    proxies: [DIRECT]
+    proxies:
+      - DIRECT
+
 rules:
   - MATCH,DIRECT
 CFG
@@ -316,52 +438,207 @@ detect_dns_mode(){
 }
 
 render_runtime(){
-    out="$1"; [ -f "$CONFIG" ] || return 1
-    cp "$CONFIG" "$out" || return 1; sed -i 's/\r$//' "$out" || return 1
-    sed -i -e 's/^[[:space:]]*external-controller:[[:space:]]*127\.0\.0\.1:/external-controller: 0.0.0.0:/' \
-        -e 's/^[[:space:]]*external-controller:[[:space:]]*localhost:/external-controller: 0.0.0.0:/' "$out"
-    grep -q '^[[:space:]]*external-controller:' "$out" || printf '\nexternal-controller: 0.0.0.0:9090\n' >> "$out"
-    grep -q '^[[:space:]]*external-ui:' "$out" || printf 'external-ui: ui\n' >> "$out"
+    out="$1"
+    [ -f "$CONFIG" ] || return 1
+
+    cp "$CONFIG" "$out" || return 1
+    sed -i 's/\r$//' "$out" || return 1
+
+    redir_port="$(yaml_top "$CONFIG" redir-port)"
+    case "$redir_port" in
+        ''|*[!0-9]*) redir_port="$REDIR_PORT_DEFAULT";;
+    esac
+    [ "$redir_port" -ge 1 ] 2>/dev/null && [ "$redir_port" -le 65535 ] 2>/dev/null || redir_port="$REDIR_PORT_DEFAULT"
+
+    dns_runtime_bootstrap="$(yaml_dns_first "$CONFIG" default-nameserver)"
+    case "$dns_runtime_bootstrap" in
+        ''|system|system://) dns_runtime_bootstrap="$DNS_BOOTSTRAP";;
+    esac
+
+    controller="$(yaml_top "$CONFIG" external-controller)"
+    controller_port="${controller##*:}"
+    controller_port="$(printf '%s\n' "$controller_port" | sed 's/[^0-9].*$//')"
+    [ -n "$controller_port" ] || controller_port=9090
+
+    # Router-specific fields are generated only in runtime.yaml. config.yaml stays personal.
+    awk -v rp="$redir_port" -v mark="$OUTBOUND_MARK" -v cp="$controller_port" '
+        BEGIN {
+            print "redir-port: " rp
+            print "routing-mark: " mark
+            print "external-controller: 0.0.0.0:" cp
+            print "external-ui: ui"
+            print "find-process-mode: off"
+            print "ipv6: false"
+        }
+        /^[^[:space:]#][^:]*:[[:space:]]*/ {
+            line=$0
+            key=line
+            sub(/:.*/, "", key)
+            if (key == "redir-port" ||
+                key == "routing-mark" ||
+                key == "external-controller" ||
+                key == "external-ui" ||
+                key == "external-ui-url" ||
+                key == "find-process-mode" ||
+                key == "ipv6")
+                next
+        }
+        { print }
+    ' "$out" > "$out.top" || return 1
+    mv -f "$out.top" "$out" || return 1
+
     sed -i '/^[[:space:]]*global-client-fingerprint:/d' "$out"
-    if grep -q '^[[:space:]]*geo-auto-update:' "$out"; then sed -i 's/^[[:space:]]*geo-auto-update:.*/geo-auto-update: false/' "$out"
-    else printf '\ngeo-auto-update: false\n' >> "$out"; fi
+    if grep -q '^[[:space:]]*geo-auto-update:' "$out"; then
+        sed -i 's/^[[:space:]]*geo-auto-update:.*/geo-auto-update: false/' "$out"
+    else
+        printf '
+geo-auto-update: false
+' >> "$out"
+    fi
+
     if ! grep -Eq '^dns:[[:space:]]*($|#)' "$out"; then
         cat >> "$out" <<DNS_RUNTIME
 
 dns:
   enable: true
-  listen: :$DNS_PORT
+  listen: 127.0.0.1:$DNS_PORT
   ipv6: false
+  use-system-hosts: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   default-nameserver: [$DNS_BOOTSTRAP, 1.1.1.1]
-  nameserver: [tls://1.1.1.1, tls://9.9.9.9]
+  nameserver: [1.1.1.1, 9.9.9.9]
   proxy-server-nameserver: [$DNS_BOOTSTRAP, 1.1.1.1]
   direct-nameserver: [$DNS_BOOTSTRAP, 1.1.1.1]
 DNS_RUNTIME
     fi
+
+    # Force the DNS listener and disable IPv6 inside the dns section.
     awk -v p="$DNS_PORT" '
-      /^dns:[[:space:]]*($|#)/ {d=1; seen=0; print; next}
-      d && /^[^[:space:]#]/ {if(!seen) print "  listen: :" p; d=0}
-      d && /^[[:space:]]+listen:[[:space:]]*/ {print "  listen: :" p; seen=1; next}
+      function finish_dns(){
+        if (!seen_listen) print "  listen: 127.0.0.1:" p
+        if (!seen_ipv6) print "  ipv6: false"
+      }
+      /^dns:[[:space:]]*($|#)/ {
+        d=1
+        seen_listen=0
+        seen_ipv6=0
+        print
+        next
+      }
+      d && /^[^[:space:]#]/ {
+        finish_dns()
+        d=0
+      }
+      d && /^[[:space:]]+listen:[[:space:]]*/ {
+        print "  listen: 127.0.0.1:" p
+        seen_listen=1
+        next
+      }
+      d && /^[[:space:]]+ipv6:[[:space:]]*/ {
+        print "  ipv6: false"
+        seen_ipv6=1
+        next
+      }
       {print}
-      END {if(d&&!seen) print "  listen: :" p}
-    ' "$out" > "$out.dns" || return 1; mv -f "$out.dns" "$out" || return 1
-    awk -v b="$DNS_BOOTSTRAP" '
+      END {
+        if (d) finish_dns()
+      }
+    ' "$out" > "$out.dns" || return 1
+    mv -f "$out.dns" "$out" || return 1
+
+    # Old stock ASUSWRT cannot safely use "system" recursively as an upstream.
+    # Prefer the user's first default-nameserver; fall back to the current router DNS.
+    awk -v b="$dns_runtime_bootstrap" '
       /^dns:[[:space:]]*($|#)/ {d=1; print; next}
       d && /^[^[:space:]#]/ {d=0}
-      d && /^[[:space:]]*-[[:space:]]*system[[:space:]]*$/ {sub(/system[[:space:]]*$/,b); print; next}
-      d && /:[[:space:]]*system[[:space:]]*$/ {sub(/system[[:space:]]*$/,b); print; next}
+      d && /^[[:space:]]*-[[:space:]]*system([:][\/][\/])?[[:space:]]*$/ {
+          sub(/system([:][\/][\/])?[[:space:]]*$/, b)
+          print
+          next
+      }
+      d && /:[[:space:]]*system([:][\/][\/])?[[:space:]]*$/ {
+          sub(/system([:][\/][\/])?[[:space:]]*$/, b)
+          print
+          next
+      }
       {print}
-    ' "$out" > "$out.bootstrap" || return 1; mv -f "$out.bootstrap" "$out" || return 1
-    te="$(yaml_section "$CONFIG" tun enable)"; ten=false; is_true "$te" && ten=true
+    ' "$out" > "$out.bootstrap" || return 1
+    mv -f "$out.bootstrap" "$out" || return 1
+
+    # A client config may leave proxy-server-nameserver empty. On a router this is
+    # unsafe because proxy node hostnames then depend on an unspecified resolver.
+    awk -v p="$dns_runtime_bootstrap" -v b="$DNS_BOOTSTRAP" '
+      function emit_fallback(){
+          print "  proxy-server-nameserver:"
+          print "    - " p
+          if (b != p) print "    - " b
+          if (p != "1.1.1.1" && b != "1.1.1.1") print "    - 1.1.1.1"
+          done=1
+          pending=0
+      }
+      /^dns:[[:space:]]*($|#)/ {d=1; print; next}
+      d && pending {
+          if ($0 ~ /^[[:space:]][[:space:]][[:space:]][[:space:]]*-[[:space:]]*/) {
+              print "  proxy-server-nameserver:"
+              print
+              pending=0
+              done=1
+              next
+          }
+          emit_fallback()
+      }
+      d && /^[^[:space:]#]/ {
+          if (!done) emit_fallback()
+          d=0
+      }
+      d && /^[[:space:]]+proxy-server-nameserver:[[:space:]]*/ {
+          x=$0
+          sub(/^[[:space:]]+proxy-server-nameserver:[[:space:]]*/, "", x)
+          gsub(/[[:space:]]/, "", x)
+          if (x == "" ) { pending=1; next }
+          if (x == "[]") { emit_fallback(); next }
+          done=1
+          print
+          next
+      }
+      {print}
+      END {
+          if (d && pending) emit_fallback()
+          else if (d && !done) emit_fallback()
+      }
+    ' "$out" > "$out.proxy-dns" || return 1
+    mv -f "$out.proxy-dns" "$out" || return 1
+
+    # Hybrid mode on this router always needs TUN for UDP/non-TCP traffic.
+    # The personal config remains untouched; only runtime.yaml is forced on.
+    ten=true
+
+    # The user's rule groups/providers remain untouched; only incompatible TUN fields are replaced.
     awk -v en="$ten" -v dev="$TUN_DEVICE" -v mtu="$TUN_MTU" '
-      function emit(){print "tun:"; print "  enable: " en; print "  stack: system"; print "  device: " dev; print "  mtu: " mtu; print "  auto-route: false"; print "  auto-redirect: false"; print "  auto-detect-interface: false"; print "  strict-route: false"}
-      /^tun:[[:space:]]*($|#)/ {if(!done){emit();done=1}; skip=1; next}
+      function emit(){
+        print "tun:"
+        print "  enable: " en
+        print "  stack: system"
+        print "  device: " dev
+        print "  mtu: " mtu
+        print "  auto-route: false"
+        print "  auto-redirect: false"
+        print "  auto-detect-interface: false"
+        print "  strict-route: false"
+      }
+      /^tun:[[:space:]]*($|#)/ {
+        if (!done) { emit(); done=1 }
+        skip=1
+        next
+      }
       skip && /^[^[:space:]#]/ {skip=0}
       !skip {print}
-      END {if(!done){print "";emit()}}
-    ' "$out" > "$out.tun" || return 1; mv -f "$out.tun" "$out"
+      END {
+        if (!done) { print ""; emit() }
+      }
+    ' "$out" > "$out.tun" || return 1
+    mv -f "$out.tun" "$out" || return 1
 }
 
 running_pid(){
@@ -504,7 +781,7 @@ dns_status(){
 start_mihomo(){
     if p="$(running_pid)"; then
         tun_enabled && setup_routing || true
-        echo "Mihomo уже запущен, PID=$p"
+        echo "Mihomo уже запущен, PID=$(cat "$PIDFILE" 2>/dev/null)"
         return 0
     fi
 
@@ -546,7 +823,7 @@ start_mihomo(){
         setup_routing || { kill_mihomo; return 1; }
     fi
 
-    echo "Mihomo запущен, PID=$p"
+    echo "Mihomo запущен, PID=$(cat "$PIDFILE" 2>/dev/null)"
 }
 
 stop_mihomo(){
@@ -644,7 +921,7 @@ doctor(){
     echo "=== GoshaCrash doctor ==="; echo "BASE=$BASE"; echo "USB=$USB_MOUNT"; echo "ARCH=$(uname -m)"; echo "LAN=$(lan_ifaces)"; echo "IP=$(lan_ip)"; echo
     [ -x "$BIN" ] && "$BIN" -v || echo "Mihomo: NOT FOUND"; [ -c /dev/net/tun ] && echo "/dev/net/tun: OK" || echo "/dev/net/tun: NOT FOUND"; echo
     status; echo; echo "=== stock dnsmasq upstreams (unchanged) ==="; cat "$RESOLV" 2>/dev/null || true; echo
-    echo "=== ports ==="; netstat -lnp 2>/dev/null | grep -E '(:53[[:space:]]|:1053[[:space:]]|:9090[[:space:]]|:7892[[:space:]])' || true; echo
+    echo "=== ports ==="; netstat -lnp 2>/dev/null | grep -E '(:53[[:space:]]|:1053[[:space:]]|:9090[[:space:]]|:7892[[:space:]]|:7893[[:space:]])' || true; echo
     echo "=== routes ==="; ip rule show 2>/dev/null | grep -E "($TUN_PREF|$TUN_TABLE|$TUN_MARK)" || true; ip route show table "$TUN_TABLE" 2>/dev/null || true; echo
     echo "=== iptables ==="; iptables -t mangle -L "$MANGLE_CHAIN" -n -v 2>/dev/null || true; iptables -t nat -L "$DNS_CHAIN" -n -v 2>/dev/null || true; echo
     echo "=== log ==="; tail -n 60 "$LOGFILE" 2>/dev/null || true
@@ -768,7 +1045,7 @@ restore_config(){
 
 install_all(){
     ensure_dirs || return 1
-    install_editor || return 1
+    install_editor || warn "nano не установлен; основной сервис продолжит установку"
     write_default_config || return 1
     install_core || { fail "Установка Mihomo не завершена"; return 1; }
     install_ui || { fail "Установка Zashboard не завершена"; return 1; }
@@ -776,23 +1053,394 @@ install_all(){
     apply_config
 }
 update_all(){
-    install_editor || return 1
+    install_editor || warn "nano не обновлён; Mihomo и Zashboard будут обновлены"
     stop_mihomo >/dev/null 2>&1 || true
     install_core || return 1
     install_ui || return 1
     apply_config
 }
 
-pause_menu(){
-    printf '\nНажми Enter для продолжения...'
-    read _dummy
+# -----------------------------------------------------------------------------
+# Router-specific final network layer.
+# LAN DNS stays on dnsmasq:53. dnsmasq's upstream queries are redirected in
+# nat OUTPUT to Mihomo DNS on 127.0.0.1:1053. This preserves DHCP/local names.
+# LAN TCP uses REDIRECT; LAN UDP/other non-TCP traffic uses manual TUN routing.
+# -----------------------------------------------------------------------------
+
+write_default_config(){
+    [ -f "$CONFIG" ] && return 0
+    ensure_dirs || return 1
+    router_ip="$(lan_ip)"
+    cat > "$CONFIG" <<CFG
+# Личный config.yaml. Обновление GoshaCrash этот файл не заменяет.
+# На роутере dnsmasq слушает :53, а GoshaCrash меняет DNS listener только
+# в runtime.yaml на 127.0.0.1:1053.
+
+mixed-port: 7892
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: info
+ipv6: false
+find-process-mode: off
+
+external-controller: 0.0.0.0:9090
+secret: "CHANGE_ME"
+external-ui: ui
+
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+hosts:
+  "www.asusrouter.com": $router_ip
+  "router.asus.com": $router_ip
+
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  ipv6: false
+  prefer-h3: false
+  use-hosts: true
+  use-system-hosts: false
+  respect-rules: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "+.lan"
+    - "+.local"
+    - "+.arpa"
+    - "localhost"
+
+  # Это только bootstrap. В жёстко фильтруемой сети надёжнее иметь хотя бы
+  # один прокси-узел с server, заданным IP-адресом, а не доменом.
+  default-nameserver:
+    - 1.1.1.1
+    - 9.9.9.9
+  proxy-server-nameserver:
+    - 1.1.1.1
+    - 9.9.9.9
+
+  # После подъёма прокси обычные DNS-запросы можно вести через группу.
+  nameserver:
+    - "https://1.1.1.1/dns-query#GLOBAL-PROXY"
+    - "https://8.8.8.8/dns-query#GLOBAL-PROXY"
+  direct-nameserver:
+    - 1.1.1.1
+    - 9.9.9.9
+
+tun:
+  enable: true
+
+proxies: []
+
+proxy-groups:
+  - name: GLOBAL-PROXY
+    type: select
+    proxies:
+      - DIRECT
+
+rules:
+  - MATCH,DIRECT
+CFG
+    chmod 600 "$CONFIG" 2>/dev/null || true
+    say "Создан $CONFIG"
 }
+
+router_proxy_enabled(){
+    [ ! -f "$ROUTER_PROXY_STATE" ] && return 0
+    value="$(cat "$ROUTER_PROXY_STATE" 2>/dev/null)"
+    case "$value" in 0|false|off|disabled) return 1;; esac
+    return 0
+}
+
+set_router_proxy_state(){
+    ensure_dirs || return 1
+    printf '%s\n' "$1" > "$ROUTER_PROXY_STATE"
+}
+
+read_redir_port(){
+    p="$(yaml_top "$RUNTIME" redir-port)"
+    case "$p" in ''|*[!0-9]*) p="$REDIR_PORT_DEFAULT";; esac
+    [ "$p" -ge 1 ] 2>/dev/null && [ "$p" -le 65535 ] 2>/dev/null || p="$REDIR_PORT_DEFAULT"
+    printf '%s\n' "$p"
+}
+
+remove_router_output(){
+    while iptables -t nat -D OUTPUT -p tcp -j "$ROUTER_TCP_CHAIN" 2>/dev/null; do :; done
+    while iptables -t nat -D OUTPUT -p udp --dport 53 -j "$ROUTER_DNS_CHAIN" 2>/dev/null; do :; done
+    while iptables -t nat -D OUTPUT -p tcp --dport 53 -j "$ROUTER_DNS_CHAIN" 2>/dev/null; do :; done
+    iptables -t nat -F "$ROUTER_TCP_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$ROUTER_TCP_CHAIN" 2>/dev/null || true
+    iptables -t nat -F "$ROUTER_DNS_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$ROUTER_DNS_CHAIN" 2>/dev/null || true
+}
+
+remove_routing(){
+    ifs="$(lan_ifaces)"
+    for i in $ifs; do
+        while iptables -t mangle -D PREROUTING -i "$i" -j "$MANGLE_CHAIN" 2>/dev/null; do :; done
+        while iptables -t nat -D PREROUTING -i "$i" -p tcp -j "$REDIR_CHAIN" 2>/dev/null; do :; done
+        # Clean legacy direct DNS hijack from 0.7/0.8.
+        while iptables -t nat -D PREROUTING -i "$i" -p udp --dport 53 -j "$DNS_CHAIN" 2>/dev/null; do :; done
+        while iptables -t nat -D PREROUTING -i "$i" -p tcp --dport 53 -j "$DNS_CHAIN" 2>/dev/null; do :; done
+    done
+    while iptables -D FORWARD -j "$FILTER_CHAIN" 2>/dev/null; do :; done
+    remove_router_output
+    iptables -t mangle -F "$MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t mangle -X "$MANGLE_CHAIN" 2>/dev/null || true
+    iptables -t nat -F "$REDIR_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$REDIR_CHAIN" 2>/dev/null || true
+    iptables -t nat -F "$DNS_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$DNS_CHAIN" 2>/dev/null || true
+    iptables -F "$FILTER_CHAIN" 2>/dev/null || true
+    iptables -X "$FILTER_CHAIN" 2>/dev/null || true
+    while ip rule del fwmark "$TUN_MARK" table "$TUN_TABLE" pref "$TUN_PREF" 2>/dev/null; do :; done
+    while ip rule del fwmark "$TUN_MARK" table "$TUN_TABLE" 2>/dev/null; do :; done
+    ip route flush table "$TUN_TABLE" 2>/dev/null || true
+    ip route flush cache 2>/dev/null || true
+}
+
+build_lan_tcp_redirect(){
+    port="$(read_redir_port)"
+    iptables -t nat -N "$REDIR_CHAIN" 2>/dev/null || true
+    iptables -t nat -F "$REDIR_CHAIN" || return 1
+
+    # DNS must reach dnsmasq on the router, not the redir listener.
+    iptables -t nat -A "$REDIR_CHAIN" -p tcp --dport 53 -j RETURN || return 1
+    for n in \
+        0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 \
+        169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 \
+        224.0.0.0/4 240.0.0.0/4 255.255.255.255/32
+    do
+        iptables -t nat -A "$REDIR_CHAIN" -d "$n" -j RETURN || return 1
+    done
+
+    # Fake-IP 198.18.0.0/16 is intentionally not excluded.
+    iptables -t nat -A "$REDIR_CHAIN" -p tcp -j REDIRECT --to-ports "$port" || return 1
+    for i in $(lan_ifaces); do
+        iptables -t nat -I PREROUTING 1 -i "$i" -p tcp -j "$REDIR_CHAIN" || return 1
+    done
+}
+
+build_dnsmasq_bridge(){
+    # Clients still talk to dnsmasq:53. dnsmasq's real upstream query is caught
+    # here and sent to Mihomo DNS:1053. Marked Mihomo sockets bypass the chain.
+    iptables -t nat -N "$ROUTER_DNS_CHAIN" 2>/dev/null || true
+    iptables -t nat -F "$ROUTER_DNS_CHAIN" || return 1
+    iptables -t nat -A "$ROUTER_DNS_CHAIN" -m mark --mark "$OUTBOUND_MARK_HEX" -j RETURN || return 1
+    iptables -t nat -A "$ROUTER_DNS_CHAIN" -d 127.0.0.0/8 -j RETURN || return 1
+    router_ip="$(lan_ip)"
+    [ -n "$router_ip" ] && iptables -t nat -A "$ROUTER_DNS_CHAIN" -d "$router_ip" -j RETURN || true
+    iptables -t nat -A "$ROUTER_DNS_CHAIN" -p udp -j REDIRECT --to-ports "$DNS_PORT" || return 1
+    iptables -t nat -A "$ROUTER_DNS_CHAIN" -p tcp -j REDIRECT --to-ports "$DNS_PORT" || return 1
+    iptables -t nat -I OUTPUT 1 -p udp --dport 53 -j "$ROUTER_DNS_CHAIN" || return 1
+    iptables -t nat -I OUTPUT 1 -p tcp --dport 53 -j "$ROUTER_DNS_CHAIN" || return 1
+}
+
+build_router_tcp(){
+    iptables -t nat -N "$ROUTER_TCP_CHAIN" 2>/dev/null || true
+    iptables -t nat -F "$ROUTER_TCP_CHAIN" || return 1
+    iptables -t nat -A "$ROUTER_TCP_CHAIN" -m mark --mark "$OUTBOUND_MARK_HEX" -j RETURN || return 1
+    iptables -t nat -A "$ROUTER_TCP_CHAIN" -j "$REDIR_CHAIN" || return 1
+    iptables -t nat -I OUTPUT 1 -p tcp -j "$ROUTER_TCP_CHAIN" || return 1
+}
+
+setup_routing(){
+    running_pid >/dev/null 2>&1 || return 1
+    remove_routing
+
+    port="$(read_redir_port)"
+    wait_port "$port" || { fail "Mihomo не слушает redir-port $port"; return 1; }
+    wait_port "$DNS_PORT" || { fail "Mihomo DNS не слушает порт $DNS_PORT"; return 1; }
+
+    build_lan_tcp_redirect || { remove_routing; return 1; }
+    build_dnsmasq_bridge || { remove_routing; return 1; }
+
+    if tun_enabled; then
+        d="$(tun_device)"
+        ip link show "$d" >/dev/null 2>&1 || ifconfig "$d" >/dev/null 2>&1 || {
+            fail "TUN-интерфейс $d не найден"
+            remove_routing
+            return 1
+        }
+        ip link set "$d" up 2>/dev/null || true
+        echo 0 > "/proc/sys/net/ipv4/conf/$d/rp_filter" 2>/dev/null || true
+        ip route add default dev "$d" table "$TUN_TABLE" 2>/dev/null || { remove_routing; return 1; }
+        ip rule add fwmark "$TUN_MARK" table "$TUN_TABLE" pref "$TUN_PREF" 2>/dev/null || { remove_routing; return 1; }
+
+        iptables -t mangle -N "$MANGLE_CHAIN" 2>/dev/null || true
+        iptables -t mangle -F "$MANGLE_CHAIN" || return 1
+        # DNS -> dnsmasq, TCP -> REDIRECT, UDP/other -> TUN.
+        iptables -t mangle -A "$MANGLE_CHAIN" -p udp --dport 53 -j RETURN || return 1
+        iptables -t mangle -A "$MANGLE_CHAIN" -p tcp -j RETURN || return 1
+        for n in \
+            0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 \
+            169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 \
+            224.0.0.0/4 240.0.0.0/4 255.255.255.255/32
+        do
+            iptables -t mangle -A "$MANGLE_CHAIN" -d "$n" -j RETURN || { remove_routing; return 1; }
+        done
+        iptables -t mangle -A "$MANGLE_CHAIN" -j MARK --set-mark "$TUN_MARK" || { remove_routing; return 1; }
+        for i in $(lan_ifaces); do
+            echo 0 > "/proc/sys/net/ipv4/conf/$i/rp_filter" 2>/dev/null || true
+            iptables -t mangle -I PREROUTING 1 -i "$i" -j "$MANGLE_CHAIN" || { remove_routing; return 1; }
+        done
+
+        iptables -N "$FILTER_CHAIN" 2>/dev/null || true
+        iptables -F "$FILTER_CHAIN" || return 1
+        for i in $(lan_ifaces); do
+            iptables -A "$FILTER_CHAIN" -i "$i" -o "$d" -j ACCEPT || return 1
+            iptables -A "$FILTER_CHAIN" -i "$d" -o "$i" -j ACCEPT || return 1
+        done
+        iptables -I FORWARD 1 -j "$FILTER_CHAIN" || { remove_routing; return 1; }
+    fi
+
+    if router_proxy_enabled; then
+        build_router_tcp || { remove_routing; return 1; }
+    fi
+
+    ip route flush cache 2>/dev/null || true
+    say "Сеть поднята: dnsmasq:53 -> Mihomo:$DNS_PORT; LAN TCP -> REDIRECT:$port; LAN UDP -> $TUN_DEVICE; router TCP proxy=$(router_proxy_enabled && echo on || echo off)"
+}
+
+dns_status(){
+    dnsmasq_ok=no
+    mihomo_ok=no
+    bridge_ok=no
+    netstat -ln 2>/dev/null | grep -Eq '[:.]53[[:space:]]' && dnsmasq_ok=yes
+    netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" && mihomo_ok=yes
+    iptables -t nat -S "$ROUTER_DNS_CHAIN" >/dev/null 2>&1 && bridge_ok=yes
+    echo "dnsmasq:53=$dnsmasq_ok -> Mihomo:$DNS_PORT=$mihomo_ok; bridge=$bridge_ok"
+}
+
+firewall_reload(){
+    running_pid >/dev/null 2>&1 || return 0
+    say "Восстанавливаю hybrid, DNS bridge и router OUTPUT"
+    setup_routing
+}
+
+status(){
+    if p="$(running_pid)"; then echo "Mihomo: работает, PID=$p"; else echo "Mihomo: не запущен"; fi
+    echo "GoshaCrash: $VERSION"
+    echo "BASE: $BASE"
+    echo "DNS: $(dns_status)"
+    if tun_enabled; then
+        d="$(tun_device)"
+        ip link show "$d" >/dev/null 2>&1 && echo "TUN: $d работает" || echo "TUN: $d не найден"
+    else
+        echo "TUN: выключен"
+    fi
+    port="$(read_redir_port)"
+    if netstat -ln 2>/dev/null | grep -Eq "[:.]$port[[:space:]]"; then
+        echo "LAN TCP: REDIRECT -> $port"
+    else
+        echo "LAN TCP: redir-port $port не слушается"
+    fi
+    if iptables -t nat -S "$REDIR_CHAIN" >/dev/null 2>&1; then
+        echo "Hybrid firewall: работает"
+    else
+        echo "Hybrid firewall: не установлен"
+    fi
+    if router_proxy_enabled; then
+        if iptables -t nat -S "$ROUTER_TCP_CHAIN" >/dev/null 2>&1; then
+            echo "Интернет роутера: через Mihomo (TCP; DNS всегда через dnsmasq/Mihomo)"
+        else
+            echo "Интернет роутера: включён, но TCP OUTPUT не установлен"
+        fi
+    else
+        echo "Интернет роутера: TCP напрямую; DNS через dnsmasq/Mihomo"
+    fi
+    c="$(yaml_top "$RUNTIME" external-controller)"; [ -n "$c" ] || c=0.0.0.0:9090
+    p="${c##*:}"; p="$(echo "$p" | sed 's/[^0-9].*$//')"; [ -n "$p" ] || p=9090
+    echo "Zashboard: http://$(lan_ip):$p/ui/"
+    s="$(yaml_top "$RUNTIME" secret)"; [ -n "$s" ] && echo "API secret: $s"
+}
+
+dns_config_report(){
+    echo "=== DNS bootstrap report ==="
+    echo "Router upstream before interception:"
+    cat "$RESOLV" 2>/dev/null || true
+    echo
+    echo "DNS section in runtime:"
+    awk '
+      /^dns:[[:space:]]*($|#)/ {d=1}
+      d {print}
+      d && NR>1 && /^[^[:space:]#]/ && $0 !~ /^dns:/ {exit}
+    ' "$RUNTIME" 2>/dev/null | sed -n '1,120p'
+    echo
+    if awk '
+      /^dns:[[:space:]]*($|#)/ {d=1; next}
+      d && /^[^[:space:]#]/ {d=0}
+      d && /(^|[[:space:]-])system([:][\/][\/])?([[:space:]]|$)/ {found=1}
+      END {exit(found ? 0 : 1)}
+    ' "$CONFIG" 2>/dev/null; then
+        echo "WARN: в личном config.yaml есть system; в runtime он заменяется на bootstrap $DNS_BOOTSTRAP, чтобы не создать петлю dnsmasq <-> Mihomo."
+    fi
+    echo "Для первого запуска в заблокированной сети самый надёжный вариант: хотя бы один proxy server задан IPv4-адресом."
+}
+
+doctor(){
+    echo "=== GoshaCrash doctor ==="
+    echo "BASE=$BASE"; echo "USB=$USB_MOUNT"; echo "ARCH=$(uname -m)"; echo "LAN=$(lan_ifaces)"; echo "IP=$(lan_ip)"; echo
+    [ -x "$BIN" ] && "$BIN" -v || echo "Mihomo: NOT FOUND"
+    [ -c /dev/net/tun ] && echo "/dev/net/tun: OK" || echo "/dev/net/tun: NOT FOUND"
+    echo
+    status
+    echo
+    echo "=== ports ==="
+    netstat -lnp 2>/dev/null | grep -E "(:53[[:space:]]|:$DNS_PORT[[:space:]]|:9090[[:space:]]|:7892[[:space:]]|:$(read_redir_port)[[:space:]])" || true
+    echo
+    echo "=== routes ==="
+    ip rule show 2>/dev/null | grep -E "($TUN_PREF|$TUN_TABLE|$TUN_MARK)" || true
+    ip route show table "$TUN_TABLE" 2>/dev/null || true
+    echo
+    echo "=== iptables ==="
+    iptables -t nat -L "$REDIR_CHAIN" -n -v 2>/dev/null || true
+    iptables -t nat -L "$ROUTER_DNS_CHAIN" -n -v 2>/dev/null || true
+    iptables -t nat -L "$ROUTER_TCP_CHAIN" -n -v 2>/dev/null || true
+    iptables -t mangle -L "$MANGLE_CHAIN" -n -v 2>/dev/null || true
+    echo
+    dns_config_report
+    echo
+    echo "=== log ==="
+    tail -n 80 "$LOGFILE" 2>/dev/null || true
+}
+
+router_proxy_enable(){
+    set_router_proxy_state 1 || return 1
+    if running_pid >/dev/null 2>&1; then setup_routing; else say "Включено; применится при запуске Mihomo"; fi
+}
+
+router_proxy_disable(){
+    set_router_proxy_state 0 || return 1
+    while iptables -t nat -D OUTPUT -p tcp -j "$ROUTER_TCP_CHAIN" 2>/dev/null; do :; done
+    iptables -t nat -F "$ROUTER_TCP_CHAIN" 2>/dev/null || true
+    iptables -t nat -X "$ROUTER_TCP_CHAIN" 2>/dev/null || true
+    say "TCP самого роутера идёт напрямую; DNS bridge и LAN hybrid оставлены"
+}
+
+hybrid_test(){
+    echo "=== GoshaCrash hybrid test ==="
+    status
+    echo
+    echo "Windows:"
+    echo "  nslookup example.com $(lan_ip)"
+    echo "  curl.exe -I --http1.1 --connect-timeout 15 https://example.com"
+    echo "  curl.exe -I --http1.1 --connect-timeout 15 https://chatgpt.com"
+    echo "Router:"
+    echo "  wget --spider --no-check-certificate https://github.com"
+    echo "Logs:"
+    echo "  goshacrash logs 100 | grep -Ei 'github|example.com|chatgpt.com|youtube|error|timeout'"
+}
+
+pause_menu(){ printf '\nНажми Enter для продолжения...'; read _dummy; }
 
 menu(){
     while :; do
         printf '\033[2J\033[H'
         echo '========================================'
-        echo '             GoshaCrash'
+        echo '      GoshaCrash 0.9.0-rc1'
         echo '========================================'
         status
         echo
@@ -801,13 +1449,16 @@ menu(){
         echo '3) Перезапустить Mihomo'
         echo '4) Редактировать config.yaml и применить'
         echo '5) Применить config.yaml'
-        echo '6) Включить TUN-маршрутизацию'
-        echo '7) Отключить TUN-маршрутизацию'
-        echo '8) Показать последние логи'
-        echo '9) Полная диагностика'
-        echo '10) Показать адрес Zashboard'
-        echo '11) Обновить Mihomo и Zashboard'
-        echo '12) Установить/проверить nano'
+        echo '6) Восстановить firewall/маршруты'
+        echo '7) Показать последние логи'
+        echo '8) Полная диагностика'
+        echo '9) Показать адрес Zashboard'
+        echo '10) Обновить Mihomo и Zashboard'
+        echo '11) Установить/проверить nano'
+        echo '12) Включить TCP-прокси самого роутера'
+        echo '13) Отключить TCP-прокси самого роутера'
+        echo '14) Отчёт по DNS bootstrap'
+        echo '15) Контрольный тест'
         echo '0) Выход'
         echo '========================================'
         printf 'Выбери пункт: '
@@ -818,13 +1469,16 @@ menu(){
             3) stop_mihomo; start_mihomo;;
             4) edit_config && apply_config;;
             5) apply_config;;
-            6) setup_routing;;
-            7) remove_routing; echo 'TUN-маршрутизация отключена';;
-            8) tail -n 100 "$LOGFILE" 2>/dev/null || true;;
-            9) doctor;;
-            10) c="$(yaml_top "$RUNTIME" external-controller)"; [ -n "$c" ] || c=0.0.0.0:9090; p="${c##*:}"; p="$(echo "$p"|sed 's/[^0-9].*$//')"; echo "http://$(lan_ip):${p:-9090}/ui/";;
-            11) update_all;;
-            12) install_editor;;
+            6) firewall_reload;;
+            7) tail -n 100 "$LOGFILE" 2>/dev/null || true;;
+            8) doctor;;
+            9) c="$(yaml_top "$RUNTIME" external-controller)"; [ -n "$c" ] || c=0.0.0.0:9090; p="${c##*:}"; p="$(echo "$p"|sed 's/[^0-9].*$//')"; echo "http://$(lan_ip):${p:-9090}/ui/";;
+            10) update_all;;
+            11) install_editor;;
+            12) router_proxy_enable;;
+            13) router_proxy_disable;;
+            14) dns_config_report;;
+            15) hybrid_test;;
             0) return 0;;
             *) echo 'Неизвестный пункт';;
         esac
@@ -833,29 +1487,29 @@ menu(){
 }
 
 usage(){ cat <<'USAGE'
-GoshaCrash — Mihomo + Zashboard для stock ASUSWRT
+GoshaCrash 0.9.0-rc1 — Mihomo + Zashboard для stock ASUSWRT
 
 Команды:
-  menu              открыть интерактивное меню
-  install           установить nano, Mihomo, Zashboard и автозапуск
-  setup             открыть config.yaml и применить
-  edit              открыть config.yaml
-  check             проверить итоговый runtime.yaml
-  apply             применить config.yaml
+  install                 установить Mihomo, Zashboard и автозапуск
+  setup                   открыть config.yaml и применить
+  edit                    открыть config.yaml
+  check                   проверить итоговый runtime.yaml
+  apply                   применить config.yaml
   start|stop|restart
-  status            состояние
-  doctor            полная диагностика
-  logs [N]          последние строки лога
-  ui                адрес Zashboard
-  backup            резервная копия config.yaml
-  restore [FILE]    восстановление config.yaml
-  install-hooks     установить автозапуск Download Master
-  uninstall-hooks   удалить автозапуск
-  tun-enable        восстановить TUN/iptables
-  tun-disable       убрать TUN/iptables без остановки Mihomo
-  firewall-reload   восстановить DNS и iptables
-  update            обновить Mihomo и Zashboard
-  install-editor    установить nano через ipkg
+  status                  состояние
+  doctor                  полная диагностика
+  test                    контрольные команды
+  logs [N]                последние строки лога
+  ui                      адрес Zashboard
+  backup                  резервная копия config.yaml
+  restore [FILE]          восстановить config.yaml
+  firewall-reload         восстановить firewall и маршруты
+  router-proxy-enable     проксировать TCP самого роутера
+  router-proxy-disable    оставить TCP роутера напрямую
+  dns-report              показать DNS bootstrap и runtime DNS
+  update                  обновить Mihomo и Zashboard
+  install-editor          установить nano через ipkg
+  install-hooks|uninstall-hooks
   version
 USAGE
 }
@@ -873,6 +1527,7 @@ case "${1:-menu}" in
  restart) stop_mihomo; start_mihomo;;
  status) status;;
  doctor) doctor;;
+ test|hybrid-test) hybrid_test;;
  logs) tail -n "${2:-100}" "$LOGFILE" 2>/dev/null || true;;
  ui) c="$(yaml_top "$RUNTIME" external-controller)"; [ -n "$c" ] || c=0.0.0.0:9090; p="${c##*:}"; p="$(echo "$p"|sed 's/[^0-9].*$//')"; echo "http://$(lan_ip):${p:-9090}/ui/";;
  backup) backup_config;;
@@ -880,9 +1535,11 @@ case "${1:-menu}" in
  install-hooks) install_hooks;;
  uninstall-hooks) uninstall_hooks;;
  boot) boot_service;;
- firewall-reload) firewall_reload;;
- tun-enable) setup_routing;;
- tun-disable) remove_routing; echo "TUN-маршрутизация отключена";;
+ firewall-reload|tun-enable) firewall_reload;;
+ tun-disable) remove_routing; echo "Маршрутизация отключена";;
+ router-proxy-enable) router_proxy_enable;;
+ router-proxy-disable) router_proxy_disable;;
+ dns-report|dns-bootstrap) dns_config_report;;
  update) update_all;;
  install-editor) install_editor;;
  version) echo "$VERSION";;
