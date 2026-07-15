@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-15-preserve-user-tun-runtime-package2-090rc1
+# BUILD: 2026-07-15-preserve-user-tun-runtime-package3-090rc1
 # GoshaCrash 0.9.0-rc1 — single-file controller for Mihomo, Zashboard and stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
 VERSION="0.9.0-rc1"
-BUILD_ID="2026-07-15-preserve-user-tun-runtime-package2-090rc1"
+BUILD_ID="2026-07-15-preserve-user-tun-runtime-package3-090rc1"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
@@ -427,14 +427,17 @@ render_runtime(){
     [ -f "$CONFIG" ] || return 1
 
     cp "$CONFIG" "$out" || return 1
-    sed -i 's/
-$//' "$out" || return 1
+
+    # Нормализация CRLF без sed: старый BusyBox sed на ASUS выдавал
+    # "sed: unmatched '/'" на выражении с буквальным CR.
+    tr -d '\r' < "$out" > "$out.lf" || return 1
+    mv -f "$out.lf" "$out" || return 1
 
     controller="$(yaml_top "$CONFIG" external-controller)"
     controller_port="${controller##*:}"
-    controller_port="$(printf '%s
-' "$controller_port" | sed 's/[^0-9].*$//')"
-    [ -n "$controller_port" ] || controller_port=9090
+    case "$controller_port" in
+        ''|*[!0-9]*) controller_port=9090;;
+    esac
 
     # Меняется только адрес API. Остальные корневые параметры пользователя
     # сохраняются, включая ipv6, find-process-mode и external-ui-url.

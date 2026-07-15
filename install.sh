@@ -1,11 +1,11 @@
 #!/bin/sh
-# BUILD: 2026-07-15-preserve-user-tun-runtime-safe-controller-installer-090rc1
+# BUILD: 2026-07-15-preserve-user-tun-runtime-busybox-fix-installer-090rc1
 # GoshaCrash 0.9.0-rc1 installer.
 # Public runtime consists of two shell files: install.sh and goshacrash.
 
 INSTALLER_VERSION="0.9.0-rc1"
 EXPECTED_CONTROLLER_VERSION="0.9.0-rc1"
-EXPECTED_CONTROLLER_BUILD="2026-07-15-preserve-user-tun-runtime-package2-090rc1"
+EXPECTED_CONTROLLER_BUILD="2026-07-15-preserve-user-tun-runtime-package3-090rc1"
 
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
