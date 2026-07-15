@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-15-preserve-user-tun-runtime-package3-090rc1
+# BUILD: 2026-07-15-preserve-user-tun-runtime-package4-090rc1
 # GoshaCrash 0.9.0-rc1 — single-file controller for Mihomo, Zashboard and stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
 VERSION="0.9.0-rc1"
-BUILD_ID="2026-07-15-preserve-user-tun-runtime-package3-090rc1"
+BUILD_ID="2026-07-15-preserve-user-tun-runtime-package4-090rc1"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
@@ -408,10 +408,16 @@ verify_runtime_requirements(){
         return 1
     }
 
-    is_true "$(yaml_section "$file" tun auto-redirect)" || {
-        fail "Для маршрутизации силами Mihomo необходимо tun.auto-redirect: true"
-        return 1
-    }
+    # auto-redirect не обязателен. На старом ASUSWRT его можно отключать,
+    # оставляя auto-route под управлением самого Mihomo.
+    auto_redirect="$(yaml_section "$file" tun auto-redirect)"
+    case "$auto_redirect" in
+        true|false|1|0|yes|no|on|off|"") ;;
+        *)
+            fail "tun.auto-redirect должен быть true или false"
+            return 1
+            ;;
+    esac
 
     listen="$(yaml_section "$file" dns listen)"
     [ "$listen" = "127.0.0.1:$DNS_PORT" ] || {
@@ -689,7 +695,7 @@ start_mihomo(){
     }
 
     echo "Mihomo запущен, PID=$(cat "$PIDFILE" 2>/dev/null)"
-    echo "[GoshaCrash] Маршрутизацией управляет Mihomo: auto-route=true, auto-redirect=true"
+    echo "[GoshaCrash] Маршрутизацией управляет Mihomo; параметры auto-route/auto-redirect взяты из config.yaml"
     [ "${GOSHACRASH_WATCHDOG_INTERNAL:-0}" = 1 ] || watchdog_start || true
 }
 
