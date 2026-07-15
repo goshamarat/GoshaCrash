@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-16-pure-tun-gvisor-armv5-090rc6
-# GoshaCrash 0.9.0-rc6 — pure TUN with custom ARMv5 gVisor Mihomo.
+# BUILD: 2026-07-16-pure-tun-gvisor-sha256-fallback-090rc61
+# GoshaCrash 0.9.0-rc6.1 — pure TUN with custom ARMv5 gVisor Mihomo.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-VERSION="0.9.0-rc6"
-BUILD_ID="2026-07-16-pure-tun-gvisor-armv5-090rc6"
+VERSION="0.9.0-rc6.1"
+BUILD_ID="2026-07-16-pure-tun-gvisor-sha256-fallback-090rc61"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
@@ -152,6 +152,48 @@ fetch_any(){
     return 1
 }
 
+sha256_file(){
+    file="$1"
+    result=""
+
+    if have sha256sum; then
+        result="$(sha256sum "$file" 2>/dev/null | awk 'NR==1 {print $1; exit}')"
+        [ -n "$result" ] && { printf '%s\n' "$result"; return 0; }
+    fi
+
+    if [ -x /opt/bin/sha256sum ]; then
+        result="$(/opt/bin/sha256sum "$file" 2>/dev/null | awk 'NR==1 {print $1; exit}')"
+        [ -n "$result" ] && { printf '%s\n' "$result"; return 0; }
+    fi
+
+    if [ -x /tmp/opt/bin/sha256sum ]; then
+        result="$(/tmp/opt/bin/sha256sum "$file" 2>/dev/null | awk 'NR==1 {print $1; exit}')"
+        [ -n "$result" ] && { printf '%s\n' "$result"; return 0; }
+    fi
+
+    if have busybox && busybox sha256sum "$file" >/dev/null 2>&1; then
+        result="$(busybox sha256sum "$file" 2>/dev/null | awk 'NR==1 {print $1; exit}')"
+        [ -n "$result" ] && { printf '%s\n' "$result"; return 0; }
+    fi
+
+    if have openssl; then
+        result="$(openssl dgst -sha256 "$file" 2>/dev/null | awk 'NR==1 {print $NF; exit}')"
+        [ -n "$result" ] && { printf '%s\n' "$result"; return 0; }
+    fi
+
+    if [ -x /opt/bin/openssl ]; then
+        result="$(/opt/bin/openssl dgst -sha256 "$file" 2>/dev/null | awk 'NR==1 {print $NF; exit}')"
+        [ -n "$result" ] && { printf '%s\n' "$result"; return 0; }
+    fi
+
+    if [ -x /tmp/opt/bin/openssl ]; then
+        result="$(/tmp/opt/bin/openssl dgst -sha256 "$file" 2>/dev/null | awk 'NR==1 {print $NF; exit}')"
+        [ -n "$result" ] && { printf '%s\n' "$result"; return 0; }
+    fi
+
+    return 1
+}
+
 is_asus(){
     have nvram && [ -n "$(nvram get productid 2>/dev/null)" ] && return 0
     uname -a 2>/dev/null | grep -qiE 'asus|brcmarm'
@@ -194,14 +236,22 @@ install_core_gvisor(){
         return 1
     }
 
-    expected="$(awk 'NR==1 {print $1}' "$sha_file" 2>/dev/null)"
-    actual="$(sha256sum "$pkg" 2>/dev/null | awk '{print $1}')"
+    expected="$(awk 'NR==1 {print $1; exit}' "$sha_file" 2>/dev/null | tr -d '\r' | tr 'A-F' 'a-f')"
+    actual="$(sha256_file "$pkg" 2>/dev/null | tr -d '\r' | tr 'A-F' 'a-f')"
 
-    [ -n "$expected" ] && [ "$actual" = "$expected" ] || {
-        fail "SHA256 gVisor core не совпал"
+    [ -n "$actual" ] || {
+        fail "На роутере не найден рабочий SHA-256 инструмент (sha256sum, BusyBox или OpenSSL)"
         rm -f "$pkg" "$sha_file"
         return 1
     }
+
+    [ -n "$expected" ] && [ "$actual" = "$expected" ] || {
+        fail "SHA256 gVisor core не совпал: expected=${expected:-EMPTY}, actual=${actual:-EMPTY}"
+        rm -f "$pkg" "$sha_file"
+        return 1
+    }
+
+    say "SHA256 gVisor core: OK ($actual)"
 
     gzip -dc "$pkg" > "$new" || {
         fail "Не удалось распаковать gVisor core"
@@ -1422,7 +1472,7 @@ menu(){
 }
 
 usage(){ cat <<'USAGE'
-GoshaCrash 0.9.0-rc6
+GoshaCrash 0.9.0-rc6.1
 
 Управление:
   goshacrash                 открыть меню

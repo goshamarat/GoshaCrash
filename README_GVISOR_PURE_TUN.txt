@@ -104,3 +104,17 @@ Runtime:
 Это экспериментальная сборка. Она проверена синтаксически и по генерации
 runtime, но настоящий ARMv5 gVisor core и производительность проверяются
 только после выполнения GitHub Actions и запуска на RT-AC68U.
+
+
+RC6.1 FIX
+---------
+Controller BUILD: 2026-07-16-pure-tun-gvisor-sha256-fallback-090rc61
+
+Исправлена проверка SHA256 на старом ASUSWRT:
+- sha256sum из PATH;
+- /opt/bin/sha256sum;
+- BusyBox sha256sum;
+- OpenSSL dgst -sha256.
+
+RC6 ошибочно считал actual пустым, если на прошивке отсутствовала команда
+sha256sum, и сообщал о несовпадении хэша.

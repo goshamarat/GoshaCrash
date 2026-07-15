@@ -1,9 +1,9 @@
 #!/bin/sh
-# BUILD: 2026-07-16-pure-tun-gvisor-routing-helper-090rc6
+# BUILD: 2026-07-16-pure-tun-gvisor-routing-helper-090rc61
 # Pure-TUN helper for ARMv5 gVisor Mihomo on old ASUSWRT kernels.
 
-VERSION="0.9.0-rc6"
-BUILD_ID="2026-07-16-pure-tun-gvisor-routing-helper-090rc6"
+VERSION="0.9.0-rc6.1"
+BUILD_ID="2026-07-16-pure-tun-gvisor-routing-helper-090rc61"
 
 BASE="${GOSHACRASH_BASE:-$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)}"
 STATE_DIR="$BASE/state/route"
