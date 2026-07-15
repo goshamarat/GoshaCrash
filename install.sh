@@ -1,12 +1,12 @@
 #!/bin/sh
-# BUILD: 2026-07-15-legacy-tun-routing-installer-090rc2
-# GoshaCrash 0.9.0-rc2 installer: controller + compatible routing helper.
+# BUILD: 2026-07-15-legacy-tun-routing-installer-dnsfix-090rc3
+# GoshaCrash 0.9.0-rc3 installer: controller + compatible routing helper.
 
-INSTALLER_VERSION="0.9.0-rc2"
-EXPECTED_CONTROLLER_VERSION="0.9.0-rc2"
-EXPECTED_CONTROLLER_BUILD="2026-07-15-legacy-tun-routing-090rc2"
-EXPECTED_ROUTE_VERSION="0.9.0-rc2"
-EXPECTED_ROUTE_BUILD="2026-07-15-legacy-tun-routing-helper-090rc2"
+INSTALLER_VERSION="0.9.0-rc3"
+EXPECTED_CONTROLLER_VERSION="0.9.0-rc3"
+EXPECTED_CONTROLLER_BUILD="2026-07-15-legacy-tun-routing-dnsfix-090rc3"
+EXPECTED_ROUTE_VERSION="0.9.0-rc3"
+EXPECTED_ROUTE_BUILD="2026-07-15-legacy-tun-routing-helper-dnsfix-090rc3"
 
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"

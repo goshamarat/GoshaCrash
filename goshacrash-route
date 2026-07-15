@@ -1,9 +1,9 @@
 #!/bin/sh
-# BUILD: 2026-07-15-legacy-tun-routing-helper-090rc2
+# BUILD: 2026-07-15-legacy-tun-routing-helper-dnsfix-090rc3
 # Compatible TUN routing helper for stock ASUSWRT / old Linux kernels.
 
-VERSION="0.9.0-rc2"
-BUILD_ID="2026-07-15-legacy-tun-routing-helper-090rc2"
+VERSION="0.9.0-rc3"
+BUILD_ID="2026-07-15-legacy-tun-routing-helper-dnsfix-090rc3"
 
 BASE="${GOSHACRASH_BASE:-$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)}"
 STATE_DIR="$BASE/state/route"
@@ -217,7 +217,8 @@ build_router_chain(){
 
 build_dns(){
     ipt -t nat -N "$DNS_LAN_CHAIN" || return 1
-    ipt -t nat -A "$DNS_LAN_CHAIN" -j REDIRECT --to-ports 53 || return 1
+    ipt -t nat -A "$DNS_LAN_CHAIN" -p udp -j REDIRECT --to-ports 53 || return 1
+    ipt -t nat -A "$DNS_LAN_CHAIN" -p tcp -j REDIRECT --to-ports 53 || return 1
 
     for iface in $(lan_ifaces); do
         ipt -t nat -I PREROUTING 1 -i "$iface" -p udp --dport 53 -j "$DNS_LAN_CHAIN" || return 1
@@ -227,7 +228,8 @@ build_dns(){
     ipt -t nat -N "$DNS_OUT_CHAIN" || return 1
     ipt -t nat -A "$DNS_OUT_CHAIN" -m mark --mark "$OUTBOUND_MARK" -j RETURN || return 1
     ipt -t nat -A "$DNS_OUT_CHAIN" -d 127.0.0.0/8 -j RETURN || return 1
-    ipt -t nat -A "$DNS_OUT_CHAIN" -j REDIRECT --to-ports "$DNS_PORT" || return 1
+    ipt -t nat -A "$DNS_OUT_CHAIN" -p udp -j REDIRECT --to-ports "$DNS_PORT" || return 1
+    ipt -t nat -A "$DNS_OUT_CHAIN" -p tcp -j REDIRECT --to-ports "$DNS_PORT" || return 1
 
     ipt -t nat -I OUTPUT 1 -p udp --dport 53 -j "$DNS_OUT_CHAIN" || return 1
     ipt -t nat -I OUTPUT 1 -p tcp --dport 53 -j "$DNS_OUT_CHAIN" || return 1

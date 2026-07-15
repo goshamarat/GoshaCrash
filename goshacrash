@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-15-legacy-tun-routing-090rc2
-# GoshaCrash 0.9.0-rc2 — Mihomo, Zashboard and legacy-compatible TUN routing for stock ASUSWRT.
+# BUILD: 2026-07-15-legacy-tun-routing-dnsfix-090rc3
+# GoshaCrash 0.9.0-rc3 — Mihomo, Zashboard and legacy-compatible TUN routing for stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-VERSION="0.9.0-rc2"
-BUILD_ID="2026-07-15-legacy-tun-routing-090rc2"
+VERSION="0.9.0-rc3"
+BUILD_ID="2026-07-15-legacy-tun-routing-dnsfix-090rc3"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
@@ -1407,7 +1407,7 @@ menu(){
 }
 
 usage(){ cat <<'USAGE'
-GoshaCrash 0.9.0-rc2
+GoshaCrash 0.9.0-rc3
 
 Управление:
   goshacrash                 открыть меню
