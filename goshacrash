@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-14-two-file-dnsmasq-hybrid-090rc1
+# BUILD: 2026-07-15-minimal-menu-dnsmasq-hybrid-090rc1
 # GoshaCrash 0.9.0-rc1 — single-file controller for Mihomo, Zashboard and stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
 VERSION="0.9.0-rc1"
-BUILD_ID="2026-07-14-two-file-dnsmasq-hybrid-090rc1"
+BUILD_ID="2026-07-15-minimal-menu-dnsmasq-hybrid-090rc1"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
@@ -1438,7 +1438,7 @@ pause_menu(){ printf '\nНажми Enter для продолжения...'; read
 
 menu(){
     while :; do
-        printf '\033[2J\033[H'
+        printf '[2J[H'
         echo '========================================'
         echo '      GoshaCrash 0.9.0-rc1'
         echo '========================================'
@@ -1449,16 +1449,9 @@ menu(){
         echo '3) Перезапустить Mihomo'
         echo '4) Редактировать config.yaml и применить'
         echo '5) Применить config.yaml'
-        echo '6) Восстановить firewall/маршруты'
-        echo '7) Показать последние логи'
-        echo '8) Полная диагностика'
-        echo '9) Показать адрес Zashboard'
-        echo '10) Обновить Mihomo и Zashboard'
-        echo '11) Установить/проверить nano'
-        echo '12) Включить TCP-прокси самого роутера'
-        echo '13) Отключить TCP-прокси самого роутера'
-        echo '14) Отчёт по DNS bootstrap'
-        echo '15) Контрольный тест'
+        echo '10) Показать адрес Zashboard'
+        echo '11) Обновить Mihomo и Zashboard'
+        echo '12) Установить/проверить nano'
         echo '0) Выход'
         echo '========================================'
         printf 'Выбери пункт: '
@@ -1469,16 +1462,9 @@ menu(){
             3) stop_mihomo; start_mihomo;;
             4) edit_config && apply_config;;
             5) apply_config;;
-            6) firewall_reload;;
-            7) tail -n 100 "$LOGFILE" 2>/dev/null || true;;
-            8) doctor;;
-            9) c="$(yaml_top "$RUNTIME" external-controller)"; [ -n "$c" ] || c=0.0.0.0:9090; p="${c##*:}"; p="$(echo "$p"|sed 's/[^0-9].*$//')"; echo "http://$(lan_ip):${p:-9090}/ui/";;
-            10) update_all;;
-            11) install_editor;;
-            12) router_proxy_enable;;
-            13) router_proxy_disable;;
-            14) dns_config_report;;
-            15) hybrid_test;;
+            10) c="$(yaml_top "$RUNTIME" external-controller)"; [ -n "$c" ] || c=0.0.0.0:9090; p="${c##*:}"; p="$(echo "$p"|sed 's/[^0-9].*$//')"; echo "http://$(lan_ip):${p:-9090}/ui/";;
+            11) update_all;;
+            12) install_editor;;
             0) return 0;;
             *) echo 'Неизвестный пункт';;
         esac
