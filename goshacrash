@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-15-legacy-tun-routing-dnsfix-090rc3
-# GoshaCrash 0.9.0-rc3 — Mihomo, Zashboard and legacy-compatible TUN routing for stock ASUSWRT.
+# BUILD: 2026-07-15-transparent-proxy-7892-menu-fixed-090rc5
+# GoshaCrash 0.9.0-rc5 — transparent TCP proxy + UDP TUN for stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-VERSION="0.9.0-rc3"
-BUILD_ID="2026-07-15-legacy-tun-routing-dnsfix-090rc3"
+VERSION="0.9.0-rc5"
+BUILD_ID="2026-07-15-transparent-proxy-7892-menu-fixed-090rc5"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
@@ -24,6 +24,7 @@ STATE="$BASE/state"
 JFFS_BASE="/jffs/addons/goshacrash"
 JFFS_BASE_FILE="$JFFS_BASE/base"
 DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
+REDIR_PORT="${MIHOMO_REDIR_PORT:-7892}"
 ROUTE_HELPER="$BASE/goshacrash-route"
 
 TUN_DEVICE="${GOSHACRASH_TUN_DEVICE:-goshatun}"
@@ -402,6 +403,23 @@ verify_runtime_requirements(){
         return 1
     }
 
+    [ "$(yaml_top "$file" redir-port)" = "$REDIR_PORT" ] || {
+        fail "runtime: ожидается redir-port=$REDIR_PORT"
+        return 1
+    }
+
+    for key in mixed-port socks-port tproxy-port; do
+        [ -z "$(yaml_top "$file" "$key")" ] || {
+            fail "runtime: $key отключён; TCP принимает только прозрачный redir-port=$REDIR_PORT"
+            return 1
+        }
+    done
+
+    grep -Eq '^port:[[:space:]]*' "$file" && {
+        fail "runtime: обычный HTTP proxy port отключён; TCP принимает только прозрачный redir-port=$REDIR_PORT"
+        return 1
+    }
+
     listen="$(yaml_section "$file" dns listen)"
     [ "$listen" = "127.0.0.1:$DNS_PORT" ] || {
         fail "runtime DNS должен слушать 127.0.0.1:$DNS_PORT"
@@ -428,10 +446,11 @@ render_runtime(){
     # Корневые runtime-параметры под старый ASUSWRT:
     # API открыт в LAN, IPv6/поиск процессов отключены, а исходящие сокеты
     # Mihomo получают отдельную метку для защиты от зацикливания.
-    awk -v cp="$controller_port" -v mark="$OUTBOUND_MARK_DEC" '
+    awk -v cp="$controller_port" -v mark="$OUTBOUND_MARK_DEC" -v redir="$REDIR_PORT" '
         BEGIN {
             have_controller=0
             have_mark=0
+            have_redir=0
             have_ipv6=0
             have_find=0
         }
@@ -449,6 +468,11 @@ render_runtime(){
                 have_mark=1
                 next
             }
+            if (key == "redir-port") {
+                print "redir-port: " redir
+                have_redir=1
+                next
+            }
             if (key == "ipv6") {
                 print "ipv6: false"
                 have_ipv6=1
@@ -459,13 +483,14 @@ render_runtime(){
                 have_find=1
                 next
             }
-            if (key == "redir-port" || key == "tproxy-port")
+            if (key == "mixed-port" || key == "port" || key == "socks-port" || key == "tproxy-port")
                 next
         }
         { print }
         END {
             if (!have_controller) print "external-controller: 0.0.0.0:" cp
             if (!have_mark) print "routing-mark: " mark
+            if (!have_redir) print "redir-port: " redir
             if (!have_ipv6) print "ipv6: false"
             if (!have_find) print "find-process-mode: off"
         }
@@ -574,6 +599,7 @@ runtime_audit(){
     echo "GoshaCrash меняет только транспортные параметры:"
     echo "  external-controller -> $(yaml_top "$RUNTIME" external-controller)"
     echo "  routing-mark -> $(yaml_top "$RUNTIME" routing-mark)"
+    echo "  transparent redir-port -> $(yaml_top "$RUNTIME" redir-port)"
     echo "  ipv6 -> $(yaml_top "$RUNTIME" ipv6)"
     echo "  find-process-mode -> $(yaml_top "$RUNTIME" find-process-mode)"
     echo "  dns.listen -> $(yaml_section "$RUNTIME" dns listen)"
@@ -666,6 +692,7 @@ route_helper(){
     GOSHACRASH_OUTBOUND_MARK="$OUTBOUND_MARK_HEX" \
     GOSHACRASH_ROUTE_ROUTER="$ROUTE_ROUTER" \
     MIHOMO_DNS_PORT="$DNS_PORT" \
+    MIHOMO_REDIR_PORT="$REDIR_PORT" \
         "$ROUTE_HELPER" "$1" "$(tun_device)"
 }
 
@@ -726,6 +753,13 @@ start_mihomo(){
         return 1
     }
 
+    wait_port "$REDIR_PORT" || {
+        kill_mihomo
+        fail "Mihomo не слушает прозрачный TCP redir-port $REDIR_PORT"
+        tail -n 100 "$LOGFILE"
+        return 1
+    }
+
     wait_tun || {
         kill_mihomo
         fail "Mihomo не создал TUN-интерфейс"
@@ -741,7 +775,7 @@ start_mihomo(){
     }
 
     echo "Mihomo запущен, PID=$(cat "$PIDFILE" 2>/dev/null)"
-    echo "[GoshaCrash] Схема: Mihomo TUN auto-route=off; iptables/ip rule/ip route создаёт goshacrash-route"
+    echo "[GoshaCrash] Схема: TCP REDIRECT:$REDIR_PORT; UDP -> system TUN; auto-route=off"
     [ "${GOSHACRASH_WATCHDOG_INTERNAL:-0}" = 1 ] || watchdog_start || true
 }
 
@@ -928,7 +962,7 @@ write_default_config(){
 # На роутере dnsmasq слушает :53, а GoshaCrash меняет DNS listener только
 # в runtime.yaml на 127.0.0.1:1053.
 
-mixed-port: 7892
+redir-port: 7892
 allow-lan: true
 bind-address: "*"
 mode: rule
@@ -1123,6 +1157,7 @@ watchdog_internet_ok(){
 watchdog_local_ok(){
     running_pid >/dev/null 2>&1 || return 1
     netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" || return 1
+    netstat -ln 2>/dev/null | grep -Eq "[:.]$REDIR_PORT[[:space:]]" || return 1
 
     d="$(tun_device)"
     ip link show "$d" >/dev/null 2>&1 ||
@@ -1295,7 +1330,7 @@ status(){
         echo "Mihomo: не запущен"
     fi
     echo "GoshaCrash: $VERSION"
-    echo "Режим: system TUN + совместимая маршрутизация"
+    echo "Режим: прозрачный TCP-прокси + UDP через system TUN"
     echo "BASE: $BASE"
     echo "DNS: $(dns_status)"
 
@@ -1307,14 +1342,18 @@ status(){
     fi
 
     echo "Mihomo: auto-route=false; auto-redirect=false"
+    netstat -ln 2>/dev/null | grep -Eq "[:.]$REDIR_PORT[[:space:]]" &&
+        echo "Transparent TCP listener:$REDIR_PORT: OK" ||
+        echo "Transparent TCP listener:$REDIR_PORT: MISSING"
     if route_helper status >/dev/null 2>&1; then
         echo "GoshaRoute: работает"
     else
         echo "GoshaRoute: не работает"
     fi
-    echo "LAN: TCP+UDP -> MARK $TUN_MARK -> table $TUN_TABLE -> $d"
+    echo "LAN TCP: прозрачный REDIRECT -> Mihomo redir-port:$REDIR_PORT"
+    echo "LAN UDP: MARK $TUN_MARK -> table $TUN_TABLE -> $d"
     [ "$ROUTE_ROUTER" = 1 ] &&
-        echo "Роутер: TCP+UDP -> TUN; исходящие сокеты Mihomo обходят петлю mark=$OUTBOUND_MARK_HEX"
+        echo "Роутер: TCP -> transparent REDIRECT:$REDIR_PORT; UDP -> TUN; Mihomo mark=$OUTBOUND_MARK_HEX bypass"
 
     if p="$(watchdog_pid)"; then
         echo "WAN watchdog: работает, PID=$p"
@@ -1385,8 +1424,8 @@ menu(){
         echo '3) Перезапустить Mihomo'
         echo '4) Редактировать config.yaml и применить'
         echo '5) Применить config.yaml'
-        echo '10) Показать адрес Zashboard'
-        echo '11) Обновить Mihomo и Zashboard'
+        echo '6) Показать адрес Zashboard'
+        echo '7) Обновить Mihomo и Zashboard'
         echo '0) Выход'
         echo '========================================'
         printf 'Выбери пункт: '
@@ -1397,8 +1436,8 @@ menu(){
             3) stop_mihomo; start_mihomo;;
             4) edit_config && apply_config;;
             5) apply_config;;
-            10) c="$(yaml_top "$RUNTIME" external-controller)"; [ -n "$c" ] || c=0.0.0.0:9090; p="${c##*:}"; p="$(echo "$p"|sed 's/[^0-9].*$//')"; echo "http://$(lan_ip):${p:-9090}/ui/";;
-            11) update_all;;
+            6) c="$(yaml_top "$RUNTIME" external-controller)"; [ -n "$c" ] || c=0.0.0.0:9090; p="${c##*:}"; p="$(echo "$p"|sed 's/[^0-9].*$//')"; echo "http://$(lan_ip):${p:-9090}/ui/";;
+            7) update_all;;
             0) return 0;;
             *) echo 'Неизвестный пункт';;
         esac
@@ -1407,7 +1446,7 @@ menu(){
 }
 
 usage(){ cat <<'USAGE'
-GoshaCrash 0.9.0-rc3
+GoshaCrash 0.9.0-rc5
 
 Управление:
   goshacrash                 открыть меню
