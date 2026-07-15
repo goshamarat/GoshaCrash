@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-15-pure-tun-wan-watchdog-090rc1
+# BUILD: 2026-07-15-mihomo-managed-routing-watchdog-package1-090rc1
 # GoshaCrash 0.9.0-rc1 — single-file controller for Mihomo, Zashboard and stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
 VERSION="0.9.0-rc1"
-BUILD_ID="2026-07-15-pure-tun-wan-watchdog-090rc1"
+BUILD_ID="2026-07-15-mihomo-managed-routing-watchdog-package1-090rc1"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
@@ -24,23 +24,20 @@ STATE="$BASE/state"
 JFFS_BASE="/jffs/addons/goshacrash"
 JFFS_BASE_FILE="$JFFS_BASE/base"
 DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
-OUTBOUND_MARK="${GOSHACRASH_OUTBOUND_MARK:-9012}"
 
 TUN_DEVICE="${GOSHACRASH_TUN_DEVICE:-mihomo0}"
 TUN_MTU="${GOSHACRASH_TUN_MTU:-1500}"
 TUN_TABLE="${GOSHACRASH_TUN_TABLE:-2022}"
-TUN_MARK="${GOSHACRASH_TUN_MARK:-0x2333}"
-TUN_PREF="${GOSHACRASH_TUN_PREF:-10010}"
-MANGLE_CHAIN="GOSHACRASH_TUN"
-ROUTER_TUN_CHAIN="GOSHACRASH_ROUTER_TUN"
-FILTER_CHAIN="GOSHACRASH_FORWARD"
-ROUTER_DNS_CHAIN="GOSHACRASH_DNSMASQ_UPSTREAM"
+TUN_RULE_INDEX="${GOSHACRASH_TUN_RULE_INDEX:-9000}"
 
-# Old hybrid chain names are retained only for cleanup during upgrade.
+# These names are cleanup-only. GoshaCrash never creates them anymore.
+LEGACY_MANGLE_CHAIN="GOSHACRASH_TUN"
+LEGACY_ROUTER_TUN_CHAIN="GOSHACRASH_ROUTER_TUN"
+LEGACY_FILTER_CHAIN="GOSHACRASH_FORWARD"
 LEGACY_DNS_CHAIN="GOSHACRASH_DNS_HIJACK"
 LEGACY_REDIR_CHAIN="GOSHACRASH_TCP_REDIR"
 LEGACY_ROUTER_TCP_CHAIN="GOSHACRASH_ROUTER_TCP"
-OUTBOUND_MARK_HEX="${GOSHACRASH_OUTBOUND_MARK_HEX:-0x2334}"
+LEGACY_ROUTER_DNS_CHAIN="GOSHACRASH_DNSMASQ_UPSTREAM"
 
 # Automatic WAN watchdog. It runs only while Mihomo is running.
 # It never reboots the router and never rewrites config.yaml/runtime.yaml.
@@ -354,22 +351,19 @@ render_runtime(){
 
     controller="$(yaml_top "$CONFIG" external-controller)"
     controller_port="${controller##*:}"
-    controller_port="$(printf '%s\\n' "$controller_port" | sed 's/[^0-9].*$//')"
+    controller_port="$(printf '%s\n' "$controller_port" | sed 's/[^0-9].*$//')"
     [ -n "$controller_port" ] || controller_port=9090
 
-    # Router-specific fields are generated only in runtime.yaml.
-    # TCP and UDP are both routed through mihomo0; no redir-port is created.
-    awk -v mark="$OUTBOUND_MARK" -v cp="$controller_port" '
+    # Mihomo owns routing. GoshaCrash only prepares a router-compatible runtime.
+    awk -v cp="$controller_port" '
         BEGIN {
-            print "routing-mark: " mark
             print "external-controller: 0.0.0.0:" cp
             print "external-ui: ui"
             print "find-process-mode: off"
             print "ipv6: false"
         }
         /^[^[:space:]#][^:]*:[[:space:]]*/ {
-            line=$0
-            key=line
+            key=$0
             sub(/:.*/, "", key)
             if (key == "redir-port" ||
                 key == "tproxy-port" ||
@@ -448,22 +442,32 @@ DNS_RUNTIME
     # Nameservers and proxy-server-nameserver are preserved exactly as
     # written by the user. Only the local DNS listener is adapted for ASUSWRT.
 
-    # Pure TUN mode: both TCP and UDP use mihomo0.
-    # The personal config remains untouched; only runtime.yaml is adapted.
-    ten=true
-
-    # The user's rule groups/providers remain untouched; only incompatible TUN fields are replaced.
-    awk -v en="$ten" -v dev="$TUN_DEVICE" -v mtu="$TUN_MTU" '
+    # Mihomo creates routes and transparent-redirection rules itself.
+    # No iptables/ip-rule/ip-route rules are created by GoshaCrash.
+    awk -v dev="$TUN_DEVICE" -v mtu="$TUN_MTU" -v table="$TUN_TABLE" -v rule="$TUN_RULE_INDEX" '
       function emit(){
         print "tun:"
-        print "  enable: " en
+        print "  enable: true"
         print "  stack: system"
         print "  device: " dev
         print "  mtu: " mtu
-        print "  auto-route: false"
-        print "  auto-redirect: false"
-        print "  auto-detect-interface: false"
+        print "  dns-hijack:"
+        print "    - any:53"
+        print "    - tcp://any:53"
+        print "  auto-route: true"
+        print "  auto-redirect: true"
+        print "  auto-detect-interface: true"
         print "  strict-route: false"
+        print "  iproute2-table-index: " table
+        print "  iproute2-rule-index: " rule
+        print "  route-exclude-address:"
+        print "    - 10.10.10.0/24"
+        print "    - 127.0.0.0/8"
+        print "    - 169.254.0.0/16"
+        print "    - 172.16.0.0/12"
+        print "    - 192.168.0.0/16"
+        print "    - 224.0.0.0/4"
+        print "    - 240.0.0.0/4"
       }
       /^tun:[[:space:]]*($|#)/ {
         if (!done) { emit(); done=1 }
@@ -539,44 +543,57 @@ wait_tun(){
     return 1
 }
 
-setup_dns_hijack(){
-    port="$1"
-    case "$port" in ''|*[!0-9]*) return 1;; esac
-    iptables -t nat -N "$DNS_CHAIN" 2>/dev/null || true
-    iptables -t nat -F "$DNS_CHAIN" || return 1
-
-    # ShellCrash-style DNS hijack: LAN TCP/UDP port 53 -> Mihomo DNS port.
-    # Protocol is explicit because old ASUS iptables rejects REDIRECT without it.
-    iptables -t nat -A "$DNS_CHAIN" -p tcp -j REDIRECT --to-ports "$port" || return 1
-    iptables -t nat -A "$DNS_CHAIN" -p udp -j REDIRECT --to-ports "$port" || return 1
-
+cleanup_legacy_network(){
+    # Remove only rules created by older GoshaCrash builds.
+    # No new routing/firewall rules are created here.
     for i in $(lan_ifaces); do
-        while iptables -t nat -D PREROUTING -i "$i" -p tcp --dport 53 -j "$DNS_CHAIN" 2>/dev/null; do :; done
-        while iptables -t nat -D PREROUTING -i "$i" -p udp --dport 53 -j "$DNS_CHAIN" 2>/dev/null; do :; done
-        iptables -t nat -I PREROUTING 1 -i "$i" -p tcp --dport 53 -j "$DNS_CHAIN" || return 1
-        iptables -t nat -I PREROUTING 1 -i "$i" -p udp --dport 53 -j "$DNS_CHAIN" || return 1
+        while iptables -t mangle -D PREROUTING -i "$i" -j "$LEGACY_MANGLE_CHAIN" 2>/dev/null; do :; done
+        while iptables -t nat -D PREROUTING -i "$i" -p tcp -j "$LEGACY_REDIR_CHAIN" 2>/dev/null; do :; done
+        while iptables -t nat -D PREROUTING -i "$i" -p udp --dport 53 -j "$LEGACY_DNS_CHAIN" 2>/dev/null; do :; done
+        while iptables -t nat -D PREROUTING -i "$i" -p tcp --dport 53 -j "$LEGACY_DNS_CHAIN" 2>/dev/null; do :; done
     done
-}
 
-dns_hijack_port(){
-    iptables -t nat -S "$DNS_CHAIN" 2>/dev/null |
-        sed -n 's/.*--to-ports \([0-9][0-9]*\).*/\1/p' |
-        head -n 1
+    while iptables -t mangle -D OUTPUT -j "$LEGACY_ROUTER_TUN_CHAIN" 2>/dev/null; do :; done
+    while iptables -t nat -D OUTPUT -p tcp -j "$LEGACY_ROUTER_TCP_CHAIN" 2>/dev/null; do :; done
+    while iptables -t nat -D OUTPUT -p udp --dport 53 -j "$LEGACY_ROUTER_DNS_CHAIN" 2>/dev/null; do :; done
+    while iptables -t nat -D OUTPUT -p tcp --dport 53 -j "$LEGACY_ROUTER_DNS_CHAIN" 2>/dev/null; do :; done
+    while iptables -D FORWARD -j "$LEGACY_FILTER_CHAIN" 2>/dev/null; do :; done
+
+    for c in "$LEGACY_MANGLE_CHAIN" "$LEGACY_ROUTER_TUN_CHAIN"; do
+        iptables -t mangle -F "$c" 2>/dev/null || true
+        iptables -t mangle -X "$c" 2>/dev/null || true
+    done
+    for c in "$LEGACY_DNS_CHAIN" "$LEGACY_REDIR_CHAIN" "$LEGACY_ROUTER_TCP_CHAIN" "$LEGACY_ROUTER_DNS_CHAIN"; do
+        iptables -t nat -F "$c" 2>/dev/null || true
+        iptables -t nat -X "$c" 2>/dev/null || true
+    done
+    iptables -F "$LEGACY_FILTER_CHAIN" 2>/dev/null || true
+    iptables -X "$LEGACY_FILTER_CHAIN" 2>/dev/null || true
+
+    while ip rule del fwmark 0x2333 table 2022 pref 10010 2>/dev/null; do :; done
+    while ip rule del fwmark 0x2333 table 2022 2>/dev/null; do :; done
+    ip route flush table 2022 2>/dev/null || true
+    ip route flush cache 2>/dev/null || true
 }
 
 start_mihomo(){
     if p="$(running_pid)"; then
-        tun_enabled && setup_routing || true
         [ "${GOSHACRASH_WATCHDOG_INTERNAL:-0}" = 1 ] || watchdog_start || true
-        echo "Mihomo уже запущен, PID=$(cat "$PIDFILE" 2>/dev/null)"
+        echo "Mihomo уже запущен, PID=$p"
         return 0
     fi
 
-    [ -f "$RUNTIME" ] || { fail "Сначала выполни: goshacrash apply"; return 1; }
-    tun_enabled && ensure_tun || { tun_enabled && { fail "Нет /dev/net/tun"; return 1; }; }
+    [ -f "$RUNTIME" ] || {
+        fail "Сначала выполни: goshacrash apply"
+        return 1
+    }
+    ensure_tun || {
+        fail "Нет /dev/net/tun"
+        return 1
+    }
     validate_runtime || return 1
 
-    remove_routing
+    cleanup_legacy_network
     ensure_dirs || return 1
     rm -f "$PIDFILE"
     [ -f "$LOGFILE" ] && [ "$(wc -c < "$LOGFILE" 2>/dev/null)" -gt 1048576 ] 2>/dev/null &&
@@ -589,35 +606,33 @@ start_mihomo(){
 
     running_pid >/dev/null 2>&1 || {
         fail "Mihomo завершился"
-        tail -n 80 "$LOGFILE"
+        tail -n 100 "$LOGFILE"
         return 1
     }
 
-    mode="$(detect_dns_mode "$RUNTIME")"
-    case "$mode" in
-        forward:*)
-            port="${mode#forward:}"
-            wait_port "$port" || {
-                kill_mihomo
-                fail "Mihomo DNS не слушает порт $port"
-                return 1
-            }
-            ;;
-    esac
+    wait_port "$DNS_PORT" || {
+        kill_mihomo
+        fail "Mihomo DNS не слушает порт $DNS_PORT"
+        tail -n 100 "$LOGFILE"
+        return 1
+    }
 
-    if tun_enabled; then
-        wait_tun || { kill_mihomo; return 1; }
-        setup_routing || { kill_mihomo; return 1; }
-    fi
+    wait_tun || {
+        kill_mihomo
+        fail "Mihomo не создал TUN-интерфейс"
+        tail -n 100 "$LOGFILE"
+        return 1
+    }
 
     echo "Mihomo запущен, PID=$(cat "$PIDFILE" 2>/dev/null)"
+    echo "[GoshaCrash] Маршрутизацией управляет Mihomo: auto-route=true, auto-redirect=true"
     [ "${GOSHACRASH_WATCHDOG_INTERNAL:-0}" = 1 ] || watchdog_start || true
 }
 
 stop_mihomo(){
     [ "${GOSHACRASH_WATCHDOG_INTERNAL:-0}" = 1 ] || watchdog_stop
-    remove_routing
     kill_mihomo
+    cleanup_legacy_network
     echo "Mihomo остановлен"
 }
 
@@ -782,10 +797,10 @@ update_all(){
 }
 
 # -----------------------------------------------------------------------------
-# Router-specific final network layer.
-# LAN DNS stays on dnsmasq:53. dnsmasq's upstream queries are redirected in
-# nat OUTPUT to Mihomo DNS on 127.0.0.1:1053. This preserves DHCP/local names.
-# LAN TCP and UDP both use manual TUN policy routing.
+# Router runtime defaults.
+# Mihomo itself creates TUN routes and transparent-redirection rules through
+# auto-route/auto-redirect. GoshaCrash only generates runtime.yaml, starts the
+# service, removes rules left by older builds and runs the WAN watchdog.
 # -----------------------------------------------------------------------------
 
 write_default_config(){
@@ -982,20 +997,14 @@ watchdog_internet_ok(){
 watchdog_local_ok(){
     running_pid >/dev/null 2>&1 || return 1
     netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" || return 1
-    iptables -t nat -S "$ROUTER_DNS_CHAIN" >/dev/null 2>&1 || return 1
 
-    if tun_enabled; then
-        d="$(tun_device)"
-        ip link show "$d" >/dev/null 2>&1 ||
-            ifconfig "$d" >/dev/null 2>&1 || return 1
-        iptables -t mangle -S "$MANGLE_CHAIN" >/dev/null 2>&1 || return 1
-        iptables -t mangle -S "$ROUTER_TUN_CHAIN" >/dev/null 2>&1 || return 1
-        ip route show table "$TUN_TABLE" 2>/dev/null |
-            grep -q "dev $d" || return 1
-        ip rule show 2>/dev/null |
-            grep -q "lookup $TUN_TABLE" || return 1
-    fi
+    d="$(tun_device)"
+    ip link show "$d" >/dev/null 2>&1 ||
+        ifconfig "$d" >/dev/null 2>&1 || return 1
 
+    # These are generated by Mihomo auto-route, not by GoshaCrash.
+    ip route show table "$TUN_TABLE" 2>/dev/null | grep -q . || return 1
+    ip rule show 2>/dev/null | grep -q "lookup $TUN_TABLE" || return 1
     return 0
 }
 
@@ -1072,10 +1081,9 @@ watchdog_loop(){
         fi
 
         if running_pid >/dev/null 2>&1 && ! watchdog_local_ok; then
-            watchdog_log "Восстанавливаются DNS bridge, firewall и policy routing"
-            setup_routing >/dev/null 2>&1 ||
-                watchdog_log "Локальную схему восстановить не удалось"
-            sleep 3
+            watchdog_log "TUN или auto-route Mihomo повреждены; выполняется мягкий перезапуск Mihomo"
+            watchdog_soft_restart || true
+            sleep 8
         fi
 
         if ! running_pid >/dev/null 2>&1; then
@@ -1107,23 +1115,16 @@ watchdog_loop(){
 
             if [ "$last_action" -eq 0 ] ||
                [ "$elapsed" -ge "$WATCHDOG_ACTION_COOLDOWN" ]; then
-                watchdog_log "Порог ошибок достигнут; пересоздаются firewall и маршрутизация"
-                setup_routing >/dev/null 2>&1 || true
-                sleep 5
+                watchdog_log "Порог ошибок достигнут; Mihomo будет перезапущен для пересоздания auto-route/auto-redirect"
+                watchdog_soft_restart || true
+                sleep 8
 
                 if watchdog_internet_ok; then
-                    watchdog_log "Связь восстановлена после пересоздания сети"
+                    watchdog_log "Связь восстановлена после мягкого перезапуска Mihomo"
                     state=up
                 else
-                    watchdog_soft_restart || true
-                    sleep 8
-                    if watchdog_internet_ok; then
-                        watchdog_log "Связь восстановлена после мягкого перезапуска Mihomo"
-                        state=up
-                    else
-                        watchdog_log "Связь не восстановлена; следующий ремонт будет не раньше cooldown"
-                        state=degraded
-                    fi
+                    watchdog_log "Связь не восстановлена; следующий restart будет не раньше cooldown"
+                    state=degraded
                 fi
 
                 failures=0
@@ -1149,181 +1150,25 @@ watchdog_status(){
     fi
 }
 
-remove_router_output(){
-    while iptables -t mangle -D OUTPUT -j "$ROUTER_TUN_CHAIN" 2>/dev/null; do :; done
-    while iptables -t nat -D OUTPUT -p udp --dport 53 -j "$ROUTER_DNS_CHAIN" 2>/dev/null; do :; done
-    while iptables -t nat -D OUTPUT -p tcp --dport 53 -j "$ROUTER_DNS_CHAIN" 2>/dev/null; do :; done
-
-    # Remove old hybrid OUTPUT hook during upgrade.
-    while iptables -t nat -D OUTPUT -p tcp -j "$LEGACY_ROUTER_TCP_CHAIN" 2>/dev/null; do :; done
-
-    iptables -t mangle -F "$ROUTER_TUN_CHAIN" 2>/dev/null || true
-    iptables -t mangle -X "$ROUTER_TUN_CHAIN" 2>/dev/null || true
-    iptables -t nat -F "$ROUTER_DNS_CHAIN" 2>/dev/null || true
-    iptables -t nat -X "$ROUTER_DNS_CHAIN" 2>/dev/null || true
-    iptables -t nat -F "$LEGACY_ROUTER_TCP_CHAIN" 2>/dev/null || true
-    iptables -t nat -X "$LEGACY_ROUTER_TCP_CHAIN" 2>/dev/null || true
-}
-
-remove_routing(){
-    for i in $(lan_ifaces); do
-        while iptables -t mangle -D PREROUTING -i "$i" -j "$MANGLE_CHAIN" 2>/dev/null; do :; done
-
-        # Remove old hybrid and legacy DNS hooks during upgrade.
-        while iptables -t nat -D PREROUTING -i "$i" -p tcp -j "$LEGACY_REDIR_CHAIN" 2>/dev/null; do :; done
-        while iptables -t nat -D PREROUTING -i "$i" -p udp --dport 53 -j "$LEGACY_DNS_CHAIN" 2>/dev/null; do :; done
-        while iptables -t nat -D PREROUTING -i "$i" -p tcp --dport 53 -j "$LEGACY_DNS_CHAIN" 2>/dev/null; do :; done
-    done
-
-    while iptables -D FORWARD -j "$FILTER_CHAIN" 2>/dev/null; do :; done
-    remove_router_output
-
-    iptables -t mangle -F "$MANGLE_CHAIN" 2>/dev/null || true
-    iptables -t mangle -X "$MANGLE_CHAIN" 2>/dev/null || true
-    iptables -t nat -F "$LEGACY_REDIR_CHAIN" 2>/dev/null || true
-    iptables -t nat -X "$LEGACY_REDIR_CHAIN" 2>/dev/null || true
-    iptables -t nat -F "$LEGACY_DNS_CHAIN" 2>/dev/null || true
-    iptables -t nat -X "$LEGACY_DNS_CHAIN" 2>/dev/null || true
-    iptables -F "$FILTER_CHAIN" 2>/dev/null || true
-    iptables -X "$FILTER_CHAIN" 2>/dev/null || true
-
-    while ip rule del fwmark "$TUN_MARK" table "$TUN_TABLE" pref "$TUN_PREF" 2>/dev/null; do :; done
-    while ip rule del fwmark "$TUN_MARK" table "$TUN_TABLE" 2>/dev/null; do :; done
-    ip route flush table "$TUN_TABLE" 2>/dev/null || true
-    ip route flush cache 2>/dev/null || true
-}
-
-build_dnsmasq_bridge(){
-    # dnsmasq remains on port 53. Its upstream query is redirected locally to
-    # Mihomo DNS on 1053. This is DNS plumbing, not TCP redir-port proxying.
-    iptables -t nat -N "$ROUTER_DNS_CHAIN" 2>/dev/null || true
-    iptables -t nat -F "$ROUTER_DNS_CHAIN" || return 1
-    iptables -t nat -A "$ROUTER_DNS_CHAIN" -m mark --mark "$OUTBOUND_MARK_HEX" -j RETURN || return 1
-    iptables -t nat -A "$ROUTER_DNS_CHAIN" -d 127.0.0.0/8 -j RETURN || return 1
-    router_ip="$(lan_ip)"
-    [ -n "$router_ip" ] &&
-        iptables -t nat -A "$ROUTER_DNS_CHAIN" -d "$router_ip" -j RETURN || true
-    iptables -t nat -A "$ROUTER_DNS_CHAIN" -p udp -j REDIRECT --to-ports "$DNS_PORT" || return 1
-    iptables -t nat -A "$ROUTER_DNS_CHAIN" -p tcp -j REDIRECT --to-ports "$DNS_PORT" || return 1
-    iptables -t nat -I OUTPUT 1 -p udp --dport 53 -j "$ROUTER_DNS_CHAIN" || return 1
-    iptables -t nat -I OUTPUT 1 -p tcp --dport 53 -j "$ROUTER_DNS_CHAIN" || return 1
-}
-
-append_tun_exclusions(){
-    table="$1"
-    chain="$2"
-
-    # DNS is served locally through dnsmasq/Mihomo.
-    iptables -t "$table" -A "$chain" -p udp --dport 53 -j RETURN || return 1
-    iptables -t "$table" -A "$chain" -p tcp --dport 53 -j RETURN || return 1
-
-    # Preserve router administration, LAN devices and special-use networks.
-    for n in \
-        0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 \
-        169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 \
-        224.0.0.0/4 240.0.0.0/4 255.255.255.255/32
-    do
-        iptables -t "$table" -A "$chain" -d "$n" -j RETURN || return 1
-    done
-}
-
-build_lan_tun(){
-    iptables -t mangle -N "$MANGLE_CHAIN" 2>/dev/null || true
-    iptables -t mangle -F "$MANGLE_CHAIN" || return 1
-
-    # Mihomo-originated sockets use mark 0x2334 and must bypass the TUN route.
-    iptables -t mangle -A "$MANGLE_CHAIN" -m mark --mark "$OUTBOUND_MARK_HEX" -j RETURN || return 1
-    append_tun_exclusions mangle "$MANGLE_CHAIN" || return 1
-
-    # There is deliberately no TCP RETURN: TCP, UDP and ICMP all use TUN.
-    iptables -t mangle -A "$MANGLE_CHAIN" -j MARK --set-mark "$TUN_MARK" || return 1
-
-    for i in $(lan_ifaces); do
-        echo 0 > "/proc/sys/net/ipv4/conf/$i/rp_filter" 2>/dev/null || true
-        iptables -t mangle -I PREROUTING 1 -i "$i" -j "$MANGLE_CHAIN" || return 1
-    done
-}
-
-build_router_tun(){
-    iptables -t mangle -N "$ROUTER_TUN_CHAIN" 2>/dev/null || true
-    iptables -t mangle -F "$ROUTER_TUN_CHAIN" || return 1
-
-    # runtime routing-mark 9012 equals 0x2334.
-    iptables -t mangle -A "$ROUTER_TUN_CHAIN" -m mark --mark "$OUTBOUND_MARK_HEX" -j RETURN || return 1
-    append_tun_exclusions mangle "$ROUTER_TUN_CHAIN" || return 1
-    iptables -t mangle -A "$ROUTER_TUN_CHAIN" -j MARK --set-mark "$TUN_MARK" || return 1
-
-    iptables -t mangle -I OUTPUT 1 -j "$ROUTER_TUN_CHAIN" || return 1
-}
-
-build_tun_forward(){
-    d="$1"
-    iptables -N "$FILTER_CHAIN" 2>/dev/null || true
-    iptables -F "$FILTER_CHAIN" || return 1
-
-    for i in $(lan_ifaces); do
-        iptables -A "$FILTER_CHAIN" -i "$i" -o "$d" -j ACCEPT || return 1
-        iptables -A "$FILTER_CHAIN" -i "$d" -o "$i" -j ACCEPT || return 1
-    done
-    iptables -I FORWARD 1 -j "$FILTER_CHAIN" || return 1
-}
-
-setup_routing(){
-    running_pid >/dev/null 2>&1 || return 1
-    tun_enabled || {
-        fail "Pure TUN требует tun.enable: true"
-        return 1
-    }
-
-    remove_routing
-    wait_port "$DNS_PORT" || {
-        fail "Mihomo DNS не слушает порт $DNS_PORT"
-        return 1
-    }
-
-    d="$(tun_device)"
-    ip link show "$d" >/dev/null 2>&1 ||
-        ifconfig "$d" >/dev/null 2>&1 || {
-            fail "TUN-интерфейс $d не найден"
-            remove_routing
-            return 1
-        }
-
-    ip link set "$d" up 2>/dev/null || true
-    echo 0 > "/proc/sys/net/ipv4/conf/$d/rp_filter" 2>/dev/null || true
-
-    ip route add default dev "$d" table "$TUN_TABLE" 2>/dev/null || {
-        remove_routing
-        return 1
-    }
-    ip rule add fwmark "$TUN_MARK" table "$TUN_TABLE" pref "$TUN_PREF" 2>/dev/null || {
-        remove_routing
-        return 1
-    }
-
-    build_dnsmasq_bridge || { remove_routing; return 1; }
-    build_lan_tun || { remove_routing; return 1; }
-    build_router_tun || { remove_routing; return 1; }
-    build_tun_forward "$d" || { remove_routing; return 1; }
-
-    ip route flush cache 2>/dev/null || true
-    say "Сеть поднята: dnsmasq:53 -> Mihomo:$DNS_PORT; LAN TCP+UDP -> $d; router TCP+UDP -> $d"
-}
-
 dns_status(){
     dnsmasq_ok=no
     mihomo_ok=no
-    bridge_ok=no
     netstat -ln 2>/dev/null | grep -Eq '[:.]53[[:space:]]' && dnsmasq_ok=yes
     netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" && mihomo_ok=yes
-    iptables -t nat -S "$ROUTER_DNS_CHAIN" >/dev/null 2>&1 && bridge_ok=yes
-    echo "dnsmasq:53=$dnsmasq_ok -> Mihomo:$DNS_PORT=$mihomo_ok; bridge=$bridge_ok"
+    echo "dnsmasq:53=$dnsmasq_ok; Mihomo DNS:$DNS_PORT=$mihomo_ok; hijack=Mihomo TUN"
 }
 
 firewall_reload(){
     running_pid >/dev/null 2>&1 || return 0
-    say "Восстанавливаю pure TUN, DNS bridge и policy routing"
-    setup_routing
+    say "ASUSWRT перезапустил firewall; перезапускаю Mihomo, чтобы он заново создал auto-route/auto-redirect"
+    GOSHACRASH_WATCHDOG_INTERNAL=1
+    export GOSHACRASH_WATCHDOG_INTERNAL
+    kill_mihomo
+    sleep 2
+    start_mihomo
+    rc=$?
+    unset GOSHACRASH_WATCHDOG_INTERNAL
+    return "$rc"
 }
 
 status(){
@@ -1333,32 +1178,20 @@ status(){
         echo "Mihomo: не запущен"
     fi
     echo "GoshaCrash: $VERSION"
-    echo "Режим: pure TUN"
+    echo "Режим маршрутизации: управляет Mihomo"
     echo "BASE: $BASE"
     echo "DNS: $(dns_status)"
 
-    if tun_enabled; then
-        d="$(tun_device)"
-        if ip link show "$d" >/dev/null 2>&1 || ifconfig "$d" >/dev/null 2>&1; then
-            echo "TUN: $d работает"
-        else
-            echo "TUN: $d не найден"
-        fi
+    d="$(tun_device)"
+    if ip link show "$d" >/dev/null 2>&1 || ifconfig "$d" >/dev/null 2>&1; then
+        echo "TUN: $d работает"
     else
-        echo "TUN: выключен"
+        echo "TUN: $d не найден"
     fi
 
-    if iptables -t mangle -S "$MANGLE_CHAIN" >/dev/null 2>&1; then
-        echo "LAN: TCP+UDP -> TUN"
-    else
-        echo "LAN: TUN-маршрутизация не установлена"
-    fi
-
-    if iptables -t mangle -S "$ROUTER_TUN_CHAIN" >/dev/null 2>&1; then
-        echo "Роутер: TCP+UDP -> TUN"
-    else
-        echo "Роутер: TUN-маршрутизация не установлена"
-    fi
+    echo "Mihomo TUN: auto-route=true"
+    echo "Mihomo TUN: auto-redirect=true"
+    echo "Mihomo TUN: auto-detect-interface=true"
 
     if p="$(watchdog_pid)"; then
         echo "WAN watchdog: работает, PID=$p"
@@ -1391,30 +1224,30 @@ doctor(){
     status
     echo
 
-    echo "=== ports ==="
-    netstat -lnp 2>/dev/null |
-        grep -E "(:53[[:space:]]|:$DNS_PORT[[:space:]]|:9090[[:space:]]|:7892[[:space:]])" || true
+    echo "=== runtime tun ==="
+    awk '
+      /^tun:[[:space:]]*($|#)/ {inside=1}
+      inside {print}
+      inside && NR>1 && /^[^[:space:]#]/ && $0 !~ /^tun:/ {exit}
+    ' "$RUNTIME" 2>/dev/null
     echo
 
-    echo "=== routes ==="
-    ip rule show 2>/dev/null | grep -E "($TUN_PREF|$TUN_TABLE|$TUN_MARK)" || true
+    echo "=== routes created by Mihomo ==="
+    ip rule show 2>/dev/null | grep -E "($TUN_TABLE|$TUN_RULE_INDEX)" || true
     ip route show table "$TUN_TABLE" 2>/dev/null || true
     echo
 
-    echo "=== iptables ==="
-    iptables -t nat -L "$ROUTER_DNS_CHAIN" -n -v 2>/dev/null || true
-    iptables -t mangle -L "$MANGLE_CHAIN" -n -v 2>/dev/null || true
-    iptables -t mangle -L "$ROUTER_TUN_CHAIN" -n -v 2>/dev/null || true
-    iptables -L "$FILTER_CHAIN" -n -v 2>/dev/null || true
+    echo "=== firewall objects visible after Mihomo start ==="
+    iptables -t nat -S 2>/dev/null | grep -Ei 'mihomo|clash|meta|redirect|tproxy' || true
+    iptables -t mangle -S 2>/dev/null | grep -Ei 'mihomo|clash|meta|mark|tproxy' || true
     echo
 
-    echo "=== legacy hybrid check ==="
-    iptables -t nat -S 2>/dev/null |
-        grep -E "($LEGACY_REDIR_CHAIN|$LEGACY_ROUTER_TCP_CHAIN|--to-ports 7893)" || true
+    echo "=== old GoshaCrash rules must be absent ==="
+    iptables-save 2>/dev/null | grep 'GOSHACRASH_' || true
     echo
 
     echo "=== log ==="
-    tail -n 80 "$LOGFILE" 2>/dev/null || true
+    tail -n 100 "$LOGFILE" 2>/dev/null || true
 }
 
 pause_menu(){ printf '\nНажми Enter для продолжения...'; read _dummy; }
