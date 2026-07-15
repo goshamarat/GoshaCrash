@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-15-mihomo-managed-routing-watchdog-package1-090rc1
+# BUILD: 2026-07-15-preserve-user-tun-runtime-package2-090rc1
 # GoshaCrash 0.9.0-rc1 — single-file controller for Mihomo, Zashboard and stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
 VERSION="0.9.0-rc1"
-BUILD_ID="2026-07-15-mihomo-managed-routing-watchdog-package1-090rc1"
+BUILD_ID="2026-07-15-preserve-user-tun-runtime-package2-090rc1"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
@@ -25,7 +25,7 @@ JFFS_BASE="/jffs/addons/goshacrash"
 JFFS_BASE_FILE="$JFFS_BASE/base"
 DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
 
-TUN_DEVICE="${GOSHACRASH_TUN_DEVICE:-mihomo0}"
+TUN_DEVICE="${GOSHACRASH_TUN_DEVICE:-tun}"
 TUN_MTU="${GOSHACRASH_TUN_MTU:-1500}"
 TUN_TABLE="${GOSHACRASH_TUN_TABLE:-2022}"
 TUN_RULE_INDEX="${GOSHACRASH_TUN_RULE_INDEX:-9000}"
@@ -342,51 +342,127 @@ detect_dns_mode(){
     esac
 }
 
+extract_yaml_section(){
+    file="$1"
+    section="$2"
+    output="$3"
+
+    awk -v section="$section" '
+        {
+            sub(/\r$/, "")
+        }
+        $0 ~ "^" section ":[[:space:]]*($|#)" {
+            inside=1
+            print
+            next
+        }
+        inside && /^[^[:space:]#]/ {
+            exit
+        }
+        inside {
+            print
+        }
+    ' "$file" > "$output"
+}
+
+verify_runtime_preserves_tun(){
+    source_file="$1"
+    runtime_file="$2"
+    source_tun="$BASE/run/tun.source.$$"
+    runtime_tun="$BASE/run/tun.runtime.$$"
+
+    extract_yaml_section "$source_file" tun "$source_tun" || return 1
+    extract_yaml_section "$runtime_file" tun "$runtime_tun" || {
+        rm -f "$source_tun" "$runtime_tun"
+        return 1
+    }
+
+    if [ ! -s "$source_tun" ]; then
+        rm -f "$source_tun" "$runtime_tun"
+        fail "В config.yaml отсутствует раздел tun:"
+        return 1
+    fi
+
+    if ! cmp -s "$source_tun" "$runtime_tun"; then
+        warn "GoshaCrash обнаружил изменение пользовательского раздела tun:"
+        diff -u "$source_tun" "$runtime_tun" 2>/dev/null || true
+        rm -f "$source_tun" "$runtime_tun"
+        fail "runtime.yaml отклонён: раздел tun должен сохраняться без изменений"
+        return 1
+    fi
+
+    rm -f "$source_tun" "$runtime_tun"
+    return 0
+}
+
+verify_runtime_requirements(){
+    file="$1"
+
+    is_true "$(yaml_section "$file" tun enable)" || {
+        fail "В tun необходимо enable: true"
+        return 1
+    }
+
+    is_true "$(yaml_section "$file" tun auto-route)" || {
+        fail "Для маршрутизации силами Mihomo необходимо tun.auto-route: true"
+        return 1
+    }
+
+    is_true "$(yaml_section "$file" tun auto-redirect)" || {
+        fail "Для маршрутизации силами Mihomo необходимо tun.auto-redirect: true"
+        return 1
+    }
+
+    listen="$(yaml_section "$file" dns listen)"
+    [ "$listen" = "127.0.0.1:$DNS_PORT" ] || {
+        fail "runtime DNS должен слушать 127.0.0.1:$DNS_PORT"
+        return 1
+    }
+
+    return 0
+}
+
 render_runtime(){
     out="$1"
     [ -f "$CONFIG" ] || return 1
 
     cp "$CONFIG" "$out" || return 1
-    sed -i 's/\r$//' "$out" || return 1
+    sed -i 's/
+$//' "$out" || return 1
 
     controller="$(yaml_top "$CONFIG" external-controller)"
     controller_port="${controller##*:}"
-    controller_port="$(printf '%s\n' "$controller_port" | sed 's/[^0-9].*$//')"
+    controller_port="$(printf '%s
+' "$controller_port" | sed 's/[^0-9].*$//')"
     [ -n "$controller_port" ] || controller_port=9090
 
-    # Mihomo owns routing. GoshaCrash only prepares a router-compatible runtime.
+    # Меняется только адрес API. Остальные корневые параметры пользователя
+    # сохраняются, включая ipv6, find-process-mode и external-ui-url.
     awk -v cp="$controller_port" '
-        BEGIN {
-            print "external-controller: 0.0.0.0:" cp
-            print "external-ui: ui"
-            print "find-process-mode: off"
-            print "ipv6: false"
-        }
+        BEGIN { seen=0 }
         /^[^[:space:]#][^:]*:[[:space:]]*/ {
             key=$0
             sub(/:.*/, "", key)
-            if (key == "redir-port" ||
-                key == "tproxy-port" ||
-                key == "routing-mark" ||
-                key == "external-controller" ||
-                key == "external-ui" ||
-                key == "external-ui-url" ||
-                key == "find-process-mode" ||
-                key == "ipv6")
+            if (key == "external-controller") {
+                print "external-controller: 0.0.0.0:" cp
+                seen=1
                 next
+            }
         }
         { print }
-    ' "$out" > "$out.top" || return 1
-    mv -f "$out.top" "$out" || return 1
+        END {
+            if (!seen) {
+                print ""
+                print "external-controller: 0.0.0.0:" cp
+            }
+        }
+    ' "$out" > "$out.controller" || return 1
+    mv -f "$out.controller" "$out" || return 1
 
-    sed -i '/^[[:space:]]*global-client-fingerprint:/d' "$out"
-    if grep -q '^[[:space:]]*geo-auto-update:' "$out"; then
-        sed -i 's/^[[:space:]]*geo-auto-update:.*/geo-auto-update: false/' "$out"
-    else
+    grep -Eq '^external-ui:[[:space:]]*' "$out" ||
         printf '
-geo-auto-update: false
+external-ui: ui
 ' >> "$out"
-    fi
 
     if ! grep -Eq '^dns:[[:space:]]*($|#)' "$out"; then
         cat >> "$out" <<DNS_RUNTIME
@@ -395,92 +471,77 @@ dns:
   enable: true
   listen: 127.0.0.1:$DNS_PORT
   ipv6: false
-  use-system-hosts: false
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
-  default-nameserver: [1.1.1.1, 9.9.9.9]
-  nameserver: [1.1.1.1, 9.9.9.9]
-  proxy-server-nameserver: [1.1.1.1, 9.9.9.9]
-  direct-nameserver: [1.1.1.1, 9.9.9.9]
+  nameserver:
+    - 1.1.1.1
+    - 9.9.9.9
 DNS_RUNTIME
     fi
 
-    # Force the DNS listener and disable IPv6 inside the dns section.
+    # На ASUS порт 53 занят dnsmasq. В существующем DNS-разделе меняется
+    # исключительно listen. Остальные поля DNS сохраняются.
     awk -v p="$DNS_PORT" '
-      function finish_dns(){
-        if (!seen_listen) print "  listen: 127.0.0.1:" p
-        if (!seen_ipv6) print "  ipv6: false"
-      }
-      /^dns:[[:space:]]*($|#)/ {
-        d=1
-        seen_listen=0
-        seen_ipv6=0
-        print
-        next
-      }
-      d && /^[^[:space:]#]/ {
-        finish_dns()
-        d=0
-      }
-      d && /^[[:space:]]+listen:[[:space:]]*/ {
-        print "  listen: 127.0.0.1:" p
-        seen_listen=1
-        next
-      }
-      d && /^[[:space:]]+ipv6:[[:space:]]*/ {
-        print "  ipv6: false"
-        seen_ipv6=1
-        next
-      }
-      {print}
-      END {
-        if (d) finish_dns()
-      }
+        function finish_dns() {
+            if (!seen_listen)
+                print "  listen: 127.0.0.1:" p
+        }
+        /^dns:[[:space:]]*($|#)/ {
+            inside=1
+            seen_listen=0
+            print
+            next
+        }
+        inside && /^[^[:space:]#]/ {
+            finish_dns()
+            inside=0
+        }
+        inside && /^[[:space:]]+listen:[[:space:]]*/ {
+            print "  listen: 127.0.0.1:" p
+            seen_listen=1
+            next
+        }
+        { print }
+        END {
+            if (inside)
+                finish_dns()
+        }
     ' "$out" > "$out.dns" || return 1
     mv -f "$out.dns" "$out" || return 1
 
-    # Nameservers and proxy-server-nameserver are preserved exactly as
-    # written by the user. Only the local DNS listener is adapted for ASUSWRT.
+    # Критическая гарантия: tun из config.yaml попадает в runtime.yaml
+    # без добавления route-exclude-address, table/rule index, strict-route
+    # и без смены stack, device или auto-*.
+    verify_runtime_preserves_tun "$CONFIG" "$out" || return 1
+    verify_runtime_requirements "$out" || return 1
+}
 
-    # Mihomo creates routes and transparent-redirection rules itself.
-    # No iptables/ip-rule/ip-route rules are created by GoshaCrash.
-    awk -v dev="$TUN_DEVICE" -v mtu="$TUN_MTU" -v table="$TUN_TABLE" -v rule="$TUN_RULE_INDEX" '
-      function emit(){
-        print "tun:"
-        print "  enable: true"
-        print "  stack: system"
-        print "  device: " dev
-        print "  mtu: " mtu
-        print "  dns-hijack:"
-        print "    - any:53"
-        print "    - tcp://any:53"
-        print "  auto-route: true"
-        print "  auto-redirect: true"
-        print "  auto-detect-interface: true"
-        print "  strict-route: false"
-        print "  iproute2-table-index: " table
-        print "  iproute2-rule-index: " rule
-        print "  route-exclude-address:"
-        print "    - 10.10.10.0/24"
-        print "    - 127.0.0.0/8"
-        print "    - 169.254.0.0/16"
-        print "    - 172.16.0.0/12"
-        print "    - 192.168.0.0/16"
-        print "    - 224.0.0.0/4"
-        print "    - 240.0.0.0/4"
-      }
-      /^tun:[[:space:]]*($|#)/ {
-        if (!done) { emit(); done=1 }
-        skip=1
-        next
-      }
-      skip && /^[^[:space:]#]/ {skip=0}
-      !skip {print}
-      END {
-        if (!done) { print ""; emit() }
-      }
-    ' "$out" > "$out.tun" || return 1
-    mv -f "$out.tun" "$out" || return 1
+runtime_audit(){
+    [ -f "$RUNTIME" ] || {
+        fail "Нет $RUNTIME"
+        return 1
+    }
+
+    verify_runtime_preserves_tun "$CONFIG" "$RUNTIME" || return 1
+    verify_runtime_requirements "$RUNTIME" || return 1
+
+    echo "runtime.yaml: OK"
+    echo "Изменения GoshaCrash:"
+    echo "  external-controller -> $(yaml_top "$RUNTIME" external-controller)"
+    echo "  dns.listen -> $(yaml_section "$RUNTIME" dns listen)"
+    echo "Раздел tun сохранён без изменений:"
+    audit_tun="/tmp/goshacrash-tun-audit.$$"
+    extract_yaml_section "$RUNTIME" tun "$audit_tun"
+    cat "$audit_tun"
+    rm -f "$audit_tun"
+}
+
+runtime_render_only(){
+    ensure_dirs || return 1
+    candidate="$BASE/run/runtime.render-test.yaml"
+    rm -f "$candidate"
+    render_runtime "$candidate" || return 1
+    echo "$candidate"
 }
 
 running_pid(){
@@ -865,6 +926,14 @@ dns:
 
 tun:
   enable: true
+  stack: mixed
+  device: tun
+  dns-hijack:
+    - "any:53"
+    - "tcp://any:53"
+  auto-route: true
+  auto-redirect: true
+  auto-detect-interface: true
 
 proxies: []
 
@@ -1002,9 +1071,8 @@ watchdog_local_ok(){
     ip link show "$d" >/dev/null 2>&1 ||
         ifconfig "$d" >/dev/null 2>&1 || return 1
 
-    # These are generated by Mihomo auto-route, not by GoshaCrash.
-    ip route show table "$TUN_TABLE" 2>/dev/null | grep -q . || return 1
-    ip rule show 2>/dev/null | grep -q "lookup $TUN_TABLE" || return 1
+    # Номера таблиц и правил выбирает Mihomo. Фактическую работоспособность
+    # маршрутизации проверяет end-to-end HTTPS probe.
     return 0
 }
 
@@ -1189,9 +1257,10 @@ status(){
         echo "TUN: $d не найден"
     fi
 
-    echo "Mihomo TUN: auto-route=true"
-    echo "Mihomo TUN: auto-redirect=true"
-    echo "Mihomo TUN: auto-detect-interface=true"
+    echo "Mihomo TUN: stack=$(yaml_section "$RUNTIME" tun stack)"
+    echo "Mihomo TUN: auto-route=$(yaml_section "$RUNTIME" tun auto-route)"
+    echo "Mihomo TUN: auto-redirect=$(yaml_section "$RUNTIME" tun auto-redirect)"
+    echo "Mihomo TUN: auto-detect-interface=$(yaml_section "$RUNTIME" tun auto-detect-interface)"
 
     if p="$(watchdog_pid)"; then
         echo "WAN watchdog: работает, PID=$p"
@@ -1232,9 +1301,12 @@ doctor(){
     ' "$RUNTIME" 2>/dev/null
     echo
 
-    echo "=== routes created by Mihomo ==="
-    ip rule show 2>/dev/null | grep -E "($TUN_TABLE|$TUN_RULE_INDEX)" || true
-    ip route show table "$TUN_TABLE" 2>/dev/null || true
+    echo "=== routes and rules created by Mihomo ==="
+    ip rule show 2>/dev/null || true
+    echo "--- main table ---"
+    ip route show 2>/dev/null || true
+    echo "--- table 2022, only if Mihomo selected it ---"
+    ip route show table 2022 2>/dev/null || true
     echo
 
     echo "=== firewall objects visible after Mihomo start ==="
@@ -1309,6 +1381,7 @@ GoshaCrash 0.9.0-rc1
   goshacrash ui              показать адрес Zashboard
   goshacrash update          обновить Mihomo и Zashboard
   goshacrash watchdog-status состояние watchdog
+  goshacrash runtime-audit   проверить неизменность tun
 USAGE
 }
 
@@ -1324,6 +1397,8 @@ case "${1:-menu}" in
  ui) c="$(yaml_top "$RUNTIME" external-controller)"; [ -n "$c" ] || c=0.0.0.0:9090; p="${c##*:}"; p="$(echo "$p"|sed 's/[^0-9].*$//')"; echo "http://$(lan_ip):${p:-9090}/ui/";;
  update) update_all;;
  watchdog-status) watchdog_status;;
+ runtime-audit) runtime_audit;;
+ runtime-render) runtime_render_only;;
  help|-h|--help) usage;;
 
  # Служебные команды — не показываются в пользовательском меню.

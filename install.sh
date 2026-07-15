@@ -1,11 +1,11 @@
 #!/bin/sh
-# BUILD: 2026-07-15-mihomo-managed-routing-package-installer-090rc1
+# BUILD: 2026-07-15-preserve-user-tun-runtime-safe-controller-installer-090rc1
 # GoshaCrash 0.9.0-rc1 installer.
 # Public runtime consists of two shell files: install.sh and goshacrash.
 
 INSTALLER_VERSION="0.9.0-rc1"
 EXPECTED_CONTROLLER_VERSION="0.9.0-rc1"
-EXPECTED_CONTROLLER_BUILD="2026-07-15-mihomo-managed-routing-watchdog-package1-090rc1"
+EXPECTED_CONTROLLER_BUILD="2026-07-15-preserve-user-tun-runtime-package2-090rc1"
 
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
@@ -242,7 +242,8 @@ install_controller(){
             GOSHACRASH_BASE="$base" "$target" install
             ;;
         controller-only)
-            GOSHACRASH_BASE="$base" "$target" apply
+            say "Контроллер заменён без применения config.yaml"
+            say "Дальше: скопируй личный config.yaml, затем выполни goshacrash check и goshacrash apply"
             ;;
         update)
             GOSHACRASH_BASE="$base" "$target" update
@@ -272,7 +273,7 @@ case "$ACTION" in
         cat <<'HELP'
 Использование:
   sh install.sh install
-  sh install.sh controller-only
+  sh install.sh controller-only   # заменить только контроллер, не применять конфиг
   sh install.sh update
   sh install.sh remove
 
