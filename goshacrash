@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-15-preserve-user-tun-runtime-package4-090rc1
-# GoshaCrash 0.9.0-rc1 — single-file controller for Mihomo, Zashboard and stock ASUSWRT.
+# BUILD: 2026-07-15-legacy-tun-routing-090rc2
+# GoshaCrash 0.9.0-rc2 — Mihomo, Zashboard and legacy-compatible TUN routing for stock ASUSWRT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-VERSION="0.9.0-rc1"
-BUILD_ID="2026-07-15-preserve-user-tun-runtime-package4-090rc1"
+VERSION="0.9.0-rc2"
+BUILD_ID="2026-07-15-legacy-tun-routing-090rc2"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
@@ -24,11 +24,16 @@ STATE="$BASE/state"
 JFFS_BASE="/jffs/addons/goshacrash"
 JFFS_BASE_FILE="$JFFS_BASE/base"
 DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
+ROUTE_HELPER="$BASE/goshacrash-route"
 
-TUN_DEVICE="${GOSHACRASH_TUN_DEVICE:-tun}"
+TUN_DEVICE="${GOSHACRASH_TUN_DEVICE:-goshatun}"
 TUN_MTU="${GOSHACRASH_TUN_MTU:-1500}"
 TUN_TABLE="${GOSHACRASH_TUN_TABLE:-2022}"
-TUN_RULE_INDEX="${GOSHACRASH_TUN_RULE_INDEX:-9000}"
+TUN_RULE_INDEX="${GOSHACRASH_TUN_RULE_PREF:-10010}"
+TUN_MARK="${GOSHACRASH_TUN_MARK:-0x2333}"
+OUTBOUND_MARK_DEC="${GOSHACRASH_OUTBOUND_MARK_DEC:-9012}"
+OUTBOUND_MARK_HEX="${GOSHACRASH_OUTBOUND_MARK:-0x2334}"
+ROUTE_ROUTER="${GOSHACRASH_ROUTE_ROUTER:-1}"
 
 # These names are cleanup-only. GoshaCrash never creates them anymore.
 LEGACY_MANGLE_CHAIN="GOSHACRASH_TUN"
@@ -348,76 +353,54 @@ extract_yaml_section(){
     output="$3"
 
     awk -v section="$section" '
-        {
-            sub(/\r$/, "")
-        }
+        { sub(/\r$/, "") }
         $0 ~ "^" section ":[[:space:]]*($|#)" {
             inside=1
             print
             next
         }
-        inside && /^[^[:space:]#]/ {
-            exit
-        }
-        inside {
-            print
-        }
+        inside && /^[^[:space:]#]/ { exit }
+        inside { print }
     ' "$file" > "$output"
-}
-
-verify_runtime_preserves_tun(){
-    source_file="$1"
-    runtime_file="$2"
-    source_tun="$BASE/run/tun.source.$$"
-    runtime_tun="$BASE/run/tun.runtime.$$"
-
-    extract_yaml_section "$source_file" tun "$source_tun" || return 1
-    extract_yaml_section "$runtime_file" tun "$runtime_tun" || {
-        rm -f "$source_tun" "$runtime_tun"
-        return 1
-    }
-
-    if [ ! -s "$source_tun" ]; then
-        rm -f "$source_tun" "$runtime_tun"
-        fail "В config.yaml отсутствует раздел tun:"
-        return 1
-    fi
-
-    if ! cmp -s "$source_tun" "$runtime_tun"; then
-        warn "GoshaCrash обнаружил изменение пользовательского раздела tun:"
-        diff -u "$source_tun" "$runtime_tun" 2>/dev/null || true
-        rm -f "$source_tun" "$runtime_tun"
-        fail "runtime.yaml отклонён: раздел tun должен сохраняться без изменений"
-        return 1
-    fi
-
-    rm -f "$source_tun" "$runtime_tun"
-    return 0
 }
 
 verify_runtime_requirements(){
     file="$1"
 
     is_true "$(yaml_section "$file" tun enable)" || {
-        fail "В tun необходимо enable: true"
+        fail "runtime: tun.enable должен быть true"
         return 1
     }
 
-    is_true "$(yaml_section "$file" tun auto-route)" || {
-        fail "Для маршрутизации силами Mihomo необходимо tun.auto-route: true"
+    [ "$(yaml_section "$file" tun stack)" = system ] || {
+        fail "runtime: на этом ASUS используется только tun.stack=system"
         return 1
     }
 
-    # auto-redirect не обязателен. На старом ASUSWRT его можно отключать,
-    # оставляя auto-route под управлением самого Mihomo.
-    auto_redirect="$(yaml_section "$file" tun auto-redirect)"
-    case "$auto_redirect" in
-        true|false|1|0|yes|no|on|off|"") ;;
-        *)
-            fail "tun.auto-redirect должен быть true или false"
-            return 1
-            ;;
-    esac
+    is_true "$(yaml_section "$file" tun auto-route)" && {
+        fail "runtime: tun.auto-route должен быть false"
+        return 1
+    }
+
+    is_true "$(yaml_section "$file" tun auto-redirect)" && {
+        fail "runtime: tun.auto-redirect должен быть false"
+        return 1
+    }
+
+    is_true "$(yaml_section "$file" tun auto-detect-interface)" && {
+        fail "runtime: tun.auto-detect-interface должен быть false"
+        return 1
+    }
+
+    [ "$(yaml_section "$file" tun device)" = "$TUN_DEVICE" ] || {
+        fail "runtime: ожидается tun.device=$TUN_DEVICE"
+        return 1
+    }
+
+    [ "$(yaml_top "$file" routing-mark)" = "$OUTBOUND_MARK_DEC" ] || {
+        fail "runtime: ожидается routing-mark=$OUTBOUND_MARK_DEC"
+        return 1
+    }
 
     listen="$(yaml_section "$file" dns listen)"
     [ "$listen" = "127.0.0.1:$DNS_PORT" ] || {
@@ -433,45 +416,64 @@ render_runtime(){
     [ -f "$CONFIG" ] || return 1
 
     cp "$CONFIG" "$out" || return 1
-
-    # Нормализация CRLF без sed: старый BusyBox sed на ASUS выдавал
-    # "sed: unmatched '/'" на выражении с буквальным CR.
     tr -d '\r' < "$out" > "$out.lf" || return 1
     mv -f "$out.lf" "$out" || return 1
 
-    controller="$(yaml_top "$CONFIG" external-controller)"
-    controller_port="${controller##*:}"
+    controller_addr="$(yaml_top "$CONFIG" external-controller)"
+    controller_port="${controller_addr##*:}"
     case "$controller_port" in
         ''|*[!0-9]*) controller_port=9090;;
     esac
 
-    # Меняется только адрес API. Остальные корневые параметры пользователя
-    # сохраняются, включая ipv6, find-process-mode и external-ui-url.
-    awk -v cp="$controller_port" '
-        BEGIN { seen=0 }
+    # Корневые runtime-параметры под старый ASUSWRT:
+    # API открыт в LAN, IPv6/поиск процессов отключены, а исходящие сокеты
+    # Mihomo получают отдельную метку для защиты от зацикливания.
+    awk -v cp="$controller_port" -v mark="$OUTBOUND_MARK_DEC" '
+        BEGIN {
+            have_controller=0
+            have_mark=0
+            have_ipv6=0
+            have_find=0
+        }
         /^[^[:space:]#][^:]*:[[:space:]]*/ {
             key=$0
             sub(/:.*/, "", key)
+
             if (key == "external-controller") {
                 print "external-controller: 0.0.0.0:" cp
-                seen=1
+                have_controller=1
                 next
             }
+            if (key == "routing-mark") {
+                print "routing-mark: " mark
+                have_mark=1
+                next
+            }
+            if (key == "ipv6") {
+                print "ipv6: false"
+                have_ipv6=1
+                next
+            }
+            if (key == "find-process-mode") {
+                print "find-process-mode: off"
+                have_find=1
+                next
+            }
+            if (key == "redir-port" || key == "tproxy-port")
+                next
         }
         { print }
         END {
-            if (!seen) {
-                print ""
-                print "external-controller: 0.0.0.0:" cp
-            }
+            if (!have_controller) print "external-controller: 0.0.0.0:" cp
+            if (!have_mark) print "routing-mark: " mark
+            if (!have_ipv6) print "ipv6: false"
+            if (!have_find) print "find-process-mode: off"
         }
-    ' "$out" > "$out.controller" || return 1
-    mv -f "$out.controller" "$out" || return 1
+    ' "$out" > "$out.root" || return 1
+    mv -f "$out.root" "$out" || return 1
 
     grep -Eq '^external-ui:[[:space:]]*' "$out" ||
-        printf '
-external-ui: ui
-' >> "$out"
+        printf '\nexternal-ui: ui\n' >> "$out"
 
     if ! grep -Eq '^dns:[[:space:]]*($|#)' "$out"; then
         cat >> "$out" <<DNS_RUNTIME
@@ -488,16 +490,17 @@ dns:
 DNS_RUNTIME
     fi
 
-    # На ASUS порт 53 занят dnsmasq. В существующем DNS-разделе меняется
-    # исключительно listen. Остальные поля DNS сохраняются.
+    # В DNS меняются только listen и IPv6. Остальные пользовательские
+    # nameserver/policy/fallback/hosts сохраняются.
     awk -v p="$DNS_PORT" '
         function finish_dns() {
-            if (!seen_listen)
-                print "  listen: 127.0.0.1:" p
+            if (!seen_listen) print "  listen: 127.0.0.1:" p
+            if (!seen_ipv6) print "  ipv6: false"
         }
         /^dns:[[:space:]]*($|#)/ {
             inside=1
             seen_listen=0
+            seen_ipv6=0
             print
             next
         }
@@ -510,19 +513,53 @@ DNS_RUNTIME
             seen_listen=1
             next
         }
-        { print }
-        END {
-            if (inside)
-                finish_dns()
+        inside && /^[[:space:]]+ipv6:[[:space:]]*/ {
+            print "  ipv6: false"
+            seen_ipv6=1
+            next
         }
+        { print }
+        END { if (inside) finish_dns() }
     ' "$out" > "$out.dns" || return 1
     mv -f "$out.dns" "$out" || return 1
 
-    # Критическая гарантия: tun из config.yaml попадает в runtime.yaml
-    # без добавления route-exclude-address, table/rule index, strict-route
-    # и без смены stack, device или auto-*.
-    verify_runtime_preserves_tun "$CONFIG" "$out" || return 1
-    verify_runtime_requirements "$out" || return 1
+    # TUN в runtime всегда совместимый. Личный config.yaml не изменяется.
+    awk -v dev="$TUN_DEVICE" -v mtu="$TUN_MTU" '
+        function emit() {
+            print "tun:"
+            print "  enable: true"
+            print "  stack: system"
+            print "  device: " dev
+            print "  mtu: " mtu
+            print "  dns-hijack:"
+            print "    - any:53"
+            print "    - tcp://any:53"
+            print "  auto-route: false"
+            print "  auto-redirect: false"
+            print "  auto-detect-interface: false"
+            print "  strict-route: false"
+            print "  gso: false"
+        }
+        /^tun:[[:space:]]*($|#)/ {
+            if (!done) {
+                emit()
+                done=1
+            }
+            skip=1
+            next
+        }
+        skip && /^[^[:space:]#]/ { skip=0 }
+        !skip { print }
+        END {
+            if (!done) {
+                print ""
+                emit()
+            }
+        }
+    ' "$out" > "$out.tun" || return 1
+    mv -f "$out.tun" "$out" || return 1
+
+    verify_runtime_requirements "$out"
 }
 
 runtime_audit(){
@@ -531,14 +568,16 @@ runtime_audit(){
         return 1
     }
 
-    verify_runtime_preserves_tun "$CONFIG" "$RUNTIME" || return 1
     verify_runtime_requirements "$RUNTIME" || return 1
 
     echo "runtime.yaml: OK"
-    echo "Изменения GoshaCrash:"
+    echo "GoshaCrash меняет только транспортные параметры:"
     echo "  external-controller -> $(yaml_top "$RUNTIME" external-controller)"
+    echo "  routing-mark -> $(yaml_top "$RUNTIME" routing-mark)"
+    echo "  ipv6 -> $(yaml_top "$RUNTIME" ipv6)"
+    echo "  find-process-mode -> $(yaml_top "$RUNTIME" find-process-mode)"
     echo "  dns.listen -> $(yaml_section "$RUNTIME" dns listen)"
-    echo "Раздел tun сохранён без изменений:"
+    echo "Совместимый TUN:"
     audit_tun="/tmp/goshacrash-tun-audit.$$"
     extract_yaml_section "$RUNTIME" tun "$audit_tun"
     cat "$audit_tun"
@@ -613,41 +652,37 @@ wait_tun(){
     return 1
 }
 
+route_helper(){
+    [ -x "$ROUTE_HELPER" ] || {
+        fail "Не найден routing helper: $ROUTE_HELPER"
+        return 1
+    }
+
+    GOSHACRASH_BASE="$BASE" \
+    GOSHACRASH_TUN_DEVICE="$(tun_device)" \
+    GOSHACRASH_TUN_TABLE="$TUN_TABLE" \
+    GOSHACRASH_TUN_RULE_PREF="$TUN_RULE_INDEX" \
+    GOSHACRASH_TUN_MARK="$TUN_MARK" \
+    GOSHACRASH_OUTBOUND_MARK="$OUTBOUND_MARK_HEX" \
+    GOSHACRASH_ROUTE_ROUTER="$ROUTE_ROUTER" \
+    MIHOMO_DNS_PORT="$DNS_PORT" \
+        "$ROUTE_HELPER" "$1" "$(tun_device)"
+}
+
 cleanup_legacy_network(){
-    # Remove only rules created by older GoshaCrash builds.
-    # No new routing/firewall rules are created here.
-    for i in $(lan_ifaces); do
-        while iptables -t mangle -D PREROUTING -i "$i" -j "$LEGACY_MANGLE_CHAIN" 2>/dev/null; do :; done
-        while iptables -t nat -D PREROUTING -i "$i" -p tcp -j "$LEGACY_REDIR_CHAIN" 2>/dev/null; do :; done
-        while iptables -t nat -D PREROUTING -i "$i" -p udp --dport 53 -j "$LEGACY_DNS_CHAIN" 2>/dev/null; do :; done
-        while iptables -t nat -D PREROUTING -i "$i" -p tcp --dport 53 -j "$LEGACY_DNS_CHAIN" 2>/dev/null; do :; done
-    done
-
-    while iptables -t mangle -D OUTPUT -j "$LEGACY_ROUTER_TUN_CHAIN" 2>/dev/null; do :; done
-    while iptables -t nat -D OUTPUT -p tcp -j "$LEGACY_ROUTER_TCP_CHAIN" 2>/dev/null; do :; done
-    while iptables -t nat -D OUTPUT -p udp --dport 53 -j "$LEGACY_ROUTER_DNS_CHAIN" 2>/dev/null; do :; done
-    while iptables -t nat -D OUTPUT -p tcp --dport 53 -j "$LEGACY_ROUTER_DNS_CHAIN" 2>/dev/null; do :; done
-    while iptables -D FORWARD -j "$LEGACY_FILTER_CHAIN" 2>/dev/null; do :; done
-
-    for c in "$LEGACY_MANGLE_CHAIN" "$LEGACY_ROUTER_TUN_CHAIN"; do
-        iptables -t mangle -F "$c" 2>/dev/null || true
-        iptables -t mangle -X "$c" 2>/dev/null || true
-    done
-    for c in "$LEGACY_DNS_CHAIN" "$LEGACY_REDIR_CHAIN" "$LEGACY_ROUTER_TCP_CHAIN" "$LEGACY_ROUTER_DNS_CHAIN"; do
-        iptables -t nat -F "$c" 2>/dev/null || true
-        iptables -t nat -X "$c" 2>/dev/null || true
-    done
-    iptables -F "$LEGACY_FILTER_CHAIN" 2>/dev/null || true
-    iptables -X "$LEGACY_FILTER_CHAIN" 2>/dev/null || true
-
-    while ip rule del fwmark 0x2333 table 2022 pref 10010 2>/dev/null; do :; done
-    while ip rule del fwmark 0x2333 table 2022 2>/dev/null; do :; done
-    ip route flush table 2022 2>/dev/null || true
-    ip route flush cache 2>/dev/null || true
+    if [ -x "$ROUTE_HELPER" ]; then
+        route_helper stop >/dev/null 2>&1 || true
+    else
+        while ip rule del fwmark "$TUN_MARK" table "$TUN_TABLE" pref "$TUN_RULE_INDEX" 2>/dev/null; do :; done
+        while ip rule del fwmark "$TUN_MARK" table "$TUN_TABLE" 2>/dev/null; do :; done
+        ip route flush table "$TUN_TABLE" 2>/dev/null || true
+        ip route flush cache 2>/dev/null || true
+    fi
 }
 
 start_mihomo(){
     if p="$(running_pid)"; then
+        route_helper reload || return 1
         [ "${GOSHACRASH_WATCHDOG_INTERNAL:-0}" = 1 ] || watchdog_start || true
         echo "Mihomo уже запущен, PID=$p"
         return 0
@@ -655,6 +690,10 @@ start_mihomo(){
 
     [ -f "$RUNTIME" ] || {
         fail "Сначала выполни: goshacrash apply"
+        return 1
+    }
+    [ -x "$ROUTE_HELPER" ] || {
+        fail "Не установлен $ROUTE_HELPER"
         return 1
     }
     ensure_tun || {
@@ -694,16 +733,23 @@ start_mihomo(){
         return 1
     }
 
+    route_helper start || {
+        kill_mihomo
+        cleanup_legacy_network
+        fail "Совместимая маршрутизация не поднялась"
+        return 1
+    }
+
     echo "Mihomo запущен, PID=$(cat "$PIDFILE" 2>/dev/null)"
-    echo "[GoshaCrash] Маршрутизацией управляет Mihomo; параметры auto-route/auto-redirect взяты из config.yaml"
+    echo "[GoshaCrash] Схема: Mihomo TUN auto-route=off; iptables/ip rule/ip route создаёт goshacrash-route"
     [ "${GOSHACRASH_WATCHDOG_INTERNAL:-0}" = 1 ] || watchdog_start || true
 }
 
 stop_mihomo(){
     [ "${GOSHACRASH_WATCHDOG_INTERNAL:-0}" = 1 ] || watchdog_stop
-    kill_mihomo
     cleanup_legacy_network
-    echo "Mihomo остановлен"
+    kill_mihomo
+    echo "Mihomo и совместимая маршрутизация остановлены"
 }
 
 backup_config(){
@@ -853,6 +899,7 @@ restore_config(){
 
 install_all(){
     ensure_dirs || return 1
+    [ -x "$ROUTE_HELPER" ] || { fail "Не установлен $ROUTE_HELPER"; return 1; }
     write_default_config || return 1
     install_core || { fail "Установка Mihomo не завершена"; return 1; }
     install_ui || { fail "Установка Zashboard не завершена"; return 1; }
@@ -868,9 +915,8 @@ update_all(){
 
 # -----------------------------------------------------------------------------
 # Router runtime defaults.
-# Mihomo itself creates TUN routes and transparent-redirection rules through
-# auto-route/auto-redirect. GoshaCrash only generates runtime.yaml, starts the
-# service, removes rules left by older builds and runs the WAN watchdog.
+# Mihomo creates only a system-stack TUN. A separate helper creates old-kernel-
+# compatible MARK/ip rule/ip route/iptables rules and removes them on stop.
 # -----------------------------------------------------------------------------
 
 write_default_config(){
@@ -935,14 +981,16 @@ dns:
 
 tun:
   enable: true
-  stack: mixed
-  device: tun
+  stack: system
+  device: goshatun
+  mtu: 1500
   dns-hijack:
     - "any:53"
     - "tcp://any:53"
-  auto-route: true
-  auto-redirect: true
-  auto-detect-interface: true
+  auto-route: false
+  auto-redirect: false
+  auto-detect-interface: false
+  strict-route: false
 
 proxies: []
 
@@ -1080,8 +1128,7 @@ watchdog_local_ok(){
     ip link show "$d" >/dev/null 2>&1 ||
         ifconfig "$d" >/dev/null 2>&1 || return 1
 
-    # Номера таблиц и правил выбирает Mihomo. Фактическую работоспособность
-    # маршрутизации проверяет end-to-end HTTPS probe.
+    route_helper status >/dev/null 2>&1 || return 1
     return 0
 }
 
@@ -1158,9 +1205,9 @@ watchdog_loop(){
         fi
 
         if running_pid >/dev/null 2>&1 && ! watchdog_local_ok; then
-            watchdog_log "TUN или auto-route Mihomo повреждены; выполняется мягкий перезапуск Mihomo"
-            watchdog_soft_restart || true
-            sleep 8
+            watchdog_log "TUN или совместимая маршрутизация повреждены; сначала пересоздаются правила"
+            route_helper reload >/dev/null 2>&1 || watchdog_soft_restart || true
+            sleep 5
         fi
 
         if ! running_pid >/dev/null 2>&1; then
@@ -1192,9 +1239,9 @@ watchdog_loop(){
 
             if [ "$last_action" -eq 0 ] ||
                [ "$elapsed" -ge "$WATCHDOG_ACTION_COOLDOWN" ]; then
-                watchdog_log "Порог ошибок достигнут; Mihomo будет перезапущен для пересоздания auto-route/auto-redirect"
-                watchdog_soft_restart || true
-                sleep 8
+                watchdog_log "Порог ошибок достигнут; пересоздаются совместимые правила маршрутизации"
+                route_helper reload >/dev/null 2>&1 || watchdog_soft_restart || true
+                sleep 5
 
                 if watchdog_internet_ok; then
                     watchdog_log "Связь восстановлена после мягкого перезапуска Mihomo"
@@ -1232,20 +1279,13 @@ dns_status(){
     mihomo_ok=no
     netstat -ln 2>/dev/null | grep -Eq '[:.]53[[:space:]]' && dnsmasq_ok=yes
     netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" && mihomo_ok=yes
-    echo "dnsmasq:53=$dnsmasq_ok; Mihomo DNS:$DNS_PORT=$mihomo_ok; hijack=Mihomo TUN"
+    echo "dnsmasq:53=$dnsmasq_ok; Mihomo DNS:$DNS_PORT=$mihomo_ok; bridge=goshacrash-route"
 }
 
 firewall_reload(){
     running_pid >/dev/null 2>&1 || return 0
-    say "ASUSWRT перезапустил firewall; перезапускаю Mihomo, чтобы он заново создал auto-route/auto-redirect"
-    GOSHACRASH_WATCHDOG_INTERNAL=1
-    export GOSHACRASH_WATCHDOG_INTERNAL
-    kill_mihomo
-    sleep 2
-    start_mihomo
-    rc=$?
-    unset GOSHACRASH_WATCHDOG_INTERNAL
-    return "$rc"
+    say "ASUSWRT перезапустил firewall; пересоздаю совместимые правила"
+    route_helper reload
 }
 
 status(){
@@ -1255,7 +1295,7 @@ status(){
         echo "Mihomo: не запущен"
     fi
     echo "GoshaCrash: $VERSION"
-    echo "Режим маршрутизации: управляет Mihomo"
+    echo "Режим: system TUN + совместимая маршрутизация"
     echo "BASE: $BASE"
     echo "DNS: $(dns_status)"
 
@@ -1266,10 +1306,15 @@ status(){
         echo "TUN: $d не найден"
     fi
 
-    echo "Mihomo TUN: stack=$(yaml_section "$RUNTIME" tun stack)"
-    echo "Mihomo TUN: auto-route=$(yaml_section "$RUNTIME" tun auto-route)"
-    echo "Mihomo TUN: auto-redirect=$(yaml_section "$RUNTIME" tun auto-redirect)"
-    echo "Mihomo TUN: auto-detect-interface=$(yaml_section "$RUNTIME" tun auto-detect-interface)"
+    echo "Mihomo: auto-route=false; auto-redirect=false"
+    if route_helper status >/dev/null 2>&1; then
+        echo "GoshaRoute: работает"
+    else
+        echo "GoshaRoute: не работает"
+    fi
+    echo "LAN: TCP+UDP -> MARK $TUN_MARK -> table $TUN_TABLE -> $d"
+    [ "$ROUTE_ROUTER" = 1 ] &&
+        echo "Роутер: TCP+UDP -> TUN; исходящие сокеты Mihomo обходят петлю mark=$OUTBOUND_MARK_HEX"
 
     if p="$(watchdog_pid)"; then
         echo "WAN watchdog: работает, PID=$p"
@@ -1280,8 +1325,7 @@ status(){
     c="$(yaml_top "$RUNTIME" external-controller)"
     [ -n "$c" ] || c=0.0.0.0:9090
     p="${c##*:}"
-    p="$(echo "$p" | sed 's/[^0-9].*$//')"
-    [ -n "$p" ] || p=9090
+    case "$p" in ''|*[!0-9]*) p=9090;; esac
     echo "Zashboard: http://$(lan_ip):$p/ui/"
     s="$(yaml_top "$RUNTIME" secret)"
     [ -n "$s" ] && echo "API secret: $s"
@@ -1297,37 +1341,23 @@ doctor(){
     echo
 
     [ -x "$BIN" ] && "$BIN" -v || echo "Mihomo: NOT FOUND"
+    [ -x "$ROUTE_HELPER" ] && "$ROUTE_HELPER" version || echo "GoshaRoute: NOT FOUND"
     [ -c /dev/net/tun ] && echo "/dev/net/tun: OK" || echo "/dev/net/tun: NOT FOUND"
     echo
     status
     echo
 
     echo "=== runtime tun ==="
-    awk '
-      /^tun:[[:space:]]*($|#)/ {inside=1}
-      inside {print}
-      inside && NR>1 && /^[^[:space:]#]/ && $0 !~ /^tun:/ {exit}
-    ' "$RUNTIME" 2>/dev/null
+    extract_yaml_section "$RUNTIME" tun /tmp/goshacrash-doctor-tun.$$
+    cat /tmp/goshacrash-doctor-tun.$$ 2>/dev/null
+    rm -f /tmp/goshacrash-doctor-tun.$$
     echo
 
-    echo "=== routes and rules created by Mihomo ==="
-    ip rule show 2>/dev/null || true
-    echo "--- main table ---"
-    ip route show 2>/dev/null || true
-    echo "--- table 2022, only if Mihomo selected it ---"
-    ip route show table 2022 2>/dev/null || true
+    echo "=== compatible routing ==="
+    route_helper doctor || true
     echo
 
-    echo "=== firewall objects visible after Mihomo start ==="
-    iptables -t nat -S 2>/dev/null | grep -Ei 'mihomo|clash|meta|redirect|tproxy' || true
-    iptables -t mangle -S 2>/dev/null | grep -Ei 'mihomo|clash|meta|mark|tproxy' || true
-    echo
-
-    echo "=== old GoshaCrash rules must be absent ==="
-    iptables-save 2>/dev/null | grep 'GOSHACRASH_' || true
-    echo
-
-    echo "=== log ==="
+    echo "=== mihomo log ==="
     tail -n 100 "$LOGFILE" 2>/dev/null || true
 }
 
@@ -1377,7 +1407,7 @@ menu(){
 }
 
 usage(){ cat <<'USAGE'
-GoshaCrash 0.9.0-rc1
+GoshaCrash 0.9.0-rc2
 
 Управление:
   goshacrash                 открыть меню
@@ -1390,7 +1420,8 @@ GoshaCrash 0.9.0-rc1
   goshacrash ui              показать адрес Zashboard
   goshacrash update          обновить Mihomo и Zashboard
   goshacrash watchdog-status состояние watchdog
-  goshacrash runtime-audit   проверить неизменность tun
+  goshacrash runtime-audit   показать совместимый runtime TUN
+  goshacrash route-status    состояние iptables/ip rule/ip route
 USAGE
 }
 
@@ -1408,6 +1439,8 @@ case "${1:-menu}" in
  watchdog-status) watchdog_status;;
  runtime-audit) runtime_audit;;
  runtime-render) runtime_render_only;;
+ route-status) route_helper status;;
+ route-reload) route_helper reload;;
  help|-h|--help) usage;;
 
  # Служебные команды — не показываются в пользовательском меню.

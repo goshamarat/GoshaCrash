@@ -1,0 +1,416 @@
+#!/bin/sh
+# BUILD: 2026-07-15-legacy-tun-routing-helper-090rc2
+# Compatible TUN routing helper for stock ASUSWRT / old Linux kernels.
+
+VERSION="0.9.0-rc2"
+BUILD_ID="2026-07-15-legacy-tun-routing-helper-090rc2"
+
+BASE="${GOSHACRASH_BASE:-$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)}"
+STATE_DIR="$BASE/state/route"
+ACTIVE_FILE="$STATE_DIR/active"
+
+TUN_DEVICE="${GOSHACRASH_TUN_DEVICE:-goshatun}"
+TUN_TABLE="${GOSHACRASH_TUN_TABLE:-2022}"
+TUN_RULE_PREF="${GOSHACRASH_TUN_RULE_PREF:-10010}"
+TUN_MARK="${GOSHACRASH_TUN_MARK:-0x2333}"
+OUTBOUND_MARK="${GOSHACRASH_OUTBOUND_MARK:-0x2334}"
+DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
+ROUTE_ROUTER="${GOSHACRASH_ROUTE_ROUTER:-1}"
+PROC_SYS="${GOSHACRASH_PROC_SYS:-/proc/sys}"
+
+LAN_CHAIN="GOSHACRASH_TUN_LAN"
+ROUTER_CHAIN="GOSHACRASH_TUN_ROUTER"
+FORWARD_CHAIN="GOSHACRASH_TUN_FORWARD"
+DNS_LAN_CHAIN="GOSHACRASH_DNS_LAN"
+DNS_OUT_CHAIN="GOSHACRASH_DNS_OUT"
+
+PATH="/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin:/opt/sbin:$PATH"
+export PATH
+
+say(){ printf '%s\n' "[GoshaRoute] $*"; }
+warn(){ printf '%s\n' "[GoshaRoute:WARN] $*" >&2; }
+fail(){ printf '%s\n' "[GoshaRoute:ERROR] $*" >&2; return 1; }
+have(){ which "$1" >/dev/null 2>&1; }
+
+lan_ifaces(){
+    if [ -n "${GOSHACRASH_LAN_IFACES:-}" ]; then
+        printf '%s\n' "$GOSHACRASH_LAN_IFACES"
+        return
+    fi
+    x="$(nvram get lan_ifname 2>/dev/null)"
+    [ -n "$x" ] || x=br0
+    printf '%s\n' "$x"
+}
+
+ipt_init(){
+    IPT_WAIT=""
+    iptables -h 2>&1 | grep -q '\-w' && IPT_WAIT="-w"
+}
+
+ipt(){
+    if [ -n "$IPT_WAIT" ]; then
+        iptables -w "$@"
+    else
+        iptables "$@"
+    fi
+}
+
+remove_jump(){
+    table="$1"
+    chain="$2"
+    shift 2
+    while ipt -t "$table" -D "$chain" "$@" 2>/dev/null; do :; done
+}
+
+delete_chain(){
+    table="$1"
+    chain="$2"
+    ipt -t "$table" -F "$chain" 2>/dev/null || true
+    ipt -t "$table" -X "$chain" 2>/dev/null || true
+}
+
+reserved_destinations(){
+    cat <<'NETS'
+0.0.0.0/8
+10.0.0.0/8
+100.64.0.0/10
+127.0.0.0/8
+169.254.0.0/16
+172.16.0.0/12
+192.168.0.0/16
+224.0.0.0/4
+240.0.0.0/4
+255.255.255.255/32
+NETS
+}
+
+save_sysctl(){
+    name="$1"
+    path="$2"
+    [ -r "$path" ] || return 0
+    mkdir -p "$STATE_DIR" || return 1
+    file="$STATE_DIR/sysctl.$name"
+    [ -f "$file" ] || cat "$path" > "$file"
+}
+
+set_sysctl_zero(){
+    name="$1"
+    path="$2"
+    save_sysctl "$name" "$path" || return 1
+    [ -w "$path" ] && printf '0\n' > "$path" 2>/dev/null || true
+}
+
+prepare_sysctls(){
+    set_sysctl_zero all_rp_filter "$PROC_SYS/net/ipv4/conf/all/rp_filter"
+    set_sysctl_zero default_rp_filter "$PROC_SYS/net/ipv4/conf/default/rp_filter"
+
+    for iface in $(lan_ifaces) "$TUN_DEVICE"; do
+        safe="$(printf '%s\n' "$iface" | tr '/ ' '__')"
+        set_sysctl_zero "${safe}_rp_filter" "$PROC_SYS/net/ipv4/conf/$iface/rp_filter"
+    done
+
+    if [ -w "$PROC_SYS/net/ipv4/ip_forward" ]; then
+        printf '1\n' > "$PROC_SYS/net/ipv4/ip_forward" 2>/dev/null || true
+    fi
+}
+
+restore_sysctls(){
+    [ -d "$STATE_DIR" ] || return 0
+    for f in "$STATE_DIR"/sysctl.*; do
+        [ -f "$f" ] || continue
+        name="${f##*/sysctl.}"
+        case "$name" in
+            all_rp_filter) path="$PROC_SYS/net/ipv4/conf/all/rp_filter";;
+            default_rp_filter) path="$PROC_SYS/net/ipv4/conf/default/rp_filter";;
+            *_rp_filter)
+                iface="${name%_rp_filter}"
+                path="$PROC_SYS/net/ipv4/conf/$iface/rp_filter"
+                ;;
+            *) continue;;
+        esac
+        [ -w "$path" ] && cat "$f" > "$path" 2>/dev/null || true
+        rm -f "$f"
+    done
+}
+
+cleanup_rules(){
+    ipt_init
+
+    for iface in $(lan_ifaces); do
+        remove_jump mangle PREROUTING -i "$iface" -j "$LAN_CHAIN"
+        remove_jump nat PREROUTING -i "$iface" -p udp --dport 53 -j "$DNS_LAN_CHAIN"
+        remove_jump nat PREROUTING -i "$iface" -p tcp --dport 53 -j "$DNS_LAN_CHAIN"
+
+        # Old GoshaCrash generations.
+        remove_jump mangle PREROUTING -i "$iface" -j GOSHACRASH_TUN
+        remove_jump nat PREROUTING -i "$iface" -p tcp -j GOSHACRASH_TCP_REDIR
+        remove_jump nat PREROUTING -i "$iface" -p udp --dport 53 -j GOSHACRASH_DNS_HIJACK
+        remove_jump nat PREROUTING -i "$iface" -p tcp --dport 53 -j GOSHACRASH_DNS_HIJACK
+    done
+
+    remove_jump mangle OUTPUT -j "$ROUTER_CHAIN"
+    remove_jump nat OUTPUT -p udp --dport 53 -j "$DNS_OUT_CHAIN"
+    remove_jump nat OUTPUT -p tcp --dport 53 -j "$DNS_OUT_CHAIN"
+    remove_jump filter FORWARD -j "$FORWARD_CHAIN"
+
+    # Old GoshaCrash generations.
+    remove_jump mangle OUTPUT -j GOSHACRASH_ROUTER_TUN
+    remove_jump nat OUTPUT -p tcp -j GOSHACRASH_ROUTER_TCP
+    remove_jump nat OUTPUT -p udp --dport 53 -j GOSHACRASH_DNSMASQ_UPSTREAM
+    remove_jump nat OUTPUT -p tcp --dport 53 -j GOSHACRASH_DNSMASQ_UPSTREAM
+    remove_jump filter FORWARD -j GOSHACRASH_FORWARD
+
+    delete_chain mangle "$LAN_CHAIN"
+    delete_chain mangle "$ROUTER_CHAIN"
+    delete_chain nat "$DNS_LAN_CHAIN"
+    delete_chain nat "$DNS_OUT_CHAIN"
+    delete_chain filter "$FORWARD_CHAIN"
+
+    for c in GOSHACRASH_TUN GOSHACRASH_ROUTER_TUN; do
+        delete_chain mangle "$c"
+    done
+    for c in GOSHACRASH_DNS_HIJACK GOSHACRASH_TCP_REDIR GOSHACRASH_ROUTER_TCP GOSHACRASH_DNSMASQ_UPSTREAM; do
+        delete_chain nat "$c"
+    done
+    delete_chain filter GOSHACRASH_FORWARD
+
+    while ip rule del fwmark "$TUN_MARK" table "$TUN_TABLE" pref "$TUN_RULE_PREF" 2>/dev/null; do :; done
+    while ip rule del fwmark "$TUN_MARK" table "$TUN_TABLE" 2>/dev/null; do :; done
+    ip route flush table "$TUN_TABLE" 2>/dev/null || true
+    ip route flush cache 2>/dev/null || true
+    rm -f "$ACTIVE_FILE"
+}
+
+add_exclusions(){
+    table="$1"
+    chain="$2"
+    reserved_destinations | while read net; do
+        [ -n "$net" ] || continue
+        ipt -t "$table" -A "$chain" -d "$net" -j RETURN || exit 1
+    done
+}
+
+build_lan_chain(){
+    ipt -t mangle -N "$LAN_CHAIN" || return 1
+    ipt -t mangle -A "$LAN_CHAIN" -m mark --mark "$OUTBOUND_MARK" -j RETURN || return 1
+    ipt -t mangle -A "$LAN_CHAIN" -p udp --dport 53 -j RETURN || return 1
+    ipt -t mangle -A "$LAN_CHAIN" -p tcp --dport 53 -j RETURN || return 1
+    add_exclusions mangle "$LAN_CHAIN" || return 1
+    ipt -t mangle -A "$LAN_CHAIN" -j MARK --set-mark "$TUN_MARK" || return 1
+
+    for iface in $(lan_ifaces); do
+        ipt -t mangle -I PREROUTING 1 -i "$iface" -j "$LAN_CHAIN" || return 1
+    done
+}
+
+build_router_chain(){
+    [ "$ROUTE_ROUTER" = 1 ] || return 0
+
+    ipt -t mangle -N "$ROUTER_CHAIN" || return 1
+    ipt -t mangle -A "$ROUTER_CHAIN" -m mark --mark "$OUTBOUND_MARK" -j RETURN || return 1
+    ipt -t mangle -A "$ROUTER_CHAIN" -p udp --dport 53 -j RETURN || return 1
+    ipt -t mangle -A "$ROUTER_CHAIN" -p tcp --dport 53 -j RETURN || return 1
+    add_exclusions mangle "$ROUTER_CHAIN" || return 1
+    ipt -t mangle -A "$ROUTER_CHAIN" -j MARK --set-mark "$TUN_MARK" || return 1
+    ipt -t mangle -I OUTPUT 1 -j "$ROUTER_CHAIN" || return 1
+}
+
+build_dns(){
+    ipt -t nat -N "$DNS_LAN_CHAIN" || return 1
+    ipt -t nat -A "$DNS_LAN_CHAIN" -j REDIRECT --to-ports 53 || return 1
+
+    for iface in $(lan_ifaces); do
+        ipt -t nat -I PREROUTING 1 -i "$iface" -p udp --dport 53 -j "$DNS_LAN_CHAIN" || return 1
+        ipt -t nat -I PREROUTING 1 -i "$iface" -p tcp --dport 53 -j "$DNS_LAN_CHAIN" || return 1
+    done
+
+    ipt -t nat -N "$DNS_OUT_CHAIN" || return 1
+    ipt -t nat -A "$DNS_OUT_CHAIN" -m mark --mark "$OUTBOUND_MARK" -j RETURN || return 1
+    ipt -t nat -A "$DNS_OUT_CHAIN" -d 127.0.0.0/8 -j RETURN || return 1
+    ipt -t nat -A "$DNS_OUT_CHAIN" -j REDIRECT --to-ports "$DNS_PORT" || return 1
+
+    ipt -t nat -I OUTPUT 1 -p udp --dport 53 -j "$DNS_OUT_CHAIN" || return 1
+    ipt -t nat -I OUTPUT 1 -p tcp --dport 53 -j "$DNS_OUT_CHAIN" || return 1
+}
+
+build_forward(){
+    ipt -t filter -N "$FORWARD_CHAIN" || return 1
+    for iface in $(lan_ifaces); do
+        ipt -t filter -A "$FORWARD_CHAIN" -i "$iface" -o "$TUN_DEVICE" -j ACCEPT || return 1
+        ipt -t filter -A "$FORWARD_CHAIN" -i "$TUN_DEVICE" -o "$iface" -j ACCEPT || return 1
+    done
+    ipt -t filter -I FORWARD 1 -j "$FORWARD_CHAIN" || return 1
+}
+
+route_start(){
+    have ip || { fail "Не найдена команда ip"; return 1; }
+    have iptables || { fail "Не найдена команда iptables"; return 1; }
+
+    ip link show "$TUN_DEVICE" >/dev/null 2>&1 ||
+        ifconfig "$TUN_DEVICE" >/dev/null 2>&1 || {
+            fail "TUN-интерфейс $TUN_DEVICE не найден"
+            return 1
+        }
+
+    iptables -j MARK -h >/dev/null 2>&1 || {
+        fail "Ядро не поддерживает iptables MARK"
+        return 1
+    }
+
+    cleanup_rules
+    prepare_sysctls || {
+        cleanup_rules
+        return 1
+    }
+    ipt_init
+
+    ip route add default dev "$TUN_DEVICE" table "$TUN_TABLE" || {
+        fail "Не удалось создать default route в таблице $TUN_TABLE"
+        cleanup_rules
+        restore_sysctls
+        return 1
+    }
+
+    ip rule add fwmark "$TUN_MARK" table "$TUN_TABLE" pref "$TUN_RULE_PREF" || {
+        fail "Не удалось создать совместимое ip rule"
+        cleanup_rules
+        restore_sysctls
+        return 1
+    }
+
+    build_lan_chain || {
+        fail "Не удалось создать LAN mangle-цепочку"
+        cleanup_rules
+        restore_sysctls
+        return 1
+    }
+
+    build_router_chain || {
+        fail "Не удалось создать OUTPUT mangle-цепочку"
+        cleanup_rules
+        restore_sysctls
+        return 1
+    }
+
+    build_dns || {
+        fail "Не удалось создать DNS-перехват"
+        cleanup_rules
+        restore_sysctls
+        return 1
+    }
+
+    build_forward || {
+        fail "Не удалось создать FORWARD-правила"
+        cleanup_rules
+        restore_sysctls
+        return 1
+    }
+
+    ip route flush cache 2>/dev/null || true
+    mkdir -p "$STATE_DIR" || return 1
+    printf 'device=%s\ntable=%s\nmark=%s\nrouter=%s\n' \
+        "$TUN_DEVICE" "$TUN_TABLE" "$TUN_MARK" "$ROUTE_ROUTER" > "$ACTIVE_FILE"
+
+    say "Маршрутизация поднята: LAN -> mark $TUN_MARK -> table $TUN_TABLE -> $TUN_DEVICE"
+    [ "$ROUTE_ROUTER" = 1 ] &&
+        say "Трафик роутера также направляется в TUN; Mihomo outbound mark=$OUTBOUND_MARK исключён"
+    say "DNS: LAN -> dnsmasq:53; dnsmasq upstream -> Mihomo:$DNS_PORT"
+}
+
+route_stop(){
+    cleanup_rules
+    restore_sysctls
+    say "Совместимая маршрутизация остановлена"
+}
+
+route_status(){
+    rc=0
+    echo "GoshaRoute: $VERSION"
+    echo "TUN device: $TUN_DEVICE"
+    echo "Table: $TUN_TABLE"
+    echo "Traffic mark: $TUN_MARK"
+    echo "Mihomo outbound mark: $OUTBOUND_MARK"
+    echo "Router traffic: $ROUTE_ROUTER"
+
+    if ip link show "$TUN_DEVICE" >/dev/null 2>&1 ||
+       ifconfig "$TUN_DEVICE" >/dev/null 2>&1; then
+        echo "TUN: OK"
+    else
+        echo "TUN: MISSING"
+        rc=1
+    fi
+
+    if ip rule show 2>/dev/null | grep -q "fwmark $TUN_MARK.*lookup $TUN_TABLE\|fwmark $TUN_MARK.*table $TUN_TABLE"; then
+        echo "ip rule: OK"
+    else
+        # Старый ip может печатать mark в десятичном/другом формате.
+        ip rule show 2>/dev/null | grep -q "lookup $TUN_TABLE" &&
+            echo "ip rule: table found (format differs)" || {
+                echo "ip rule: MISSING"
+                rc=1
+            }
+    fi
+
+    ip route show table "$TUN_TABLE" 2>/dev/null | grep -q "default.*dev $TUN_DEVICE" &&
+        echo "route table: OK" || { echo "route table: MISSING"; rc=1; }
+
+    ipt_init
+    ipt -t mangle -S "$LAN_CHAIN" >/dev/null 2>&1 &&
+        echo "LAN chain: OK" || { echo "LAN chain: MISSING"; rc=1; }
+
+    ipt -t nat -S "$DNS_OUT_CHAIN" >/dev/null 2>&1 &&
+        echo "DNS bridge: OK" || { echo "DNS bridge: MISSING"; rc=1; }
+
+    return "$rc"
+}
+
+route_doctor(){
+    route_status || true
+    echo
+    echo "=== ip rule ==="
+    ip rule show 2>/dev/null || true
+    echo
+    echo "=== table $TUN_TABLE ==="
+    ip route show table "$TUN_TABLE" 2>/dev/null || true
+    echo
+    echo "=== mangle ==="
+    iptables -t mangle -L "$LAN_CHAIN" -n -v 2>/dev/null || true
+    iptables -t mangle -L "$ROUTER_CHAIN" -n -v 2>/dev/null || true
+    echo
+    echo "=== nat DNS ==="
+    iptables -t nat -L "$DNS_LAN_CHAIN" -n -v 2>/dev/null || true
+    iptables -t nat -L "$DNS_OUT_CHAIN" -n -v 2>/dev/null || true
+    echo
+    echo "=== filter ==="
+    iptables -L "$FORWARD_CHAIN" -n -v 2>/dev/null || true
+}
+
+case "${1:-status}" in
+    start)
+        [ -n "${2:-}" ] && TUN_DEVICE="$2"
+        route_start
+        ;;
+    reload)
+        [ -n "${2:-}" ] && TUN_DEVICE="$2"
+        route_start
+        ;;
+    stop)
+        [ -n "${2:-}" ] && TUN_DEVICE="$2"
+        route_stop
+        ;;
+    status)
+        [ -n "${2:-}" ] && TUN_DEVICE="$2"
+        route_status
+        ;;
+    doctor)
+        [ -n "${2:-}" ] && TUN_DEVICE="$2"
+        route_doctor
+        ;;
+    version)
+        echo "$VERSION"
+        ;;
+    *)
+        echo "Usage: goshacrash-route {start|reload|stop|status|doctor} [tun-device]"
+        exit 1
+        ;;
+esac
