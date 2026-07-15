@@ -1,12 +1,19 @@
 #!/bin/sh
-# BUILD: 2026-07-15-transparent-proxy-7892-menu-fixed-090rc5
-# GoshaCrash 0.9.0-rc5 — transparent TCP proxy + UDP TUN for stock ASUSWRT.
+# BUILD: 2026-07-16-pure-tun-gvisor-armv5-090rc6
+# GoshaCrash 0.9.0-rc6 — pure TUN with custom ARMv5 gVisor Mihomo.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-VERSION="0.9.0-rc5"
-BUILD_ID="2026-07-15-transparent-proxy-7892-menu-fixed-090rc5"
+VERSION="0.9.0-rc6"
+BUILD_ID="2026-07-16-pure-tun-gvisor-armv5-090rc6"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
+
+MIHOMO_GVISOR_VERSION="${MIHOMO_GVISOR_VERSION:-v1.19.28}"
+MIHOMO_GVISOR_REPO="${MIHOMO_GVISOR_REPO:-goshamarat/GoshaCrash}"
+MIHOMO_GVISOR_TAG="${MIHOMO_GVISOR_TAG:-mihomo-gvisor-armv5-v1.19.28}"
+MIHOMO_GVISOR_ASSET="${MIHOMO_GVISOR_ASSET:-mihomo-linux-armv5-gvisor-v1.19.28.gz}"
+MIHOMO_GVISOR_URL="${MIHOMO_GVISOR_URL:-https://github.com/$MIHOMO_GVISOR_REPO/releases/download/$MIHOMO_GVISOR_TAG/$MIHOMO_GVISOR_ASSET}"
+MIHOMO_GVISOR_SHA_URL="${MIHOMO_GVISOR_SHA_URL:-$MIHOMO_GVISOR_URL.sha256}"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -24,7 +31,6 @@ STATE="$BASE/state"
 JFFS_BASE="/jffs/addons/goshacrash"
 JFFS_BASE_FILE="$JFFS_BASE/base"
 DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
-REDIR_PORT="${MIHOMO_REDIR_PORT:-7892}"
 ROUTE_HELPER="$BASE/goshacrash-route"
 
 TUN_DEVICE="${GOSHACRASH_TUN_DEVICE:-goshatun}"
@@ -164,58 +170,61 @@ core_arch(){
     esac
 }
 
-install_core_from_shellcrash(){
+install_core_gvisor(){
     a="$1"
-    pkg="$BASE/run/mihomo-shellcrash.tar.gz"
-    ex="$BASE/run/mihomo.extract"
+    pkg="$BASE/run/$MIHOMO_GVISOR_ASSET"
+    sha_file="$pkg.sha256"
     new="$BASE/run/mihomo.new"
-    asset="clash-linux-$a.tar.gz"
 
-    if [ -n "${MIHOMO_URL:-}" ]; then
-        fetch_any "$pkg" "$MIHOMO_URL" || return 1
-    else
-        fetch_any "$pkg" \
-            "https://testingcf.jsdelivr.net/gh/$SHELLCRASH_REPO@$SHELLCRASH_BRANCH/bin/meta/$asset" \
-            "https://cdn.jsdelivr.net/gh/$SHELLCRASH_REPO@$SHELLCRASH_BRANCH/bin/meta/$asset" \
-            "https://raw.githubusercontent.com/$SHELLCRASH_REPO/$SHELLCRASH_BRANCH/bin/meta/$asset" \
-            "https://github.com/$SHELLCRASH_REPO/raw/$SHELLCRASH_BRANCH/bin/meta/$asset" || return 1
-    fi
+    [ "$a" = armv5 ] || {
+        fail "Чистая gVisor-сборка подготовлена только для ARMv5, обнаружено: $a"
+        return 1
+    }
 
-    tar -tzf "$pkg" >/dev/null 2>&1 || {
-        warn "Получен повреждённый архив Mihomo"
+    rm -f "$pkg" "$sha_file" "$new"
+
+    fetch_any "$pkg" "$MIHOMO_GVISOR_URL" || {
+        fail "Не удалось скачать ARMv5 gVisor core. Сначала запусти GitHub Actions workflow Build Mihomo ARMv5 gVisor."
+        return 1
+    }
+
+    fetch_any "$sha_file" "$MIHOMO_GVISOR_SHA_URL" || {
+        fail "Не удалось скачать SHA256 для gVisor core"
         rm -f "$pkg"
         return 1
     }
 
-    rm -rf "$ex"
-    mkdir -p "$ex" || return 1
-    tar -xzf "$pkg" -C "$ex" >/dev/null 2>&1 || {
-        rm -rf "$ex" "$pkg"
+    expected="$(awk 'NR==1 {print $1}' "$sha_file" 2>/dev/null)"
+    actual="$(sha256sum "$pkg" 2>/dev/null | awk '{print $1}')"
+
+    [ -n "$expected" ] && [ "$actual" = "$expected" ] || {
+        fail "SHA256 gVisor core не совпал"
+        rm -f "$pkg" "$sha_file"
         return 1
     }
 
-    candidate=""
-    for f in "$ex/CrashCore" "$ex/clash" "$ex/mihomo" "$ex"/*; do
-        [ -f "$f" ] || continue
-        candidate="$f"
-        break
-    done
-
-    [ -n "$candidate" ] && [ -f "$candidate" ] || {
-        rm -rf "$ex" "$pkg"
-        fail "В архиве Mihomo не найден бинарник"
+    gzip -dc "$pkg" > "$new" || {
+        fail "Не удалось распаковать gVisor core"
+        rm -f "$pkg" "$sha_file" "$new"
         return 1
     }
-
-    cp "$candidate" "$new" || return 1
     chmod 755 "$new" || return 1
-    "$new" -v >/dev/null 2>&1 || {
-        warn "Скачанное ядро Mihomo не запускается"
-        rm -rf "$ex" "$pkg" "$new"
+
+    version_output="$("$new" -v 2>&1)"
+    printf '%s\n' "$version_output" | grep -Fq 'Use tags: with_gvisor' || {
+        fail "Скачанный Mihomo собран без with_gvisor"
+        printf '%s\n' "$version_output" >&2
+        rm -f "$pkg" "$sha_file" "$new"
         return 1
     }
 
-    rm -rf "$ex" "$pkg"
+    printf '%s\n' "$version_output" | grep -qi 'linux arm' || {
+        fail "Скачанный Mihomo не является Linux ARM-сборкой"
+        rm -f "$pkg" "$sha_file" "$new"
+        return 1
+    }
+
+    rm -f "$pkg" "$sha_file"
     return 0
 }
 
@@ -226,15 +235,14 @@ install_core(){
     rm -f "$new"
 
     say "Архитектура ядра: $a"
-    install_core_from_shellcrash "$a" || {
-        fail "Не удалось скачать рабочее ядро Mihomo из основного источника"
-        return 1
-    }
+    say "Источник Mihomo: $MIHOMO_GVISOR_URL"
+
+    install_core_gvisor "$a" || return 1
 
     [ -f "$BIN" ] && cp "$BIN" "$BIN.previous" 2>/dev/null || true
     mv -f "$new" "$BIN" || return 1
     chmod 755 "$BIN" || return 1
-    say "Mihomo установлен: $($BIN -v 2>/dev/null | head -n 1)"
+    say "Mihomo gVisor установлен: $($BIN -v 2>/dev/null | head -n 2 | tr '\n' ' ')"
 }
 
 find_ui_root(){
@@ -368,13 +376,18 @@ extract_yaml_section(){
 verify_runtime_requirements(){
     file="$1"
 
+    [ -x "$BIN" ] && "$BIN" -v 2>&1 | grep -Fq 'Use tags: with_gvisor' || {
+        fail "Установленный Mihomo не содержит with_gvisor"
+        return 1
+    }
+
     is_true "$(yaml_section "$file" tun enable)" || {
         fail "runtime: tun.enable должен быть true"
         return 1
     }
 
-    [ "$(yaml_section "$file" tun stack)" = system ] || {
-        fail "runtime: на этом ASUS используется только tun.stack=system"
+    [ "$(yaml_section "$file" tun stack)" = gvisor ] || {
+        fail "runtime: чистый TUN требует tun.stack=gvisor"
         return 1
     }
 
@@ -400,23 +413,6 @@ verify_runtime_requirements(){
 
     [ "$(yaml_top "$file" routing-mark)" = "$OUTBOUND_MARK_DEC" ] || {
         fail "runtime: ожидается routing-mark=$OUTBOUND_MARK_DEC"
-        return 1
-    }
-
-    [ "$(yaml_top "$file" redir-port)" = "$REDIR_PORT" ] || {
-        fail "runtime: ожидается redir-port=$REDIR_PORT"
-        return 1
-    }
-
-    for key in mixed-port socks-port tproxy-port; do
-        [ -z "$(yaml_top "$file" "$key")" ] || {
-            fail "runtime: $key отключён; TCP принимает только прозрачный redir-port=$REDIR_PORT"
-            return 1
-        }
-    done
-
-    grep -Eq '^port:[[:space:]]*' "$file" && {
-        fail "runtime: обычный HTTP proxy port отключён; TCP принимает только прозрачный redir-port=$REDIR_PORT"
         return 1
     }
 
@@ -446,11 +442,10 @@ render_runtime(){
     # Корневые runtime-параметры под старый ASUSWRT:
     # API открыт в LAN, IPv6/поиск процессов отключены, а исходящие сокеты
     # Mihomo получают отдельную метку для защиты от зацикливания.
-    awk -v cp="$controller_port" -v mark="$OUTBOUND_MARK_DEC" -v redir="$REDIR_PORT" '
+    awk -v cp="$controller_port" -v mark="$OUTBOUND_MARK_DEC" '
         BEGIN {
             have_controller=0
             have_mark=0
-            have_redir=0
             have_ipv6=0
             have_find=0
         }
@@ -468,11 +463,6 @@ render_runtime(){
                 have_mark=1
                 next
             }
-            if (key == "redir-port") {
-                print "redir-port: " redir
-                have_redir=1
-                next
-            }
             if (key == "ipv6") {
                 print "ipv6: false"
                 have_ipv6=1
@@ -483,14 +473,13 @@ render_runtime(){
                 have_find=1
                 next
             }
-            if (key == "mixed-port" || key == "port" || key == "socks-port" || key == "tproxy-port")
+            if (key == "mixed-port" || key == "port" || key == "socks-port" || key == "redir-port" || key == "tproxy-port")
                 next
         }
         { print }
         END {
             if (!have_controller) print "external-controller: 0.0.0.0:" cp
             if (!have_mark) print "routing-mark: " mark
-            if (!have_redir) print "redir-port: " redir
             if (!have_ipv6) print "ipv6: false"
             if (!have_find) print "find-process-mode: off"
         }
@@ -553,7 +542,7 @@ DNS_RUNTIME
         function emit() {
             print "tun:"
             print "  enable: true"
-            print "  stack: system"
+            print "  stack: gvisor"
             print "  device: " dev
             print "  mtu: " mtu
             print "  dns-hijack:"
@@ -599,11 +588,10 @@ runtime_audit(){
     echo "GoshaCrash меняет только транспортные параметры:"
     echo "  external-controller -> $(yaml_top "$RUNTIME" external-controller)"
     echo "  routing-mark -> $(yaml_top "$RUNTIME" routing-mark)"
-    echo "  transparent redir-port -> $(yaml_top "$RUNTIME" redir-port)"
     echo "  ipv6 -> $(yaml_top "$RUNTIME" ipv6)"
     echo "  find-process-mode -> $(yaml_top "$RUNTIME" find-process-mode)"
     echo "  dns.listen -> $(yaml_section "$RUNTIME" dns listen)"
-    echo "Совместимый TUN:"
+    echo "Чистый gVisor TUN:"
     audit_tun="/tmp/goshacrash-tun-audit.$$"
     extract_yaml_section "$RUNTIME" tun "$audit_tun"
     cat "$audit_tun"
@@ -692,7 +680,6 @@ route_helper(){
     GOSHACRASH_OUTBOUND_MARK="$OUTBOUND_MARK_HEX" \
     GOSHACRASH_ROUTE_ROUTER="$ROUTE_ROUTER" \
     MIHOMO_DNS_PORT="$DNS_PORT" \
-    MIHOMO_REDIR_PORT="$REDIR_PORT" \
         "$ROUTE_HELPER" "$1" "$(tun_device)"
 }
 
@@ -753,13 +740,6 @@ start_mihomo(){
         return 1
     }
 
-    wait_port "$REDIR_PORT" || {
-        kill_mihomo
-        fail "Mihomo не слушает прозрачный TCP redir-port $REDIR_PORT"
-        tail -n 100 "$LOGFILE"
-        return 1
-    }
-
     wait_tun || {
         kill_mihomo
         fail "Mihomo не создал TUN-интерфейс"
@@ -775,7 +755,7 @@ start_mihomo(){
     }
 
     echo "Mihomo запущен, PID=$(cat "$PIDFILE" 2>/dev/null)"
-    echo "[GoshaCrash] Схема: TCP REDIRECT:$REDIR_PORT; UDP -> system TUN; auto-route=off"
+    echo "[GoshaCrash] Чистый TUN: TCP+UDP -> goshatun -> Mihomo gVisor; auto-route=off"
     [ "${GOSHACRASH_WATCHDOG_INTERNAL:-0}" = 1 ] || watchdog_start || true
 }
 
@@ -962,7 +942,6 @@ write_default_config(){
 # На роутере dnsmasq слушает :53, а GoshaCrash меняет DNS listener только
 # в runtime.yaml на 127.0.0.1:1053.
 
-redir-port: 7892
 allow-lan: true
 bind-address: "*"
 mode: rule
@@ -1015,7 +994,7 @@ dns:
 
 tun:
   enable: true
-  stack: system
+  stack: gvisor
   device: goshatun
   mtu: 1500
   dns-hijack:
@@ -1157,7 +1136,6 @@ watchdog_internet_ok(){
 watchdog_local_ok(){
     running_pid >/dev/null 2>&1 || return 1
     netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" || return 1
-    netstat -ln 2>/dev/null | grep -Eq "[:.]$REDIR_PORT[[:space:]]" || return 1
 
     d="$(tun_device)"
     ip link show "$d" >/dev/null 2>&1 ||
@@ -1330,7 +1308,7 @@ status(){
         echo "Mihomo: не запущен"
     fi
     echo "GoshaCrash: $VERSION"
-    echo "Режим: прозрачный TCP-прокси + UDP через system TUN"
+    echo "Режим: чистый TUN, TCP+UDP через gVisor"
     echo "BASE: $BASE"
     echo "DNS: $(dns_status)"
 
@@ -1342,18 +1320,14 @@ status(){
     fi
 
     echo "Mihomo: auto-route=false; auto-redirect=false"
-    netstat -ln 2>/dev/null | grep -Eq "[:.]$REDIR_PORT[[:space:]]" &&
-        echo "Transparent TCP listener:$REDIR_PORT: OK" ||
-        echo "Transparent TCP listener:$REDIR_PORT: MISSING"
     if route_helper status >/dev/null 2>&1; then
         echo "GoshaRoute: работает"
     else
         echo "GoshaRoute: не работает"
     fi
-    echo "LAN TCP: прозрачный REDIRECT -> Mihomo redir-port:$REDIR_PORT"
-    echo "LAN UDP: MARK $TUN_MARK -> table $TUN_TABLE -> $d"
+    echo "LAN: TCP+UDP -> MARK $TUN_MARK -> table $TUN_TABLE -> $d -> gVisor"
     [ "$ROUTE_ROUTER" = 1 ] &&
-        echo "Роутер: TCP -> transparent REDIRECT:$REDIR_PORT; UDP -> TUN; Mihomo mark=$OUTBOUND_MARK_HEX bypass"
+        echo "Роутер: TCP+UDP -> TUN; исходящие сокеты Mihomo обходят петлю mark=$OUTBOUND_MARK_HEX"
 
     if p="$(watchdog_pid)"; then
         echo "WAN watchdog: работает, PID=$p"
@@ -1380,6 +1354,8 @@ doctor(){
     echo
 
     [ -x "$BIN" ] && "$BIN" -v || echo "Mihomo: NOT FOUND"
+    [ -x "$BIN" ] && "$BIN" -v 2>&1 | grep -Fq 'Use tags: with_gvisor' &&
+        echo "gVisor build tag: OK" || echo "gVisor build tag: MISSING"
     [ -x "$ROUTE_HELPER" ] && "$ROUTE_HELPER" version || echo "GoshaRoute: NOT FOUND"
     [ -c /dev/net/tun ] && echo "/dev/net/tun: OK" || echo "/dev/net/tun: NOT FOUND"
     echo
@@ -1419,13 +1395,13 @@ menu(){
             echo "Watchdog: не запущен"
         fi
         echo
-        echo '1) Запустить Mihomo'
+        echo '1) Запустить чистый TUN'
         echo '2) Остановить Mihomo'
         echo '3) Перезапустить Mihomo'
         echo '4) Редактировать config.yaml и применить'
         echo '5) Применить config.yaml'
         echo '6) Показать адрес Zashboard'
-        echo '7) Обновить Mihomo и Zashboard'
+        echo '7) Обновить gVisor Mihomo и Zashboard'
         echo '0) Выход'
         echo '========================================'
         printf 'Выбери пункт: '
@@ -1446,7 +1422,7 @@ menu(){
 }
 
 usage(){ cat <<'USAGE'
-GoshaCrash 0.9.0-rc5
+GoshaCrash 0.9.0-rc6
 
 Управление:
   goshacrash                 открыть меню

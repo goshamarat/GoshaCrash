@@ -1,12 +1,12 @@
 #!/bin/sh
-# BUILD: 2026-07-15-transparent-proxy-installer-090rc5
-# GoshaCrash 0.9.0-rc5 installer: transparent TCP proxy + UDP TUN.
+# BUILD: 2026-07-16-pure-tun-gvisor-installer-090rc6
+# GoshaCrash 0.9.0-rc6 installer: pure TUN with ARMv5 gVisor Mihomo.
 
-INSTALLER_VERSION="0.9.0-rc5"
-EXPECTED_CONTROLLER_VERSION="0.9.0-rc5"
-EXPECTED_CONTROLLER_BUILD="2026-07-15-transparent-proxy-7892-menu-fixed-090rc5"
-EXPECTED_ROUTE_VERSION="0.9.0-rc5"
-EXPECTED_ROUTE_BUILD="2026-07-15-transparent-proxy-routing-helper-090rc5"
+INSTALLER_VERSION="0.9.0-rc6"
+EXPECTED_CONTROLLER_VERSION="0.9.0-rc6"
+EXPECTED_CONTROLLER_BUILD="2026-07-16-pure-tun-gvisor-armv5-090rc6"
+EXPECTED_ROUTE_VERSION="0.9.0-rc6"
+EXPECTED_ROUTE_BUILD="2026-07-16-pure-tun-gvisor-routing-helper-090rc6"
 
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"

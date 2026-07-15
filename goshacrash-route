@@ -1,9 +1,9 @@
 #!/bin/sh
-# BUILD: 2026-07-15-transparent-proxy-routing-helper-090rc5
-# Transparent proxy helper: TCP REDIRECT + UDP TUN for old ASUSWRT kernels.
+# BUILD: 2026-07-16-pure-tun-gvisor-routing-helper-090rc6
+# Pure-TUN helper for ARMv5 gVisor Mihomo on old ASUSWRT kernels.
 
-VERSION="0.9.0-rc5"
-BUILD_ID="2026-07-15-transparent-proxy-routing-helper-090rc5"
+VERSION="0.9.0-rc6"
+BUILD_ID="2026-07-16-pure-tun-gvisor-routing-helper-090rc6"
 
 BASE="${GOSHACRASH_BASE:-$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)}"
 STATE_DIR="$BASE/state/route"
@@ -15,14 +15,11 @@ TUN_RULE_PREF="${GOSHACRASH_TUN_RULE_PREF:-10010}"
 TUN_MARK="${GOSHACRASH_TUN_MARK:-0x2333}"
 OUTBOUND_MARK="${GOSHACRASH_OUTBOUND_MARK:-0x2334}"
 DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
-REDIR_PORT="${MIHOMO_REDIR_PORT:-7892}"
 ROUTE_ROUTER="${GOSHACRASH_ROUTE_ROUTER:-1}"
 PROC_SYS="${GOSHACRASH_PROC_SYS:-/proc/sys}"
 
 LAN_CHAIN="GOSHACRASH_TUN_LAN"
 ROUTER_CHAIN="GOSHACRASH_TUN_ROUTER"
-TCP_LAN_CHAIN="GOSHACRASH_TCP_REDIR"
-TCP_ROUTER_CHAIN="GOSHACRASH_ROUTER_TCP"
 FORWARD_CHAIN="GOSHACRASH_TUN_FORWARD"
 DNS_LAN_CHAIN="GOSHACRASH_DNS_LAN"
 DNS_OUT_CHAIN="GOSHACRASH_DNS_OUT"
@@ -140,29 +137,23 @@ cleanup_rules(){
     ipt_init
 
     for iface in $(lan_ifaces); do
-        # Current hybrid jumps.
-        remove_jump mangle PREROUTING -i "$iface" -p udp -j "$LAN_CHAIN"
-        remove_jump nat PREROUTING -i "$iface" -p tcp -j "$TCP_LAN_CHAIN"
+        remove_jump mangle PREROUTING -i "$iface" -j "$LAN_CHAIN"
         remove_jump nat PREROUTING -i "$iface" -p udp --dport 53 -j "$DNS_LAN_CHAIN"
         remove_jump nat PREROUTING -i "$iface" -p tcp --dport 53 -j "$DNS_LAN_CHAIN"
 
-        # rc2/rc3 pure-TUN jumps and older generations.
-        remove_jump mangle PREROUTING -i "$iface" -j "$LAN_CHAIN"
+        # Old GoshaCrash generations.
         remove_jump mangle PREROUTING -i "$iface" -j GOSHACRASH_TUN
         remove_jump nat PREROUTING -i "$iface" -p tcp -j GOSHACRASH_TCP_REDIR
         remove_jump nat PREROUTING -i "$iface" -p udp --dport 53 -j GOSHACRASH_DNS_HIJACK
         remove_jump nat PREROUTING -i "$iface" -p tcp --dport 53 -j GOSHACRASH_DNS_HIJACK
     done
 
-    # Current hybrid jumps.
-    remove_jump mangle OUTPUT -p udp -j "$ROUTER_CHAIN"
-    remove_jump nat OUTPUT -p tcp -j "$TCP_ROUTER_CHAIN"
+    remove_jump mangle OUTPUT -j "$ROUTER_CHAIN"
     remove_jump nat OUTPUT -p udp --dport 53 -j "$DNS_OUT_CHAIN"
     remove_jump nat OUTPUT -p tcp --dport 53 -j "$DNS_OUT_CHAIN"
     remove_jump filter FORWARD -j "$FORWARD_CHAIN"
 
-    # rc2/rc3 pure-TUN jumps and older generations.
-    remove_jump mangle OUTPUT -j "$ROUTER_CHAIN"
+    # Old GoshaCrash generations.
     remove_jump mangle OUTPUT -j GOSHACRASH_ROUTER_TUN
     remove_jump nat OUTPUT -p tcp -j GOSHACRASH_ROUTER_TCP
     remove_jump nat OUTPUT -p udp --dport 53 -j GOSHACRASH_DNSMASQ_UPSTREAM
@@ -171,8 +162,6 @@ cleanup_rules(){
 
     delete_chain mangle "$LAN_CHAIN"
     delete_chain mangle "$ROUTER_CHAIN"
-    delete_chain nat "$TCP_LAN_CHAIN"
-    delete_chain nat "$TCP_ROUTER_CHAIN"
     delete_chain nat "$DNS_LAN_CHAIN"
     delete_chain nat "$DNS_OUT_CHAIN"
     delete_chain filter "$FORWARD_CHAIN"
@@ -180,7 +169,7 @@ cleanup_rules(){
     for c in GOSHACRASH_TUN GOSHACRASH_ROUTER_TUN; do
         delete_chain mangle "$c"
     done
-    for c in GOSHACRASH_DNS_HIJACK GOSHACRASH_DNSMASQ_UPSTREAM; do
+    for c in GOSHACRASH_DNS_HIJACK GOSHACRASH_TCP_REDIR GOSHACRASH_ROUTER_TCP GOSHACRASH_DNSMASQ_UPSTREAM; do
         delete_chain nat "$c"
     done
     delete_chain filter GOSHACRASH_FORWARD
@@ -202,51 +191,28 @@ add_exclusions(){
 }
 
 build_lan_chain(){
-    # Only UDP goes through the TUN policy-routing table.
     ipt -t mangle -N "$LAN_CHAIN" || return 1
     ipt -t mangle -A "$LAN_CHAIN" -m mark --mark "$OUTBOUND_MARK" -j RETURN || return 1
     ipt -t mangle -A "$LAN_CHAIN" -p udp --dport 53 -j RETURN || return 1
+    ipt -t mangle -A "$LAN_CHAIN" -p tcp --dport 53 -j RETURN || return 1
     add_exclusions mangle "$LAN_CHAIN" || return 1
-    ipt -t mangle -A "$LAN_CHAIN" -p udp -j MARK --set-mark "$TUN_MARK" || return 1
+    ipt -t mangle -A "$LAN_CHAIN" -j MARK --set-mark "$TUN_MARK" || return 1
 
     for iface in $(lan_ifaces); do
-        ipt -t mangle -I PREROUTING 1 -i "$iface" -p udp -j "$LAN_CHAIN" || return 1
+        ipt -t mangle -I PREROUTING 1 -i "$iface" -j "$LAN_CHAIN" || return 1
     done
 }
 
 build_router_chain(){
     [ "$ROUTE_ROUTER" = 1 ] || return 0
 
-    # Only router-originated UDP goes through TUN.
     ipt -t mangle -N "$ROUTER_CHAIN" || return 1
     ipt -t mangle -A "$ROUTER_CHAIN" -m mark --mark "$OUTBOUND_MARK" -j RETURN || return 1
     ipt -t mangle -A "$ROUTER_CHAIN" -p udp --dport 53 -j RETURN || return 1
+    ipt -t mangle -A "$ROUTER_CHAIN" -p tcp --dport 53 -j RETURN || return 1
     add_exclusions mangle "$ROUTER_CHAIN" || return 1
-    ipt -t mangle -A "$ROUTER_CHAIN" -p udp -j MARK --set-mark "$TUN_MARK" || return 1
-    ipt -t mangle -I OUTPUT 1 -p udp -j "$ROUTER_CHAIN" || return 1
-}
-
-build_tcp_lan(){
-    # system-stack TCP is delivered through Mihomo's redir-port.
-    ipt -t nat -N "$TCP_LAN_CHAIN" || return 1
-    ipt -t nat -A "$TCP_LAN_CHAIN" -p tcp --dport 53 -j RETURN || return 1
-    add_exclusions nat "$TCP_LAN_CHAIN" || return 1
-    ipt -t nat -A "$TCP_LAN_CHAIN" -p tcp -j REDIRECT --to-ports "$REDIR_PORT" || return 1
-
-    for iface in $(lan_ifaces); do
-        ipt -t nat -I PREROUTING 1 -i "$iface" -p tcp -j "$TCP_LAN_CHAIN" || return 1
-    done
-}
-
-build_tcp_router(){
-    [ "$ROUTE_ROUTER" = 1 ] || return 0
-
-    ipt -t nat -N "$TCP_ROUTER_CHAIN" || return 1
-    ipt -t nat -A "$TCP_ROUTER_CHAIN" -m mark --mark "$OUTBOUND_MARK" -j RETURN || return 1
-    ipt -t nat -A "$TCP_ROUTER_CHAIN" -p tcp --dport 53 -j RETURN || return 1
-    add_exclusions nat "$TCP_ROUTER_CHAIN" || return 1
-    ipt -t nat -A "$TCP_ROUTER_CHAIN" -p tcp -j REDIRECT --to-ports "$REDIR_PORT" || return 1
-    ipt -t nat -I OUTPUT 1 -p tcp -j "$TCP_ROUTER_CHAIN" || return 1
+    ipt -t mangle -A "$ROUTER_CHAIN" -j MARK --set-mark "$TUN_MARK" || return 1
+    ipt -t mangle -I OUTPUT 1 -j "$ROUTER_CHAIN" || return 1
 }
 
 build_dns(){
@@ -322,21 +288,7 @@ route_start(){
     }
 
     build_router_chain || {
-        fail "Не удалось создать OUTPUT UDP mangle-цепочку"
-        cleanup_rules
-        restore_sysctls
-        return 1
-    }
-
-    build_tcp_lan || {
-        fail "Не удалось создать LAN TCP REDIRECT"
-        cleanup_rules
-        restore_sysctls
-        return 1
-    }
-
-    build_tcp_router || {
-        fail "Не удалось создать OUTPUT TCP REDIRECT"
+        fail "Не удалось создать OUTPUT mangle-цепочку"
         cleanup_rules
         restore_sysctls
         return 1
@@ -358,12 +310,12 @@ route_start(){
 
     ip route flush cache 2>/dev/null || true
     mkdir -p "$STATE_DIR" || return 1
-    printf 'device=%s\ntable=%s\nmark=%s\nredir=%s\nrouter=%s\n' \
-        "$TUN_DEVICE" "$TUN_TABLE" "$TUN_MARK" "$REDIR_PORT" "$ROUTE_ROUTER" > "$ACTIVE_FILE"
+    printf 'device=%s\ntable=%s\nmark=%s\nrouter=%s\n' \
+        "$TUN_DEVICE" "$TUN_TABLE" "$TUN_MARK" "$ROUTE_ROUTER" > "$ACTIVE_FILE"
 
-    say "Прозрачный TCP LAN -> REDIRECT:$REDIR_PORT; UDP LAN -> mark $TUN_MARK -> table $TUN_TABLE -> $TUN_DEVICE"
+    say "Чистый TUN поднят: TCP+UDP LAN -> mark $TUN_MARK -> table $TUN_TABLE -> $TUN_DEVICE"
     [ "$ROUTE_ROUTER" = 1 ] &&
-        say "Роутер: прозрачный TCP -> REDIRECT:$REDIR_PORT; UDP -> TUN; Mihomo mark=$OUTBOUND_MARK исключён"
+        say "Трафик роутера также направляется в TUN; Mihomo outbound mark=$OUTBOUND_MARK исключён"
     say "DNS: LAN -> dnsmasq:53; dnsmasq upstream -> Mihomo:$DNS_PORT"
 }
 
@@ -378,8 +330,7 @@ route_status(){
     echo "GoshaRoute: $VERSION"
     echo "TUN device: $TUN_DEVICE"
     echo "Table: $TUN_TABLE"
-    echo "UDP traffic mark: $TUN_MARK"
-    echo "TCP redir port: $REDIR_PORT"
+    echo "Traffic mark: $TUN_MARK"
     echo "Mihomo outbound mark: $OUTBOUND_MARK"
     echo "Router traffic: $ROUTE_ROUTER"
 
@@ -407,10 +358,7 @@ route_status(){
 
     ipt_init
     ipt -t mangle -S "$LAN_CHAIN" >/dev/null 2>&1 &&
-        echo "UDP LAN chain: OK" || { echo "UDP LAN chain: MISSING"; rc=1; }
-
-    ipt -t nat -S "$TCP_LAN_CHAIN" >/dev/null 2>&1 &&
-        echo "TCP LAN REDIRECT: OK" || { echo "TCP LAN REDIRECT: MISSING"; rc=1; }
+        echo "LAN chain: OK" || { echo "LAN chain: MISSING"; rc=1; }
 
     ipt -t nat -S "$DNS_OUT_CHAIN" >/dev/null 2>&1 &&
         echo "DNS bridge: OK" || { echo "DNS bridge: MISSING"; rc=1; }
@@ -430,10 +378,6 @@ route_doctor(){
     echo "=== mangle ==="
     iptables -t mangle -L "$LAN_CHAIN" -n -v 2>/dev/null || true
     iptables -t mangle -L "$ROUTER_CHAIN" -n -v 2>/dev/null || true
-    echo
-    echo "=== nat TCP REDIRECT ==="
-    iptables -t nat -L "$TCP_LAN_CHAIN" -n -v 2>/dev/null || true
-    iptables -t nat -L "$TCP_ROUTER_CHAIN" -n -v 2>/dev/null || true
     echo
     echo "=== nat DNS ==="
     iptables -t nat -L "$DNS_LAN_CHAIN" -n -v 2>/dev/null || true
