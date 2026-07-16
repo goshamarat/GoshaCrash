@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-16-pure-tun-gvisor-failopen-direct-090rc62
-# GoshaCrash 0.9.0-rc6.2 — pure gVisor TUN with fail-open DIRECT policy.
+# BUILD: 2026-07-16-final-autostart-tun0-yandex-watchdog-110
+# GoshaCrash 1.1.0 — pure gVisor TUN, fixed tun0, reboot autostart, fail-open DIRECT.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-VERSION="0.9.0-rc6.2"
-BUILD_ID="2026-07-16-pure-tun-gvisor-failopen-direct-090rc62"
+VERSION="1.1.0"
+BUILD_ID="2026-07-16-final-autostart-tun0-yandex-watchdog-110"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
@@ -33,7 +33,8 @@ JFFS_BASE_FILE="$JFFS_BASE/base"
 DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
 ROUTE_HELPER="$BASE/goshacrash-route"
 
-TUN_DEVICE="${GOSHACRASH_TUN_DEVICE:-goshatun}"
+# Conventional Linux TUN name. No automatic interface-name fallback.
+TUN_DEVICE="tun0"
 TUN_MTU="${GOSHACRASH_TUN_MTU:-1500}"
 TUN_TABLE="${GOSHACRASH_TUN_TABLE:-2022}"
 TUN_RULE_INDEX="${GOSHACRASH_TUN_RULE_PREF:-10010}"
@@ -55,20 +56,29 @@ LEGACY_ROUTER_DNS_CHAIN="GOSHACRASH_DNSMASQ_UPSTREAM"
 # It never reboots the router and never rewrites config.yaml/runtime.yaml.
 WATCHDOG_PIDFILE="$BASE/run/watchdog.pid"
 WATCHDOG_LOG="$BASE/logs/watchdog.log"
+BOOT_PIDFILE="$BASE/run/boot.pid"
+BOOT_LOG="$BASE/logs/boot.log"
 VPN_SESSION_FILE="$STATE/vpn-session.active"
 DIRECT_REASON_FILE="$STATE/direct-mode.reason"
+
+# Reboot autostart waits for the physical WAN and the ordinary main default route.
+BOOT_WAN_WAIT="${GOSHACRASH_BOOT_WAN_WAIT:-300}"
+BOOT_WAN_STEP="${GOSHACRASH_BOOT_WAN_STEP:-5}"
 
 # Fail-open watchdog:
 # - WAN/link loss: switch to DIRECT within a few seconds;
 # - local Mihomo/TUN/routing failure: switch to DIRECT;
 # - repeated Internet probe failure: switch to DIRECT;
-# - it never restarts Mihomo automatically.
+# - after fail-open it does not restart Mihomo until a manual start or reboot.
 WATCHDOG_INTERVAL="${GOSHACRASH_WATCHDOG_INTERVAL:-5}"
 WATCHDOG_LOCAL_FAIL_THRESHOLD="${GOSHACRASH_WATCHDOG_LOCAL_FAIL_THRESHOLD:-2}"
+WATCHDOG_PROBE_ENABLED="${GOSHACRASH_WATCHDOG_PROBE_ENABLED:-1}"
 WATCHDOG_PROBE_INTERVAL="${GOSHACRASH_WATCHDOG_PROBE_INTERVAL:-60}"
-WATCHDOG_FAIL_THRESHOLD="${GOSHACRASH_WATCHDOG_FAIL_THRESHOLD:-2}"
-WATCHDOG_BOOT_GRACE="${GOSHACRASH_WATCHDOG_BOOT_GRACE:-10}"
-WATCHDOG_URLS="${GOSHACRASH_WATCHDOG_URLS:-https://www.gstatic.com/generate_204 https://cp.cloudflare.com/generate_204}"
+WATCHDOG_FAIL_THRESHOLD="${GOSHACRASH_WATCHDOG_FAIL_THRESHOLD:-3}"
+WATCHDOG_BOOT_GRACE="${GOSHACRASH_WATCHDOG_BOOT_GRACE:-30}"
+# Google-only probes are unsuitable for heavily filtered networks. Success of any
+# one regional endpoint is enough; the list can be overridden through the env.
+WATCHDOG_URLS="${GOSHACRASH_WATCHDOG_URLS:-https://ya.ru/ https://mail.ru/ https://www.rambler.ru/}"
 
 PATH="/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$USB_MOUNT/asusware.arm/bin:$USB_MOUNT/asusware.arm/sbin:$USB_MOUNT/asusware.arm/opt/bin:$USB_MOUNT/asusware.arm/opt/sbin:$USB_MOUNT/asusware.arm/usr/bin"
 export PATH
@@ -131,8 +141,33 @@ lan_ifaces(){
 
 lan_ip(){ x="$(nvram get lan_ipaddr 2>/dev/null)"; [ -n "$x" ] || x=192.168.1.1; echo "$x"; }
 
+tun_link_exists(){
+    ip link show tun0 >/dev/null 2>&1 || ifconfig tun0 >/dev/null 2>&1
+}
+
+load_tun_device(){
+    TUN_DEVICE="tun0"
+}
+
+choose_tun_device(){
+    TUN_DEVICE="tun0"
+
+    # A running Mihomo already owns tun0 and may be reloaded in place.
+    running_pid >/dev/null 2>&1 && return 0
+
+    if tun_link_exists; then
+        fail "Интерфейс tun0 уже занят другим процессом. Останови его перед запуском GoshaCrash."
+        return 1
+    fi
+
+    return 0
+}
+
 fetch(){
     url="$1"; out="$2"; part="$out.part.$$"; log="/tmp/goshacrash-fetch.$$"
+    fetch_home="$STATE/wget-home"
+    mkdir -p "$fetch_home" 2>/dev/null || true
+    chmod 700 "$fetch_home" 2>/dev/null || true
     rm -f "$part" "$out" "$log"
 
     if [ -x /usr/sbin/wget ]; then
@@ -148,9 +183,9 @@ fetch(){
 
     say "Загрузчик: $downloader"
     if [ "$kind" = wget ]; then
-        "$downloader" --no-check-certificate -O "$part" "$url" >"$log" 2>&1
+        HOME="$fetch_home" "$downloader" --no-check-certificate -O "$part" "$url" >"$log" 2>&1
     else
-        "$downloader" -k -f -L -o "$part" "$url" >"$log" 2>&1
+        HOME="$fetch_home" "$downloader" -k -f -L -o "$part" "$url" >"$log" 2>&1
     fi
     rc=$?
 
@@ -169,12 +204,19 @@ fetch(){
 fetch_any(){
     out="$1"
     shift
+    retries="${GOSHACRASH_FETCH_RETRIES:-4}"
+
     for url in "$@"; do
         [ -n "$url" ] || continue
-        say "Пробую скачать: $url"
-        if fetch "$url" "$out"; then
-            return 0
-        fi
+        attempt=1
+        while [ "$attempt" -le "$retries" ]; do
+            say "Пробую скачать ($attempt/$retries): $url"
+            if fetch "$url" "$out"; then
+                return 0
+            fi
+            sleep "$attempt"
+            attempt=$((attempt + 1))
+        done
     done
     return 1
 }
@@ -677,25 +719,67 @@ runtime_audit(){
 
 runtime_render_only(){
     ensure_dirs || return 1
+    choose_tun_device || return 1
     candidate="$BASE/run/runtime.render-test.yaml"
     rm -f "$candidate"
     render_runtime "$candidate" || return 1
     echo "$candidate"
 }
 
+mihomo_pids(){
+    for proc in /proc/[0-9]*; do
+        [ -r "$proc/cmdline" ] || continue
+        pid="${proc##*/}"
+        [ "$pid" = "$$" ] && continue
+        cmd="$(tr '\000' ' ' < "$proc/cmdline" 2>/dev/null)"
+        case "$cmd" in
+            "$BIN"|"$BIN "*) printf '%s\n' "$pid";;
+        esac
+    done
+}
+
 running_pid(){
-    [ -f "$PIDFILE" ] || return 1; p="$(cat "$PIDFILE" 2>/dev/null)"; [ -n "$p" ] || return 1
-    kill -0 "$p" 2>/dev/null || return 1
-    ps 2>/dev/null | awk -v p="$p" '$1==p{print}' | grep -q '[m]ihomo' || return 1
+    if [ -f "$PIDFILE" ]; then
+        p="$(cat "$PIDFILE" 2>/dev/null)"
+        case "$p" in ''|*[!0-9]*) p="";; esac
+        if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+            cmd="$(tr '\000' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
+            case "$cmd" in "$BIN"|"$BIN "*) echo "$p"; return 0;; esac
+        fi
+    fi
+
+    p="$(mihomo_pids | sed -n '1p')"
+    [ -n "$p" ] || return 1
+    echo "$p" > "$PIDFILE" 2>/dev/null || true
     echo "$p"
 }
 
 kill_mihomo(){
-    if p="$(running_pid)"; then
-        kill "$p" 2>/dev/null || true; n=0
-        while kill -0 "$p" 2>/dev/null && [ "$n" -lt 10 ]; do sleep 1; n=$((n+1)); done
+    # Never trust a stale pidfile: only terminate processes whose /proc/cmdline
+    # starts with the exact installed Mihomo binary path.
+    pids="$(mihomo_pids)"
+
+    for p in $pids; do
+        case "$p" in ''|*[!0-9]*) continue;; esac
+        kill "$p" 2>/dev/null || true
+    done
+
+    n=0
+    while [ "$n" -lt 10 ]; do
+        alive=0
+        for p in $pids; do
+            case "$p" in ''|*[!0-9]*) continue;; esac
+            kill -0 "$p" 2>/dev/null && alive=1
+        done
+        [ "$alive" -eq 0 ] && break
+        sleep 1
+        n=$((n + 1))
+    done
+
+    for p in $pids; do
+        case "$p" in ''|*[!0-9]*) continue;; esac
         kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true
-    fi
+    done
     rm -f "$PIDFILE"
 }
 
@@ -760,14 +844,64 @@ route_helper(){
         "$ROUTE_HELPER" "$1" "$(tun_device)"
 }
 
+fallback_remove_jump(){
+    table="$1"
+    chain="$2"
+    shift 2
+    while iptables -t "$table" -D "$chain" "$@" 2>/dev/null; do :; done
+}
+
+fallback_delete_chain(){
+    table="$1"
+    chain="$2"
+    iptables -t "$table" -F "$chain" 2>/dev/null || true
+    iptables -t "$table" -X "$chain" 2>/dev/null || true
+}
+
+fallback_cleanup_network(){
+    if have iptables; then
+        for iface in $(lan_ifaces); do
+            fallback_remove_jump mangle PREROUTING -i "$iface" -j GOSHACRASH_TUN_LAN
+            fallback_remove_jump nat PREROUTING -i "$iface" -p udp --dport 53 -j GOSHACRASH_DNS_LAN
+            fallback_remove_jump nat PREROUTING -i "$iface" -p tcp --dport 53 -j GOSHACRASH_DNS_LAN
+            fallback_remove_jump mangle PREROUTING -i "$iface" -j GOSHACRASH_TUN
+            fallback_remove_jump nat PREROUTING -i "$iface" -p tcp -j GOSHACRASH_TCP_REDIR
+            fallback_remove_jump nat PREROUTING -i "$iface" -p udp --dport 53 -j GOSHACRASH_DNS_HIJACK
+            fallback_remove_jump nat PREROUTING -i "$iface" -p tcp --dport 53 -j GOSHACRASH_DNS_HIJACK
+        done
+
+        fallback_remove_jump mangle OUTPUT -j GOSHACRASH_TUN_ROUTER
+        fallback_remove_jump nat OUTPUT -p udp --dport 53 -j GOSHACRASH_DNS_OUT
+        fallback_remove_jump nat OUTPUT -p tcp --dport 53 -j GOSHACRASH_DNS_OUT
+        fallback_remove_jump filter FORWARD -j GOSHACRASH_TUN_FORWARD
+        fallback_remove_jump mangle OUTPUT -j GOSHACRASH_ROUTER_TUN
+        fallback_remove_jump nat OUTPUT -p tcp -j GOSHACRASH_ROUTER_TCP
+        fallback_remove_jump nat OUTPUT -p udp --dport 53 -j GOSHACRASH_DNSMASQ_UPSTREAM
+        fallback_remove_jump nat OUTPUT -p tcp --dport 53 -j GOSHACRASH_DNSMASQ_UPSTREAM
+        fallback_remove_jump filter FORWARD -j GOSHACRASH_FORWARD
+
+        for chain in GOSHACRASH_TUN_LAN GOSHACRASH_TUN_ROUTER GOSHACRASH_TUN GOSHACRASH_ROUTER_TUN; do
+            fallback_delete_chain mangle "$chain"
+        done
+        for chain in GOSHACRASH_DNS_LAN GOSHACRASH_DNS_OUT GOSHACRASH_DNS_HIJACK GOSHACRASH_TCP_REDIR GOSHACRASH_ROUTER_TCP GOSHACRASH_DNSMASQ_UPSTREAM; do
+            fallback_delete_chain nat "$chain"
+        done
+        for chain in GOSHACRASH_TUN_FORWARD GOSHACRASH_FORWARD; do
+            fallback_delete_chain filter "$chain"
+        done
+    fi
+
+    while ip rule del fwmark "$TUN_MARK" table "$TUN_TABLE" pref "$TUN_RULE_INDEX" 2>/dev/null; do :; done
+    while ip rule del fwmark "$TUN_MARK" table "$TUN_TABLE" 2>/dev/null; do :; done
+    ip route flush table "$TUN_TABLE" 2>/dev/null || true
+    ip route flush cache 2>/dev/null || true
+}
+
 cleanup_legacy_network(){
     if [ -x "$ROUTE_HELPER" ]; then
-        route_helper stop >/dev/null 2>&1 || true
+        route_helper stop >/dev/null 2>&1 || fallback_cleanup_network
     else
-        while ip rule del fwmark "$TUN_MARK" table "$TUN_TABLE" pref "$TUN_RULE_INDEX" 2>/dev/null; do :; done
-        while ip rule del fwmark "$TUN_MARK" table "$TUN_TABLE" 2>/dev/null; do :; done
-        ip route flush table "$TUN_TABLE" 2>/dev/null || true
-        ip route flush cache 2>/dev/null || true
+        fallback_cleanup_network
     fi
 }
 
@@ -780,7 +914,37 @@ enter_direct_mode(){
     write_direct_reason "$reason"
 }
 
+sync_runtime_tun_device(){
+    [ -f "$RUNTIME" ] || return 0
+    current="$(yaml_section "$RUNTIME" tun device)"
+    [ "$current" = "$TUN_DEVICE" ] && return 0
+
+    candidate="$BASE/run/runtime.device-switch.yaml"
+    rm -f "$candidate"
+    render_runtime "$candidate" || return 1
+    check_file "$candidate" || { rm -f "$candidate"; return 1; }
+    cp "$RUNTIME" "$PREVIOUS" 2>/dev/null || true
+    mv -f "$candidate" "$RUNTIME" || return 1
+    say "TUN-интерфейс runtime переключён: ${current:-unknown} -> $TUN_DEVICE"
+}
+
 start_mihomo(){
+    [ "${GOSHACRASH_BOOT_INTERNAL:-0}" = 1 ] || boot_stop
+
+    [ -f "$RUNTIME" ] || {
+        fail "Сначала выполни: goshacrash apply"
+        return 1
+    }
+
+    choose_tun_device || return 1
+    sync_runtime_tun_device || return 1
+
+    watchdog_wan_available || {
+        enter_direct_mode "WAN-кабель, carrier или основной default route недоступны при запуске"
+        fail "WAN недоступен; оставлен обычный DIRECT"
+        return 1
+    }
+
     if p="$(running_pid)"; then
         route_helper reload || {
             enter_direct_mode "не удалось восстановить правила для уже запущенного Mihomo"
@@ -792,10 +956,6 @@ start_mihomo(){
         return 0
     fi
 
-    [ -f "$RUNTIME" ] || {
-        fail "Сначала выполни: goshacrash apply"
-        return 1
-    }
     [ -x "$ROUTE_HELPER" ] || {
         fail "Не установлен $ROUTE_HELPER"
         return 1
@@ -848,14 +1008,15 @@ start_mihomo(){
 
     set_vpn_session_active
     echo "Mihomo запущен, PID=$(cat "$PIDFILE" 2>/dev/null)"
-    echo "[GoshaCrash] Чистый TUN: TCP+UDP -> goshatun -> Mihomo gVisor; auto-route=off"
+    echo "[GoshaCrash] Чистый TUN: TCP+UDP -> $TUN_DEVICE -> Mihomo gVisor; auto-route=off"
     [ "${GOSHACRASH_WATCHDOG_INTERNAL:-0}" = 1 ] || watchdog_start || true
 }
 
 stop_mihomo(){
+    [ "${GOSHACRASH_BOOT_INTERNAL:-0}" = 1 ] || boot_stop
     [ "${GOSHACRASH_WATCHDOG_INTERNAL:-0}" = 1 ] || watchdog_stop
     enter_direct_mode "ручная остановка"
-    echo "Mihomo и TUN остановлены; трафик переведён в обычный DIRECT"
+    echo "Mihomo и tun0 остановлены; трафик переведён в обычный DIRECT"
 }
 
 backup_config(){
@@ -876,8 +1037,28 @@ BASE="$BASE"
 [ -f "\$BASE_FILE" ] && { x="\$(cat "\$BASE_FILE" 2>/dev/null)"; [ -n "\$x" ] && BASE="\$x"; }
 CTL="\$BASE/goshacrash"
 case "\$1" in
- start) sleep 5; [ -x "\$CTL" ] && GOSHACRASH_BASE="\$BASE" "\$CTL" boot;;
- restart|force-reload) [ -x "\$CTL" ] && GOSHACRASH_BASE="\$BASE" "\$CTL" restart;;
+ start)
+   sleep 5
+   if [ -x "\$CTL" ]; then
+     mkdir -p "\$BASE/logs" "\$BASE/run" 2>/dev/null || true
+     if command -v nohup >/dev/null 2>&1; then
+       GOSHACRASH_BASE="\$BASE" nohup "\$CTL" boot </dev/null >>"\$BASE/logs/boot.log" 2>&1 &
+     else
+       GOSHACRASH_BASE="\$BASE" "\$CTL" boot </dev/null >>"\$BASE/logs/boot.log" 2>&1 &
+     fi
+   fi
+   ;;
+ restart|force-reload)
+   [ -x "\$CTL" ] && GOSHACRASH_BASE="\$BASE" "\$CTL" stop >/dev/null 2>&1 || true
+   if [ -x "\$CTL" ]; then
+     mkdir -p "\$BASE/logs" "\$BASE/run" 2>/dev/null || true
+     if command -v nohup >/dev/null 2>&1; then
+       GOSHACRASH_BASE="\$BASE" nohup "\$CTL" boot </dev/null >>"\$BASE/logs/boot.log" 2>&1 &
+     else
+       GOSHACRASH_BASE="\$BASE" "\$CTL" boot </dev/null >>"\$BASE/logs/boot.log" 2>&1 &
+     fi
+   fi
+   ;;
  stop) [ -x "\$CTL" ] && GOSHACRASH_BASE="\$BASE" "\$CTL" stop;;
  firewall-start|firewall-restart) [ -x "\$CTL" ] && GOSHACRASH_BASE="\$BASE" "\$CTL" firewall-reload;;
  *) exit 0;;
@@ -911,6 +1092,7 @@ uninstall_hooks(){
 
 apply_config(){
     [ -f "$CONFIG" ] || { fail "Не найден $CONFIG"; return 1; }; ensure_dirs || return 1
+    choose_tun_device || return 1
     b="$(backup_config)" || return 1; say "Резервная копия: $b"
     cand="$BASE/run/runtime.candidate.yaml"; rm -f "$cand"; render_runtime "$cand" || return 1
     [ -f "$RUNTIME" ] && cp "$RUNTIME" "$PREVIOUS" 2>/dev/null || rm -f "$PREVIOUS"
@@ -921,22 +1103,94 @@ apply_config(){
     say "Конфиг применён"; status
 }
 
-check_config(){ ensure_dirs || return 1; t="$BASE/run/check.yaml"; render_runtime "$t" || return 1; check_file "$t"; r=$?; rm -f "$t"; return "$r"; }
+check_config(){ ensure_dirs || return 1; choose_tun_device || return 1; t="$BASE/run/check.yaml"; render_runtime "$t" || return 1; check_file "$t"; r=$?; rm -f "$t"; return "$r"; }
+
+boot_pid(){
+    [ -f "$BOOT_PIDFILE" ] || return 1
+    p="$(cat "$BOOT_PIDFILE" 2>/dev/null)"
+    case "$p" in ''|*[!0-9]*) return 1;; esac
+    kill -0 "$p" 2>/dev/null || return 1
+
+    # Never trust a stale PID file: verify the exact GoshaCrash boot process.
+    [ -r "/proc/$p/cmdline" ] || return 1
+    cmd="$(tr '\000' ' ' < "/proc/$p/cmdline" 2>/dev/null)"
+    case "$cmd" in
+        *"$BASE/goshacrash boot"*) ;;
+        *) return 1;;
+    esac
+
+    printf '%s\n' "$p"
+}
+
+boot_stop(){
+    if p="$(boot_pid)"; then
+        [ "$p" = "$$" ] && return 0
+        kill "$p" 2>/dev/null || true
+        n=0
+        while kill -0 "$p" 2>/dev/null && [ "$n" -lt 5 ]; do
+            sleep 1
+            n=$((n + 1))
+        done
+        kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true
+    fi
+    rm -f "$BOOT_PIDFILE"
+}
 
 boot_service(){
+    # Prevent duplicate S99/restart invocations from launching parallel waiters.
+    if old_boot_pid="$(boot_pid)"; then
+        if [ "$old_boot_pid" != "$$" ]; then
+            say "Автозапуск уже ожидает WAN, PID=$old_boot_pid"
+            return 0
+        fi
+    fi
+
+    ensure_dirs || return 1
+    echo "$$" > "$BOOT_PIDFILE"
+    cleanup_boot_pid(){
+        saved="$(cat "$BOOT_PIDFILE" 2>/dev/null)"
+        [ "$saved" = "$$" ] && rm -f "$BOOT_PIDFILE"
+    }
+    trap 'cleanup_boot_pid; exit 0' TERM INT HUP
+    trap 'cleanup_boot_pid' EXIT
+
     n=0
     while [ ! -x "$BIN" ] && [ "$n" -lt 30 ]; do
         sleep 2
         n=$((n + 1))
     done
 
-    # Reboot is a hard VPN-session boundary.
+    [ -x "$BIN" ] || {
+        enter_direct_mode "автозапуск: бинарник Mihomo не найден"
+        return 1
+    }
+    [ -f "$RUNTIME" ] || {
+        enter_direct_mode "автозапуск: runtime.yaml не найден"
+        return 1
+    }
+
     watchdog_stop
     cleanup_legacy_network
     kill_mihomo
     clear_vpn_session
-    write_direct_reason "перезагрузка роутера: VPN не запускается автоматически"
-    say "После загрузки оставлен обычный DIRECT. Для VPN: goshacrash start"
+
+    waited=0
+    while ! watchdog_wan_available; do
+        if [ "$waited" -ge "$BOOT_WAN_WAIT" ]; then
+            enter_direct_mode "автозапуск: WAN не появился за ${BOOT_WAN_WAIT} секунд"
+            warn "WAN не появился; роутер оставлен в DIRECT"
+            return 0
+        fi
+        sleep "$BOOT_WAN_STEP"
+        waited=$((waited + BOOT_WAN_STEP))
+    done
+
+    say "WAN готов; автоматически запускаю Mihomo и tun0"
+    GOSHACRASH_BOOT_INTERNAL=1 start_mihomo || {
+        enter_direct_mode "автозапуск Mihomo завершился ошибкой"
+        return 1
+    }
+    say "Автозапуск Mihomo после reboot завершён"
     return 0
 }
 
@@ -1021,7 +1275,19 @@ install_all(){
     install_core || { fail "Установка Mihomo не завершена"; return 1; }
     install_ui || { fail "Установка Zashboard не завершена"; return 1; }
     install_hooks || return 1
-    apply_config
+    choose_tun_device || return 1
+
+    candidate="$BASE/run/runtime.install.yaml"
+    rm -f "$candidate"
+    render_runtime "$candidate" || return 1
+    say "Проверяю подготовленный runtime.yaml"
+    check_file "$candidate" || { rm -f "$candidate"; return 1; }
+    mv -f "$candidate" "$RUNTIME" || return 1
+
+    enter_direct_mode "чистая установка завершена; после первого apply VPN будет автоматически запускаться при reboot"
+    say "Установка завершена в безопасном DIRECT-режиме"
+    say "Замени config.yaml и выполни: goshacrash apply. Следующие reboot будут запускать Mihomo автоматически."
+    status
 }
 update_all(){
     stop_mihomo >/dev/null 2>&1 || true
@@ -1032,8 +1298,8 @@ update_all(){
 
 # -----------------------------------------------------------------------------
 # Router runtime defaults.
-# Mihomo creates only a system-stack TUN. A separate helper creates old-kernel-
-# compatible MARK/ip rule/ip route/iptables rules and removes them on stop.
+# Mihomo creates a userspace gVisor TUN with the conventional fixed name tun0.
+# A separate helper creates old-kernel-compatible MARK/ip-rule/ip-route rules.
 # -----------------------------------------------------------------------------
 
 write_default_config(){
@@ -1098,7 +1364,7 @@ dns:
 tun:
   enable: true
   stack: gvisor
-  device: goshatun
+  device: tun0
   mtu: 1500
   dns-hijack:
     - "any:53"
@@ -1231,22 +1497,23 @@ watchdog_wan_available(){
 watchdog_probe_url(){
     url="$1"
     tmp="/tmp/goshacrash-watchdog.$$"
+    probe_home="$STATE/watchdog-wget-home"
+    mkdir -p "$probe_home" 2>/dev/null || true
+    chmod 700 "$probe_home" 2>/dev/null || true
     rm -f "$tmp"
+    rc=1
 
     if [ -x /usr/sbin/wget ]; then
-        HOME=/tmp /usr/sbin/wget -T 12 -t 1 --no-check-certificate \
-            -O "$tmp" "$url" >/dev/null 2>&1
-        rc=$?
+        HOME="$probe_home" /usr/sbin/wget -T 15 -t 1 --no-check-certificate \
+            -O "$tmp" "$url" >/dev/null 2>&1 && rc=0
     elif have wget; then
-        HOME=/tmp "$(which wget)" -T 12 -t 1 --no-check-certificate \
-            -O "$tmp" "$url" >/dev/null 2>&1
-        rc=$?
-    elif have curl; then
-        HOME=/tmp "$(which curl)" -4 -k -f -L \
-            --connect-timeout 8 --max-time 15 -o "$tmp" "$url" >/dev/null 2>&1
-        rc=$?
-    else
-        rc=1
+        HOME="$probe_home" "$(which wget)" -T 15 -t 1 --no-check-certificate \
+            -O "$tmp" "$url" >/dev/null 2>&1 && rc=0
+    fi
+
+    if [ "$rc" -ne 0 ] && have curl; then
+        HOME="$probe_home" "$(which curl)" -4 -k -f -L \
+            --connect-timeout 10 --max-time 20 -o "$tmp" "$url" >/dev/null 2>&1 && rc=0
     fi
 
     rm -f "$tmp"
@@ -1272,16 +1539,10 @@ watchdog_local_ok(){
     return 0
 }
 
-watchdog_now(){
-    now="$(date '+%s' 2>/dev/null)"
-    case "$now" in ''|*[!0-9]*) now=0;; esac
-    printf '%s\n' "$now"
-}
-
 watchdog_fail_open(){
     reason="$1"
     enter_direct_mode "$reason"
-    watchdog_log "Watchdog завершён; VPN останется выключенным до ручного goshacrash start"
+    watchdog_log "Watchdog завершён; VPN останется выключенным до ручного start или следующего reboot"
 }
 
 watchdog_loop(){
@@ -1294,7 +1555,7 @@ watchdog_loop(){
     trap 'cleanup_watchdog' EXIT
     echo "$$" > "$WATCHDOG_PIDFILE"
 
-    watchdog_log "Fail-open watchdog запущен: tick=${WATCHDOG_INTERVAL}s probe=${WATCHDOG_PROBE_INTERVAL}s internet-threshold=$WATCHDOG_FAIL_THRESHOLD"
+    watchdog_log "Fail-open watchdog запущен: tick=${WATCHDOG_INTERVAL}s local-threshold=$WATCHDOG_LOCAL_FAIL_THRESHOLD remote-probe=$WATCHDOG_PROBE_ENABLED"
 
     slept=0
     while [ "$slept" -lt "$WATCHDOG_BOOT_GRACE" ]; do
@@ -1324,19 +1585,21 @@ watchdog_loop(){
             fi
         fi
 
-        probe_elapsed=$((probe_elapsed + WATCHDOG_INTERVAL))
-        if [ "$probe_elapsed" -ge "$WATCHDOG_PROBE_INTERVAL" ]; then
-            probe_elapsed=0
+        if [ "$WATCHDOG_PROBE_ENABLED" = 1 ]; then
+            probe_elapsed=$((probe_elapsed + WATCHDOG_INTERVAL))
+            if [ "$probe_elapsed" -ge "$WATCHDOG_PROBE_INTERVAL" ]; then
+                probe_elapsed=0
 
-            if watchdog_internet_ok; then
-                internet_failures=0
-            else
-                internet_failures=$((internet_failures + 1))
-                watchdog_log "Контрольный интернет-запрос не прошёл ($internet_failures/$WATCHDOG_FAIL_THRESHOLD)"
+                if watchdog_internet_ok; then
+                    internet_failures=0
+                else
+                    internet_failures=$((internet_failures + 1))
+                    watchdog_log "Контрольный интернет-запрос не прошёл ($internet_failures/$WATCHDOG_FAIL_THRESHOLD)"
 
-                if [ "$internet_failures" -ge "$WATCHDOG_FAIL_THRESHOLD" ]; then
-                    watchdog_fail_open "WAN присутствует, но интернет через Mihomo недоступен"
-                    return 0
+                    if [ "$internet_failures" -ge "$WATCHDOG_FAIL_THRESHOLD" ]; then
+                        watchdog_fail_open "WAN присутствует, но интернет через Mihomo недоступен"
+                        return 0
+                    fi
                 fi
             fi
         fi
@@ -1352,7 +1615,9 @@ watchdog_status(){
         echo "WAN watchdog: не запущен"
     fi
 
-    echo "Fail-open: tick=${WATCHDOG_INTERVAL}s; local-threshold=$WATCHDOG_LOCAL_FAIL_THRESHOLD; probe=${WATCHDOG_PROBE_INTERVAL}s; internet-threshold=$WATCHDOG_FAIL_THRESHOLD"
+    echo "Fail-open: tick=${WATCHDOG_INTERVAL}s; local-threshold=$WATCHDOG_LOCAL_FAIL_THRESHOLD; remote-probe=$WATCHDOG_PROBE_ENABLED"
+    [ "$WATCHDOG_PROBE_ENABLED" = 1 ] && echo "Probe URLs: $WATCHDOG_URLS"
+    [ "$WATCHDOG_PROBE_ENABLED" = 1 ] && echo "Remote probe: interval=${WATCHDOG_PROBE_INTERVAL}s; threshold=$WATCHDOG_FAIL_THRESHOLD"
     if [ -f "$WATCHDOG_LOG" ]; then
         echo "Последние события:"
         tail -n 12 "$WATCHDOG_LOG" 2>/dev/null
@@ -1362,9 +1627,11 @@ watchdog_status(){
 dns_status(){
     dnsmasq_ok=no
     mihomo_ok=no
+    bridge=off
     netstat -ln 2>/dev/null | grep -Eq '[:.]53[[:space:]]' && dnsmasq_ok=yes
     netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" && mihomo_ok=yes
-    echo "dnsmasq:53=$dnsmasq_ok; Mihomo DNS:$DNS_PORT=$mihomo_ok; bridge=goshacrash-route"
+    [ -f "$VPN_SESSION_FILE" ] && running_pid >/dev/null 2>&1 && bridge=on
+    echo "dnsmasq:53=$dnsmasq_ok; Mihomo DNS:$DNS_PORT=$mihomo_ok; bridge=$bridge"
 }
 
 firewall_reload(){
@@ -1384,10 +1651,10 @@ status(){
     fi
     echo "GoshaCrash: $VERSION"
     if [ -f "$VPN_SESSION_FILE" ] && running_pid >/dev/null 2>&1; then
-        echo "Сеанс: VPN активен до reboot/WAN/failure/stop"
+        echo "Сеанс: VPN активен; после reboot запускается автоматически"
         echo "Режим: чистый TUN, TCP+UDP через gVisor"
     else
-        echo "Сеанс: обычный DIRECT; VPN запускается вручную"
+        echo "Сеанс: обычный DIRECT; ручной start или reboot снова включит VPN"
         [ -f "$DIRECT_REASON_FILE" ] && echo "Причина DIRECT: $(cat "$DIRECT_REASON_FILE" 2>/dev/null)"
         echo "Режим VPN: чистый TUN, TCP+UDP через gVisor"
     fi
@@ -1402,10 +1669,14 @@ status(){
     fi
 
     echo "Mihomo: auto-route=false; auto-redirect=false"
-    if route_helper status >/dev/null 2>&1; then
-        echo "GoshaRoute: работает"
+    if [ -f "$VPN_SESSION_FILE" ] && running_pid >/dev/null 2>&1; then
+        if route_helper status >/dev/null 2>&1; then
+            echo "GoshaRoute: работает"
+        else
+            echo "GoshaRoute: ОШИБКА"
+        fi
     else
-        echo "GoshaRoute: не работает"
+        echo "GoshaRoute: выключен (норма для DIRECT)"
     fi
     echo "LAN: TCP+UDP -> MARK $TUN_MARK -> table $TUN_TABLE -> $d -> gVisor"
     [ "$ROUTE_ROUTER" = 1 ] &&
@@ -1417,13 +1688,17 @@ status(){
         echo "WAN watchdog: не запущен"
     fi
 
-    c="$(yaml_top "$RUNTIME" external-controller)"
-    [ -n "$c" ] || c=0.0.0.0:9090
-    p="${c##*:}"
-    case "$p" in ''|*[!0-9]*) p=9090;; esac
-    echo "Zashboard: http://$(lan_ip):$p/ui/"
-    s="$(yaml_top "$RUNTIME" secret)"
-    [ -n "$s" ] && echo "API secret: $s"
+    if running_pid >/dev/null 2>&1; then
+        c="$(yaml_top "$RUNTIME" external-controller)"
+        [ -n "$c" ] || c=0.0.0.0:9090
+        p="${c##*:}"
+        case "$p" in ''|*[!0-9]*) p=9090;; esac
+        echo "Zashboard: http://$(lan_ip):$p/ui/"
+        s="$(yaml_top "$RUNTIME" secret)"
+        [ -n "$s" ] && echo "API secret: $s"
+    else
+        echo "Zashboard: недоступен до запуска VPN"
+    fi
 }
 
 doctor(){
@@ -1477,9 +1752,9 @@ menu(){
             echo "Watchdog: не запущен"
         fi
         echo
-        echo '1) Запустить VPN-сеанс до reboot/WAN/failure'
+        echo '1) Запустить VPN'
         echo '2) Остановить VPN и перейти в DIRECT'
-        echo '3) Перезапустить Mihomo'
+        echo '3) Перезапустить VPN'
         echo '4) Редактировать config.yaml и применить'
         echo '5) Применить config.yaml'
         echo '6) Показать адрес Zashboard'
@@ -1504,26 +1779,28 @@ menu(){
 }
 
 usage(){ cat <<'USAGE'
-GoshaCrash 0.9.0-rc6.2
+GoshaCrash 1.1.0
 
-Политика fail-open:
-  - после перезагрузки роутер остаётся в обычном DIRECT;
-  - WAN/link loss останавливает Mihomo и удаляет TUN-правила;
-  - crash Mihomo/TUN/routing переводит сеть в DIRECT;
-  - после возврата WAN VPN сам не запускается.
+Политика работы:
+  - после reboot S99goshacrash ждёт WAN и автоматически запускает Mihomo;
+  - используется один обычный TUN-интерфейс tun0;
+  - WAN/link loss, crash Mihomo/TUN/routing или длительный провал
+    всех интернет-проверок переводит сеть в штатный DIRECT;
+  - после fail-open VPN включается вручную либо при следующем reboot;
+  - интернет проверяется по ya.ru, mail.ru и rambler.ru; достаточно одного ответа.
 
 Управление:
   goshacrash                 открыть меню
-  goshacrash start           вручную запустить VPN-сеанс
+  goshacrash start           запустить VPN
   goshacrash stop            остановить VPN и перейти в DIRECT
   goshacrash direct          то же, что stop
-  goshacrash restart         перезапустить VPN-сеанс
+  goshacrash restart         перезапустить VPN
   goshacrash edit            изменить config.yaml и применить
-  goshacrash apply           применить config.yaml и запустить VPN-сеанс
+  goshacrash apply           применить config.yaml и запустить VPN
   goshacrash status          показать состояние
   goshacrash ui              показать адрес Zashboard
   goshacrash update          обновить Mihomo и Zashboard
-  goshacrash watchdog-status состояние fail-open watchdog
+  goshacrash watchdog-status состояние watchdog
   goshacrash runtime-audit   показать runtime TUN
   goshacrash route-status    состояние iptables/ip rule/ip route
 USAGE
@@ -1531,6 +1808,7 @@ USAGE
 
 
 ensure_dirs >/dev/null 2>&1 || true
+load_tun_device
 case "${1:-menu}" in
  menu) menu;;
  start) start_mihomo;;

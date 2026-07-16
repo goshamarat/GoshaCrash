@@ -1,12 +1,12 @@
 #!/bin/sh
-# BUILD: 2026-07-16-pure-tun-gvisor-installer-failopen-090rc62
-# GoshaCrash 0.9.0-rc6.2 installer: pure TUN with ARMv5 gVisor Mihomo.
+# BUILD: 2026-07-16-final-installer-autostart-110
+# GoshaCrash 1.1.0 installer: autostart pure tun0 with ARMv5 gVisor Mihomo.
 
-INSTALLER_VERSION="0.9.0-rc6.2"
-EXPECTED_CONTROLLER_VERSION="0.9.0-rc6.2"
-EXPECTED_CONTROLLER_BUILD="2026-07-16-pure-tun-gvisor-failopen-direct-090rc62"
-EXPECTED_ROUTE_VERSION="0.9.0-rc6.2"
-EXPECTED_ROUTE_BUILD="2026-07-16-pure-tun-gvisor-routing-helper-090rc62"
+INSTALLER_VERSION="1.1.0"
+EXPECTED_CONTROLLER_VERSION="1.1.0"
+EXPECTED_CONTROLLER_BUILD="2026-07-16-final-autostart-tun0-yandex-watchdog-110"
+EXPECTED_ROUTE_VERSION="1.1.0"
+EXPECTED_ROUTE_BUILD="2026-07-16-final-routing-tun0-110"
 
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
@@ -23,6 +23,9 @@ fetch(){
     part="$output.part.$$"
     log="/tmp/goshacrash-fetch.$$"
 
+    fetch_home="/tmp/goshacrash-wget-home"
+    mkdir -p "$fetch_home" 2>/dev/null || true
+    chmod 700 "$fetch_home" 2>/dev/null || true
     rm -f "$part" "$log"
 
     if [ -x /usr/sbin/wget ]; then
@@ -40,15 +43,15 @@ fetch(){
     fi
 
     if [ "$kind" = wget ]; then
-        HOME=/tmp "$downloader" --no-check-certificate -O "$part" "$url" >"$log" 2>&1
+        HOME="$fetch_home" "$downloader" --no-check-certificate -O "$part" "$url" >"$log" 2>&1
         rc=$?
         if [ "$rc" -ne 0 ] || [ ! -s "$part" ]; then
             rm -f "$part"
-            HOME=/tmp "$downloader" -O "$part" "$url" >>"$log" 2>&1
+            HOME="$fetch_home" "$downloader" -O "$part" "$url" >>"$log" 2>&1
             rc=$?
         fi
     else
-        HOME=/tmp "$downloader" -k -f -L -o "$part" "$url" >"$log" 2>&1
+        HOME="$fetch_home" "$downloader" -k -f -L -o "$part" "$url" >"$log" 2>&1
         rc=$?
     fi
 
