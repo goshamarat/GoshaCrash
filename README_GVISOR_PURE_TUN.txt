@@ -118,3 +118,44 @@ Controller BUILD: 2026-07-16-pure-tun-gvisor-sha256-fallback-090rc61
 
 RC6 ошибочно считал actual пустым, если на прошивке отсутствовала команда
 sha256sum, и сообщал о несовпадении хэша.
+
+
+FAIL-OPEN DIRECT — RC6.2
+========================
+
+Controller BUILD:
+  2026-07-16-pure-tun-gvisor-failopen-direct-090rc62
+
+Политика работы:
+
+1. goshacrash start:
+   вручную поднимает Mihomo, goshatun, iptables, ip rule/table 2022 и watchdog.
+
+2. goshacrash stop/direct:
+   сначала удаляет GoshaCrash iptables/ip-rule/routes, затем завершает Mihomo.
+   LAN возвращается к штатному ASUS routing/NAT через eth0.
+
+3. Перезагрузка или потеря питания:
+   после новой загрузки init-hook выполняет cleanup, но НЕ запускает VPN.
+   Роутер работает в DIRECT до ручного goshacrash start/apply.
+
+4. Отключение WAN-кабеля:
+   пока кабель отключён, физического доступа в Интернет нет.
+   Watchdog обнаруживает carrier/default-route loss, удаляет TUN-схему и
+   завершает Mihomo. После подключения кабеля штатный DIRECT восстанавливается;
+   VPN автоматически не запускается.
+
+5. Crash Mihomo/TUN/routing:
+   после двух локальных неудачных проверок выполняется fail-open DIRECT.
+   Автоматического restart Mihomo нет.
+
+6. WAN есть, но Интернет через Mihomo не работает:
+   проверка выполняется каждые 60 секунд. После двух провалов выполняется DIRECT.
+
+Проверка режима DIRECT:
+
+  goshacrash status
+  ip link show goshatun
+  ip rule show
+  ip route show table 2022
+  iptables-save | grep GOSHACRASH

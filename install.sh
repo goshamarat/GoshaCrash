@@ -1,12 +1,12 @@
 #!/bin/sh
-# BUILD: 2026-07-16-pure-tun-gvisor-installer-090rc61
-# GoshaCrash 0.9.0-rc6.1 installer: pure TUN with ARMv5 gVisor Mihomo.
+# BUILD: 2026-07-16-pure-tun-gvisor-installer-failopen-090rc62
+# GoshaCrash 0.9.0-rc6.2 installer: pure TUN with ARMv5 gVisor Mihomo.
 
-INSTALLER_VERSION="0.9.0-rc6.1"
-EXPECTED_CONTROLLER_VERSION="0.9.0-rc6.1"
-EXPECTED_CONTROLLER_BUILD="2026-07-16-pure-tun-gvisor-sha256-fallback-090rc61"
-EXPECTED_ROUTE_VERSION="0.9.0-rc6.1"
-EXPECTED_ROUTE_BUILD="2026-07-16-pure-tun-gvisor-routing-helper-090rc61"
+INSTALLER_VERSION="0.9.0-rc6.2"
+EXPECTED_CONTROLLER_VERSION="0.9.0-rc6.2"
+EXPECTED_CONTROLLER_BUILD="2026-07-16-pure-tun-gvisor-failopen-direct-090rc62"
+EXPECTED_ROUTE_VERSION="0.9.0-rc6.2"
+EXPECTED_ROUTE_BUILD="2026-07-16-pure-tun-gvisor-routing-helper-090rc62"
 
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"

@@ -1,10 +1,10 @@
 #!/bin/sh
-# BUILD: 2026-07-16-pure-tun-gvisor-sha256-fallback-090rc61
-# GoshaCrash 0.9.0-rc6.1 — pure TUN with custom ARMv5 gVisor Mihomo.
+# BUILD: 2026-07-16-pure-tun-gvisor-failopen-direct-090rc62
+# GoshaCrash 0.9.0-rc6.2 — pure gVisor TUN with fail-open DIRECT policy.
 # Target: ASUS RT-AC68U, Download Master installed, USB-mounted installation.
 
-VERSION="0.9.0-rc6.1"
-BUILD_ID="2026-07-16-pure-tun-gvisor-sha256-fallback-090rc61"
+VERSION="0.9.0-rc6.2"
+BUILD_ID="2026-07-16-pure-tun-gvisor-failopen-direct-090rc62"
 SHELLCRASH_REPO="${SHELLCRASH_REPO:-juewuy/ShellCrash}"
 SHELLCRASH_BRANCH="${SHELLCRASH_BRANCH:-update}"
 
@@ -55,10 +55,19 @@ LEGACY_ROUTER_DNS_CHAIN="GOSHACRASH_DNSMASQ_UPSTREAM"
 # It never reboots the router and never rewrites config.yaml/runtime.yaml.
 WATCHDOG_PIDFILE="$BASE/run/watchdog.pid"
 WATCHDOG_LOG="$BASE/logs/watchdog.log"
-WATCHDOG_INTERVAL="${GOSHACRASH_WATCHDOG_INTERVAL:-60}"
-WATCHDOG_FAIL_THRESHOLD="${GOSHACRASH_WATCHDOG_FAIL_THRESHOLD:-3}"
-WATCHDOG_BOOT_GRACE="${GOSHACRASH_WATCHDOG_BOOT_GRACE:-120}"
-WATCHDOG_ACTION_COOLDOWN="${GOSHACRASH_WATCHDOG_ACTION_COOLDOWN:-600}"
+VPN_SESSION_FILE="$STATE/vpn-session.active"
+DIRECT_REASON_FILE="$STATE/direct-mode.reason"
+
+# Fail-open watchdog:
+# - WAN/link loss: switch to DIRECT within a few seconds;
+# - local Mihomo/TUN/routing failure: switch to DIRECT;
+# - repeated Internet probe failure: switch to DIRECT;
+# - it never restarts Mihomo automatically.
+WATCHDOG_INTERVAL="${GOSHACRASH_WATCHDOG_INTERVAL:-5}"
+WATCHDOG_LOCAL_FAIL_THRESHOLD="${GOSHACRASH_WATCHDOG_LOCAL_FAIL_THRESHOLD:-2}"
+WATCHDOG_PROBE_INTERVAL="${GOSHACRASH_WATCHDOG_PROBE_INTERVAL:-60}"
+WATCHDOG_FAIL_THRESHOLD="${GOSHACRASH_WATCHDOG_FAIL_THRESHOLD:-2}"
+WATCHDOG_BOOT_GRACE="${GOSHACRASH_WATCHDOG_BOOT_GRACE:-10}"
 WATCHDOG_URLS="${GOSHACRASH_WATCHDOG_URLS:-https://www.gstatic.com/generate_204 https://cp.cloudflare.com/generate_204}"
 
 PATH="/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$USB_MOUNT/asusware.arm/bin:$USB_MOUNT/asusware.arm/sbin:$USB_MOUNT/asusware.arm/opt/bin:$USB_MOUNT/asusware.arm/opt/sbin:$USB_MOUNT/asusware.arm/usr/bin"
@@ -70,6 +79,24 @@ fail(){ printf '%s\n' "[GoshaCrash:ERROR] $*" >&2; return 1; }
 have(){ which "$1" >/dev/null 2>&1; }
 
 ensure_dirs(){ mkdir -p "$BASE/bin" "$UI" "$BASE/run" "$BASE/logs" "$BACKUPS" "$STATE"; }
+
+set_vpn_session_active(){
+    ensure_dirs >/dev/null 2>&1 || true
+    date '+%Y-%m-%d %H:%M:%S' > "$VPN_SESSION_FILE" 2>/dev/null || : > "$VPN_SESSION_FILE"
+    rm -f "$DIRECT_REASON_FILE"
+}
+
+clear_vpn_session(){
+    rm -f "$VPN_SESSION_FILE"
+}
+
+write_direct_reason(){
+    ensure_dirs >/dev/null 2>&1 || true
+    reason="$*"
+    stamp="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+    [ -n "$stamp" ] || stamp="unknown-time"
+    printf '%s | %s\n' "$stamp" "$reason" > "$DIRECT_REASON_FILE" 2>/dev/null || true
+}
 
 is_true(){
     case "$1" in true|True|TRUE|yes|Yes|YES|1|on|On|ON) return 0;; esac
@@ -744,9 +771,22 @@ cleanup_legacy_network(){
     fi
 }
 
+enter_direct_mode(){
+    reason="${1:-fail-open}"
+    watchdog_log "FAIL-OPEN -> DIRECT: $reason"
+    cleanup_legacy_network
+    kill_mihomo
+    clear_vpn_session
+    write_direct_reason "$reason"
+}
+
 start_mihomo(){
     if p="$(running_pid)"; then
-        route_helper reload || return 1
+        route_helper reload || {
+            enter_direct_mode "не удалось восстановить правила для уже запущенного Mihomo"
+            return 1
+        }
+        set_vpn_session_active
         [ "${GOSHACRASH_WATCHDOG_INTERNAL:-0}" = 1 ] || watchdog_start || true
         echo "Mihomo уже запущен, PID=$p"
         return 0
@@ -800,10 +840,13 @@ start_mihomo(){
     route_helper start || {
         kill_mihomo
         cleanup_legacy_network
-        fail "Совместимая маршрутизация не поднялась"
+        clear_vpn_session
+        write_direct_reason "маршрутизация TUN не поднялась"
+        fail "Совместимая маршрутизация не поднялась; оставлен обычный DIRECT"
         return 1
     }
 
+    set_vpn_session_active
     echo "Mihomo запущен, PID=$(cat "$PIDFILE" 2>/dev/null)"
     echo "[GoshaCrash] Чистый TUN: TCP+UDP -> goshatun -> Mihomo gVisor; auto-route=off"
     [ "${GOSHACRASH_WATCHDOG_INTERNAL:-0}" = 1 ] || watchdog_start || true
@@ -811,9 +854,8 @@ start_mihomo(){
 
 stop_mihomo(){
     [ "${GOSHACRASH_WATCHDOG_INTERNAL:-0}" = 1 ] || watchdog_stop
-    cleanup_legacy_network
-    kill_mihomo
-    echo "Mihomo и совместимая маршрутизация остановлены"
+    enter_direct_mode "ручная остановка"
+    echo "Mihomo и TUN остановлены; трафик переведён в обычный DIRECT"
 }
 
 backup_config(){
@@ -882,9 +924,20 @@ apply_config(){
 check_config(){ ensure_dirs || return 1; t="$BASE/run/check.yaml"; render_runtime "$t" || return 1; check_file "$t"; r=$?; rm -f "$t"; return "$r"; }
 
 boot_service(){
-    n=0; while [ ! -x "$BIN" ] && [ "$n" -lt 30 ]; do sleep 2; n=$((n+1)); done
-    [ -x "$BIN" ] || return 1; [ -f "$RUNTIME" ] || return 0
-    start_mihomo
+    n=0
+    while [ ! -x "$BIN" ] && [ "$n" -lt 30 ]; do
+        sleep 2
+        n=$((n + 1))
+    done
+
+    # Reboot is a hard VPN-session boundary.
+    watchdog_stop
+    cleanup_legacy_network
+    kill_mihomo
+    clear_vpn_session
+    write_direct_reason "перезагрузка роутера: VPN не запускается автоматически"
+    say "После загрузки оставлен обычный DIRECT. Для VPN: goshacrash start"
+    return 0
 }
 
 prepend_path(){
@@ -1137,6 +1190,26 @@ watchdog_start(){
     say "WAN watchdog запущен, PID=$p"
 }
 
+watchdog_wan_iface(){
+    iface="$(nvram get wan0_ifname 2>/dev/null)"
+    [ -n "$iface" ] || iface="$(nvram get wan_ifname 2>/dev/null)"
+    [ -n "$iface" ] || iface="$(ip route show default 2>/dev/null | awk -v d="$TUN_DEVICE" '$0 !~ ("dev " d "([[:space:]]|$)") {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    [ -n "$iface" ] && printf '%s\n' "$iface"
+}
+
+watchdog_wan_carrier_present(){
+    iface="$(watchdog_wan_iface)"
+    [ -n "$iface" ] || return 1
+
+    carrier="/sys/class/net/$iface/carrier"
+    if [ -r "$carrier" ]; then
+        [ "$(cat "$carrier" 2>/dev/null)" = 1 ]
+        return $?
+    fi
+
+    ip link show "$iface" 2>/dev/null | grep -q 'LOWER_UP'
+}
+
 watchdog_wan_route_present(){
     if ip route show 2>/dev/null | awk -v d="$TUN_DEVICE" '
         $1 == "default" && $0 !~ ("dev " d "([[:space:]]|$)") {found=1}
@@ -1149,6 +1222,10 @@ watchdog_wan_route_present(){
         $1 == "0.0.0.0" && $8 != d {found=1}
         END {exit(found ? 0 : 1)}
     '
+}
+
+watchdog_wan_available(){
+    watchdog_wan_carrier_present && watchdog_wan_route_present
 }
 
 watchdog_probe_url(){
@@ -1201,16 +1278,10 @@ watchdog_now(){
     printf '%s\n' "$now"
 }
 
-watchdog_soft_restart(){
-    watchdog_log "Мягкий перезапуск Mihomo"
-    GOSHACRASH_WATCHDOG_INTERNAL=1
-    export GOSHACRASH_WATCHDOG_INTERNAL
-    stop_mihomo >/dev/null 2>&1 || true
-    sleep 2
-    start_mihomo >/dev/null 2>&1
-    rc=$?
-    unset GOSHACRASH_WATCHDOG_INTERNAL
-    return "$rc"
+watchdog_fail_open(){
+    reason="$1"
+    enter_direct_mode "$reason"
+    watchdog_log "Watchdog завершён; VPN останется выключенным до ручного goshacrash start"
 }
 
 watchdog_loop(){
@@ -1223,99 +1294,50 @@ watchdog_loop(){
     trap 'cleanup_watchdog' EXIT
     echo "$$" > "$WATCHDOG_PIDFILE"
 
-    watchdog_log "Watchdog запущен: interval=${WATCHDOG_INTERVAL}s threshold=$WATCHDOG_FAIL_THRESHOLD cooldown=${WATCHDOG_ACTION_COOLDOWN}s"
+    watchdog_log "Fail-open watchdog запущен: tick=${WATCHDOG_INTERVAL}s probe=${WATCHDOG_PROBE_INTERVAL}s internet-threshold=$WATCHDOG_FAIL_THRESHOLD"
 
     slept=0
     while [ "$slept" -lt "$WATCHDOG_BOOT_GRACE" ]; do
-        sleep 5
-        slept=$((slept + 5))
+        sleep 2
+        slept=$((slept + 2))
     done
 
-    state=boot
-    failures=0
-    last_action=0
+    local_failures=0
+    internet_failures=0
+    probe_elapsed=0
 
     while :; do
-        if ! watchdog_wan_route_present; then
-            if [ "$state" != down ]; then
-                watchdog_log "WAN потерян: основной default route отсутствует; сервисы оставлены запущенными"
-            fi
-            state=down
-            failures=0
-            sleep "$WATCHDOG_INTERVAL"
-            continue
+        if ! watchdog_wan_available; then
+            watchdog_fail_open "WAN-кабель, carrier или основной default route потерян"
+            return 0
         fi
 
-        if [ "$state" = down ]; then
-            watchdog_log "WAN-маршрут вернулся"
-        fi
+        if watchdog_local_ok; then
+            local_failures=0
+        else
+            local_failures=$((local_failures + 1))
+            watchdog_log "Локальная проверка Mihomo/TUN/routing не прошла ($local_failures/$WATCHDOG_LOCAL_FAIL_THRESHOLD)"
 
-        if ! running_pid >/dev/null 2>&1; then
-            now="$(watchdog_now)"
-            elapsed=$((now - last_action))
-            if [ "$last_action" -eq 0 ] ||
-               [ "$elapsed" -ge "$WATCHDOG_ACTION_COOLDOWN" ]; then
-                watchdog_log "Mihomo не запущен при доступном WAN; выполняется запуск"
-                GOSHACRASH_WATCHDOG_INTERNAL=1
-                export GOSHACRASH_WATCHDOG_INTERNAL
-                start_mihomo >/dev/null 2>&1
-                rc=$?
-                unset GOSHACRASH_WATCHDOG_INTERNAL
-                last_action="$now"
-                [ "$rc" -eq 0 ] ||
-                    watchdog_log "Запустить Mihomo не удалось"
+            if [ "$local_failures" -ge "$WATCHDOG_LOCAL_FAIL_THRESHOLD" ]; then
+                watchdog_fail_open "Mihomo, DNS, TUN или policy routing перестали работать"
+                return 0
             fi
         fi
 
-        if running_pid >/dev/null 2>&1 && ! watchdog_local_ok; then
-            watchdog_log "TUN или совместимая маршрутизация повреждены; сначала пересоздаются правила"
-            route_helper reload >/dev/null 2>&1 || watchdog_soft_restart || true
-            sleep 5
-        fi
+        probe_elapsed=$((probe_elapsed + WATCHDOG_INTERVAL))
+        if [ "$probe_elapsed" -ge "$WATCHDOG_PROBE_INTERVAL" ]; then
+            probe_elapsed=0
 
-        if ! running_pid >/dev/null 2>&1; then
-            state=degraded
-            failures=0
-            sleep "$WATCHDOG_INTERVAL"
-            continue
-        fi
+            if watchdog_internet_ok; then
+                internet_failures=0
+            else
+                internet_failures=$((internet_failures + 1))
+                watchdog_log "Контрольный интернет-запрос не прошёл ($internet_failures/$WATCHDOG_FAIL_THRESHOLD)"
 
-        if watchdog_internet_ok; then
-            if [ "$state" != up ]; then
-                watchdog_log "Интернет доступен через текущую схему Mihomo"
-            fi
-            state=up
-            failures=0
-            sleep "$WATCHDOG_INTERVAL"
-            continue
-        fi
-
-        failures=$((failures + 1))
-        if [ "$failures" -eq 1 ]; then
-            watchdog_log "WAN-маршрут есть, но контрольный интернет-запрос не проходит"
-        fi
-        state=degraded
-
-        if [ "$failures" -ge "$WATCHDOG_FAIL_THRESHOLD" ]; then
-            now="$(watchdog_now)"
-            elapsed=$((now - last_action))
-
-            if [ "$last_action" -eq 0 ] ||
-               [ "$elapsed" -ge "$WATCHDOG_ACTION_COOLDOWN" ]; then
-                watchdog_log "Порог ошибок достигнут; пересоздаются совместимые правила маршрутизации"
-                route_helper reload >/dev/null 2>&1 || watchdog_soft_restart || true
-                sleep 5
-
-                if watchdog_internet_ok; then
-                    watchdog_log "Связь восстановлена после мягкого перезапуска Mihomo"
-                    state=up
-                else
-                    watchdog_log "Связь не восстановлена; следующий restart будет не раньше cooldown"
-                    state=degraded
+                if [ "$internet_failures" -ge "$WATCHDOG_FAIL_THRESHOLD" ]; then
+                    watchdog_fail_open "WAN присутствует, но интернет через Mihomo недоступен"
+                    return 0
                 fi
-
-                failures=0
-                last_action="$now"
             fi
         fi
 
@@ -1330,7 +1352,7 @@ watchdog_status(){
         echo "WAN watchdog: не запущен"
     fi
 
-    echo "Интервал: ${WATCHDOG_INTERVAL}s; порог: $WATCHDOG_FAIL_THRESHOLD; cooldown: ${WATCHDOG_ACTION_COOLDOWN}s"
+    echo "Fail-open: tick=${WATCHDOG_INTERVAL}s; local-threshold=$WATCHDOG_LOCAL_FAIL_THRESHOLD; probe=${WATCHDOG_PROBE_INTERVAL}s; internet-threshold=$WATCHDOG_FAIL_THRESHOLD"
     if [ -f "$WATCHDOG_LOG" ]; then
         echo "Последние события:"
         tail -n 12 "$WATCHDOG_LOG" 2>/dev/null
@@ -1348,7 +1370,10 @@ dns_status(){
 firewall_reload(){
     running_pid >/dev/null 2>&1 || return 0
     say "ASUSWRT перезапустил firewall; пересоздаю совместимые правила"
-    route_helper reload
+    route_helper reload || {
+        enter_direct_mode "не удалось восстановить правила после перезапуска firewall"
+        return 1
+    }
 }
 
 status(){
@@ -1358,7 +1383,14 @@ status(){
         echo "Mihomo: не запущен"
     fi
     echo "GoshaCrash: $VERSION"
-    echo "Режим: чистый TUN, TCP+UDP через gVisor"
+    if [ -f "$VPN_SESSION_FILE" ] && running_pid >/dev/null 2>&1; then
+        echo "Сеанс: VPN активен до reboot/WAN/failure/stop"
+        echo "Режим: чистый TUN, TCP+UDP через gVisor"
+    else
+        echo "Сеанс: обычный DIRECT; VPN запускается вручную"
+        [ -f "$DIRECT_REASON_FILE" ] && echo "Причина DIRECT: $(cat "$DIRECT_REASON_FILE" 2>/dev/null)"
+        echo "Режим VPN: чистый TUN, TCP+UDP через gVisor"
+    fi
     echo "BASE: $BASE"
     echo "DNS: $(dns_status)"
 
@@ -1445,8 +1477,8 @@ menu(){
             echo "Watchdog: не запущен"
         fi
         echo
-        echo '1) Запустить чистый TUN'
-        echo '2) Остановить Mihomo'
+        echo '1) Запустить VPN-сеанс до reboot/WAN/failure'
+        echo '2) Остановить VPN и перейти в DIRECT'
         echo '3) Перезапустить Mihomo'
         echo '4) Редактировать config.yaml и применить'
         echo '5) Применить config.yaml'
@@ -1472,29 +1504,37 @@ menu(){
 }
 
 usage(){ cat <<'USAGE'
-GoshaCrash 0.9.0-rc6.1
+GoshaCrash 0.9.0-rc6.2
+
+Политика fail-open:
+  - после перезагрузки роутер остаётся в обычном DIRECT;
+  - WAN/link loss останавливает Mihomo и удаляет TUN-правила;
+  - crash Mihomo/TUN/routing переводит сеть в DIRECT;
+  - после возврата WAN VPN сам не запускается.
 
 Управление:
   goshacrash                 открыть меню
-  goshacrash start           запустить Mihomo и watchdog
-  goshacrash stop            остановить Mihomo и watchdog
-  goshacrash restart         перезапустить Mihomo
+  goshacrash start           вручную запустить VPN-сеанс
+  goshacrash stop            остановить VPN и перейти в DIRECT
+  goshacrash direct          то же, что stop
+  goshacrash restart         перезапустить VPN-сеанс
   goshacrash edit            изменить config.yaml и применить
-  goshacrash apply           применить config.yaml
+  goshacrash apply           применить config.yaml и запустить VPN-сеанс
   goshacrash status          показать состояние
   goshacrash ui              показать адрес Zashboard
   goshacrash update          обновить Mihomo и Zashboard
-  goshacrash watchdog-status состояние watchdog
-  goshacrash runtime-audit   показать совместимый runtime TUN
+  goshacrash watchdog-status состояние fail-open watchdog
+  goshacrash runtime-audit   показать runtime TUN
   goshacrash route-status    состояние iptables/ip rule/ip route
 USAGE
 }
+
 
 ensure_dirs >/dev/null 2>&1 || true
 case "${1:-menu}" in
  menu) menu;;
  start) start_mihomo;;
- stop) stop_mihomo;;
+ stop|direct) stop_mihomo;;
  restart) stop_mihomo; start_mihomo;;
  edit|setup) edit_config && apply_config;;
  apply) apply_config;;
