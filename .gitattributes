@@ -1,4 +1,0 @@
-*.sh text eol=lf
-goshacrash text eol=lf
-*.yaml text eol=lf
-*.md text eol=lf

@@ -1,0 +1,64 @@
+# Единственный рабочий конфиг GoshaCrash.
+# Файл config.yaml создаётся из этого шаблона при первой установке.
+
+mixed-port: 7892
+routing-mark: 9012
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: info
+ipv6: false
+find-process-mode: off
+
+external-controller: 0.0.0.0:9090
+secret: "CHANGE_ME"
+external-ui: ui
+
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "+.lan"
+    - "+.local"
+    - "+.arpa"
+    - "localhost"
+  default-nameserver:
+    - 77.88.8.8
+    - 77.88.8.1
+    - 1.1.1.1
+  proxy-server-nameserver:
+    - 77.88.8.8
+    - 77.88.8.1
+    - 1.1.1.1
+  nameserver:
+    - 77.88.8.8
+    - 77.88.8.1
+    - 1.1.1.1
+
+tun:
+  enable: true
+  stack: gvisor
+  device: tun0
+  mtu: 1500
+  auto-route: false
+  auto-redirect: false
+  auto-detect-interface: false
+  strict-route: false
+
+proxies: []
+
+proxy-groups:
+  - name: GLOBAL-PROXY
+    type: select
+    proxies:
+      - DIRECT
+
+rules:
+  - MATCH,DIRECT
