@@ -1,18 +1,16 @@
 #!/bin/sh
-# GoshaCrash online bootstrap installer for legacy ASUSWRT routers.
-# Installs everything from GitHub and uses Download Master/Optware for packages.
+# GoshaCrash online installer for real ASUSWRT routers.
+# One copied file installs the controller, a matching Mihomo core, Zashboard,
+# package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.0.0-online"
+INSTALLER_VERSION="3.4.1-minimal"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
-ACTION="${1:-install}"
 
-MIHOMO_VERSION="${MIHOMO_VERSION:-v1.19.28}"
-MIHOMO_TAG="${MIHOMO_TAG:-mihomo-gvisor-armv5-$MIHOMO_VERSION}"
-MIHOMO_ASSET="${MIHOMO_ASSET:-mihomo-linux-armv5-gvisor-$MIHOMO_VERSION.gz}"
-MIHOMO_URL="${MIHOMO_URL:-https://github.com/$REPO/releases/download/$MIHOMO_TAG/$MIHOMO_ASSET}"
-MIHOMO_SHA_URL="${MIHOMO_SHA_URL:-$MIHOMO_URL.sha256}"
-ZASHBOARD_URL="${ZASHBOARD_URL:-https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip}"
+LEGACY_MIHOMO_VERSION="${LEGACY_MIHOMO_VERSION:-v1.19.28}"
+LEGACY_MIHOMO_TAG="${LEGACY_MIHOMO_TAG:-mihomo-gvisor-armv5-$LEGACY_MIHOMO_VERSION}"
+OFFICIAL_MIHOMO_FALLBACK="${OFFICIAL_MIHOMO_FALLBACK:-v1.19.29}"
+ZASHBOARD_PRIMARY="${ZASHBOARD_URL:-https://github.com/Zephyruso/zashboard/releases/latest/download/dist-cdn-fonts.zip}"
 
 TMP_ROOT="/tmp/goshacrash-install.$$"
 TMP_LOG="/tmp/goshacrash-install.log"
@@ -21,6 +19,20 @@ USB_MOUNT=""
 DM_ROOT=""
 BASE=""
 PKG=""
+UNZIP_BIN=""
+GZIP_BIN=""
+DOWNLOADER=""
+
+PLATFORM=""
+LEGACY="0"
+ROUTING_MODE=""
+TUN_STACK=""
+MIHOMO_TARGET=""
+MIHOMO_SOURCE=""
+MIHOMO_VERSION_SELECTED=""
+MIHOMO_URL_SELECTED=""
+CONFIG_TEMPLATE=""
+GCNET_BIN=""
 
 now(){ date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date; }
 _emit(){ level="$1"; shift; line="[$(now)] [$level] [install] $*"; printf '%s\n' "$line"; printf '%s\n' "$line" >> "$INSTALL_LOG" 2>/dev/null || true; }
@@ -28,143 +40,151 @@ say(){ _emit INFO "$@"; }
 ok(){ _emit OK "$@"; }
 warn(){ _emit WARN "$@" >&2; }
 fail(){ _emit ERROR "$@" >&2; return 1; }
-have(){ command -v "$1" >/dev/null 2>&1; }
 
 cleanup(){ rm -rf "$TMP_ROOT" 2>/dev/null || true; }
 trap cleanup EXIT HUP INT TERM
 
-usage(){
-    cat <<'USAGE'
-GoshaCrash online installer
 
-Использование:
-  sh install.sh                 полная установка
-  sh install.sh install         полная установка
-  sh install.sh repair          повторно скачать недостающие компоненты
-  sh install.sh remove          удалить GoshaCrash, сохранив config.yaml
+verify_asuswrt(){
+    command -v nvram >/dev/null 2>&1 || { fail "nvram не найден: установщик предназначен для реального ASUSWRT"; return 1; }
+    [ -d /jffs ] || { fail "/jffs не найден: это не поддерживаемая ASUSWRT-среда"; return 1; }
+    [ -d /tmp/mnt ] || { fail "/tmp/mnt не найден: USB-подсистема ASUSWRT не готова"; return 1; }
+}
 
-Переменные:
-  INSTALL_ROOT=/tmp/mnt/МЕТКА
-  INSTALL_DIR=/tmp/mnt/МЕТКА/goshacrash
-  REPO=goshamarat/GoshaCrash
-  BRANCH=main
-  MIHOMO_URL=https://...
-  ZASHBOARD_URL=https://...
-USAGE
+tool_path(){
+    name="$1"
+    for p in \
+        "/opt/bin/$name" "/opt/sbin/$name" \
+        "/tmp/opt/bin/$name" "/tmp/opt/sbin/$name" \
+        "$DM_ROOT/bin/$name" "$DM_ROOT/sbin/$name" \
+        "/usr/sbin/$name" "/usr/bin/$name" "/sbin/$name" "/bin/$name"; do
+        [ -n "$p" ] && [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+    done
+    command -v "$name" 2>/dev/null || return 1
+}
+
+have(){ tool_path "$1" >/dev/null 2>&1; }
+
+refresh_tools(){
+    hash -r 2>/dev/null || true
+    UNZIP_BIN="$(tool_path unzip 2>/dev/null)"
+    GZIP_BIN="$(tool_path gzip 2>/dev/null)"
+    if have curl; then DOWNLOADER="curl"; elif have wget; then DOWNLOADER="wget"; else DOWNLOADER=""; fi
 }
 
 find_download_master(){
     if [ -n "${INSTALL_ROOT:-}" ]; then
-        [ -d "$INSTALL_ROOT" ] || { fail "INSTALL_ROOT не существует: $INSTALL_ROOT"; return 1; }
         USB_MOUNT="$INSTALL_ROOT"
+        [ -d "$USB_MOUNT" ] || { fail "INSTALL_ROOT не существует: $USB_MOUNT"; return 1; }
         for d in "$USB_MOUNT/asusware.arm" "$USB_MOUNT/asusware.arm64" "$USB_MOUNT/asusware"; do
             [ -d "$d" ] && { DM_ROOT="$d"; return 0; }
         done
-        fail "Download Master не найден внутри $USB_MOUNT"
+        fail "На $USB_MOUNT не найден Download Master (asusware.arm/asusware.arm64/asusware)"
         return 1
     fi
 
-    preferred=""
-    if [ -L /opt ] && have readlink; then
-        preferred="$(readlink /opt 2>/dev/null)"
-    fi
-
     count=0
-    found_mount=""
-    found_dm=""
     for mount in /tmp/mnt/*; do
         [ -d "$mount" ] || continue
         [ -w "$mount" ] || continue
         for d in "$mount/asusware.arm" "$mount/asusware.arm64" "$mount/asusware"; do
             [ -d "$d" ] || continue
-            case "$preferred" in
-                "$d"|"$d"/*) USB_MOUNT="$mount"; DM_ROOT="$d"; return 0 ;;
-            esac
             count=$((count + 1))
-            found_mount="$mount"
-            found_dm="$d"
+            USB_MOUNT="$mount"
+            DM_ROOT="$d"
             break
         done
     done
 
-    if [ "$count" -eq 1 ]; then
-        USB_MOUNT="$found_mount"
-        DM_ROOT="$found_dm"
-        return 0
-    fi
+    [ "$count" -eq 1 ] && return 0
     if [ "$count" -gt 1 ]; then
-        fail "Найдено несколько установок Download Master. Запусти с INSTALL_ROOT=/tmp/mnt/МЕТКА"
+        fail "Найдено несколько флешек с Download Master. Укажи INSTALL_ROOT=/tmp/mnt/МЕТКА"
     else
-        fail "Download Master не найден. Сначала установи и запусти его в ASUSWRT"
+        fail "Download Master не найден. Установи его через веб-интерфейс ASUS на USB-флешку"
     fi
     return 1
 }
 
-attach_opt(){
-    [ -d "$DM_ROOT" ] || return 1
-    if [ -L /opt ]; then
-        [ -d /opt ] || { rm -f /opt 2>/dev/null || true; ln -s "$DM_ROOT" /opt 2>/dev/null || true; }
-    elif [ ! -e /opt ]; then
-        ln -s "$DM_ROOT" /opt 2>/dev/null || true
-    fi
-    PATH="$DM_ROOT/bin:$DM_ROOT/sbin:/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+prepare_path(){
+    PATH="$DM_ROOT/bin:$DM_ROOT/sbin:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:/jffs/scripts:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
     export PATH
+    hash -r 2>/dev/null || true
 }
 
 find_pkg(){
     PKG=""
-    for p in "$DM_ROOT/bin/ipkg" "$DM_ROOT/bin/opkg" /opt/bin/ipkg /opt/bin/opkg; do
+    # Prefer the manager belonging to the detected Download Master tree.
+    for p in "$DM_ROOT/bin/opkg" "$DM_ROOT/bin/ipkg" /opt/bin/opkg /opt/bin/ipkg /tmp/opt/bin/opkg /tmp/opt/bin/ipkg; do
         [ -x "$p" ] && { PKG="$p"; break; }
     done
     [ -n "$PKG" ]
 }
 
-pkg_install(){
+pkg_log(){
+    mkdir -p "$BASE/logs" 2>/dev/null || true
+    printf '[%s] %s\n' "$(now)" "$*" >> "$BASE/logs/packages.log" 2>/dev/null || true
+}
+
+pkg_update_index(){
+    [ -n "$PKG" ] || return 1
+    pkg_log "RUN: $PKG update"
+    "$PKG" update >> "$BASE/logs/packages.log" 2>&1
+}
+
+pkg_install_one(){
     name="$1"
     [ -n "$PKG" ] || return 1
-    "$PKG" install "$name" >> "$INSTALL_LOG" 2>&1
+    pkg_log "RUN: $PKG install $name"
+    "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
 }
 
 prepare_packages(){
-    attach_opt
-    if ! find_pkg; then
-        warn "ipkg/opkg не найден. Download Master есть, но менеджер пакетов не готов"
-        return 0
+    prepare_path
+    find_pkg || { fail "В Download Master не найден ipkg/opkg"; return 1; }
+    say "Менеджер пакетов ASUS: $PKG"
+
+    pkg_update_index || warn "Не удалось обновить индекс ipkg/opkg; пробую доступные пакеты"
+
+    for name in nano unzip wget gzip; do
+        if ! have "$name"; then
+            say "Устанавливаю $name через $(basename "$PKG")"
+            pkg_install_one "$name" || warn "Пакет $name не установился"
+            prepare_path
+            refresh_tools
+        fi
+    done
+
+    # Certificates have different names in Optware/Entware; install only as best effort.
+    if ! [ -f /opt/etc/ssl/certs/ca-certificates.crt ] && ! [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+        pkg_install_one ca-certificates >/dev/null 2>&1 || pkg_install_one ca-bundle >/dev/null 2>&1 || true
     fi
-    say "Менеджер пакетов: $PKG"
-    "$PKG" update >> "$INSTALL_LOG" 2>&1 || warn "Не удалось обновить индекс пакетов"
 
-    have nano || pkg_install nano || warn "nano пока не установлен"
-    have unzip || pkg_install unzip || warn "unzip пока не установлен"
-    have wget || pkg_install wget || warn "wget пока не установлен"
-    have gzip || pkg_install gzip || warn "gzip пока не установлен"
-
-    have unzip || { fail "Нужен unzip; установка через Download Master не удалась"; return 1; }
-    have gzip || { fail "Нужен gzip; установка через Download Master не удалась"; return 1; }
-    have wget || have curl || { fail "Нужен wget или curl"; return 1; }
+    prepare_path
+    refresh_tools
+    [ -x "$UNZIP_BIN" ] || { fail "unzip не найден после установки через Download Master"; return 1; }
+    [ -x "$GZIP_BIN" ] || { fail "gzip не найден после установки через Download Master"; return 1; }
+    [ -n "$DOWNLOADER" ] || { fail "Не найден wget или curl"; return 1; }
+    have nano || warn "nano не найден; GoshaCrash сможет повторить установку позже командой goshacrash pkg install nano"
+    say "Инструменты: unzip=$UNZIP_BIN, gzip=$GZIP_BIN, downloader=$DOWNLOADER"
 }
 
 wget_fetch(){
     url="$1"; out="$2"
-    for w in "$DM_ROOT/bin/wget" /opt/bin/wget /usr/sbin/wget /usr/bin/wget; do
+    for w in "$DM_ROOT/bin/wget" /opt/bin/wget /tmp/opt/bin/wget /usr/sbin/wget /usr/bin/wget; do
         [ -x "$w" ] || continue
+        "$w" -q --no-check-certificate -U "GoshaCrash/$INSTALLER_VERSION" -O "$out.part" "$url" >/dev/null 2>&1 && [ -s "$out.part" ] && { mv -f "$out.part" "$out"; return 0; }
         "$w" -q --no-check-certificate -O "$out.part" "$url" >/dev/null 2>&1 && [ -s "$out.part" ] && { mv -f "$out.part" "$out"; return 0; }
         "$w" -q -O "$out.part" "$url" >/dev/null 2>&1 && [ -s "$out.part" ] && { mv -f "$out.part" "$out"; return 0; }
     done
-    if have wget; then
-        wget -q --no-check-certificate -O "$out.part" "$url" >/dev/null 2>&1 && [ -s "$out.part" ] && { mv -f "$out.part" "$out"; return 0; }
-        wget -q -O "$out.part" "$url" >/dev/null 2>&1 && [ -s "$out.part" ] && { mv -f "$out.part" "$out"; return 0; }
-    fi
     return 1
 }
 
 curl_fetch(){
     url="$1"; out="$2"
-    for c in "$DM_ROOT/bin/curl" /opt/bin/curl /usr/bin/curl; do
+    for c in "$DM_ROOT/bin/curl" /opt/bin/curl /tmp/opt/bin/curl /usr/bin/curl; do
         [ -x "$c" ] || continue
-        "$c" -k -fL --connect-timeout 25 -o "$out.part" "$url" >/dev/null 2>&1 && [ -s "$out.part" ] && { mv -f "$out.part" "$out"; return 0; }
+        "$c" -k -fL --retry 2 --connect-timeout 25 --max-time 900 -A "GoshaCrash/$INSTALLER_VERSION" -o "$out.part" "$url" >/dev/null 2>&1 && [ -s "$out.part" ] && { mv -f "$out.part" "$out"; return 0; }
     done
-    have curl && curl -k -fL --connect-timeout 25 -o "$out.part" "$url" >/dev/null 2>&1 && [ -s "$out.part" ] && { mv -f "$out.part" "$out"; return 0; }
     return 1
 }
 
@@ -173,8 +193,8 @@ fetch(){
     rm -f "$out" "$out.part"
     n=1
     while [ "$n" -le 3 ]; do
-        wget_fetch "$url" "$out" && return 0
         curl_fetch "$url" "$out" && return 0
+        wget_fetch "$url" "$out" && return 0
         sleep 2
         n=$((n + 1))
     done
@@ -196,102 +216,253 @@ fetch_repo_file(){
     return 1
 }
 
-sha256_one(){
-    file="$1"
-    if have sha256sum; then sha256sum "$file" 2>/dev/null | awk 'NR==1{print tolower($1);exit}'; return; fi
-    if have busybox && busybox sha256sum "$file" >/dev/null 2>&1; then busybox sha256sum "$file" | awk 'NR==1{print tolower($1);exit}'; return; fi
-    if have openssl; then openssl dgst -sha256 "$file" 2>/dev/null | sed 's/^.*= //' | tr 'A-F' 'a-f'; return; fi
-    return 1
-}
 
-verify_mihomo_archive(){
-    archive="$1"; sha_file="$2"
-    gzip -t "$archive" >/dev/null 2>&1 || { fail "Архив Mihomo повреждён"; return 1; }
-    if [ -s "$sha_file" ]; then
-        expected="$(awk 'NR==1{print tolower($1);exit}' "$sha_file" | tr -d '\r')"
-        actual="$(sha256_one "$archive" 2>/dev/null)"
-        [ -n "$actual" ] || { warn "На роутере нет SHA-256; проверена только целостность gzip"; return 0; }
-        [ "$actual" = "$expected" ] || { fail "SHA-256 Mihomo не совпал"; return 1; }
-    else
-        warn "Файл SHA-256 недоступен; проверена только целостность gzip"
-    fi
-}
+detect_platform(){
+    machine="$(uname -m 2>/dev/null | tr 'A-Z' 'a-z')"
+    kernel="$(uname -r 2>/dev/null)"
+    model="$(nvram get productid 2>/dev/null)"
 
-make_secret(){
-    if [ -r /dev/urandom ] && have od; then od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'; return; fi
-    if [ -r /dev/urandom ] && have hexdump; then hexdump -n 16 -e '16/1 "%02x"' /dev/urandom 2>/dev/null; return; fi
-    printf '%s' "$(nvram get et0macaddr 2>/dev/null)-$(date +%s 2>/dev/null)-$$" | tr -cd 'A-Za-z0-9' | head -c 32
-}
+    case "$machine:$kernel:$model" in
+        armv7*:2.6.*:*|arm*:2.6.*:*|*:*:RT-AC68U*|*:*:RT-AC68P*|*:*:RT-AC1900*|*:*:RT-AC66U_B1*)
+            PLATFORM="legacy-armv5-gvisor"
+            LEGACY="1"
+            ROUTING_MODE="manual"
+            TUN_STACK="gvisor"
+            MIHOMO_TARGET="armv5"
+            MIHOMO_SOURCE="project-legacy-release"
+            MIHOMO_VERSION_SELECTED="$LEGACY_MIHOMO_VERSION"
+            CONFIG_TEMPLATE="config-legacy.yaml"
+            return 0
+            ;;
+    esac
 
-prepare_config(){
-    if [ ! -f "$BASE/config.yaml" ]; then
-        cp "$BASE/config.example.yaml" "$BASE/config.yaml" || return 1
-    fi
-    if grep -Eq '^secret:[[:space:]]*"CHANGE_ME"[[:space:]]*$' "$BASE/config.yaml" 2>/dev/null; then
-        secret="$(make_secret)"; [ -n "$secret" ] || secret="goshacrash$(date +%s 2>/dev/null)"
-        sed "s/^secret:.*/secret: \"$secret\"/" "$BASE/config.yaml" > "$BASE/config.yaml.new" || return 1
-        mv -f "$BASE/config.yaml.new" "$BASE/config.yaml" || return 1
-    fi
-    chmod 600 "$BASE/config.yaml" 2>/dev/null || true
+    LEGACY="0"
+    ROUTING_MODE="auto"
+    TUN_STACK="system"
+    MIHOMO_SOURCE="official-latest"
+    CONFIG_TEMPLATE="config.yaml"
+
+    case "${MIHOMO_ARCH:-$machine}" in
+        aarch64|arm64) MIHOMO_TARGET="arm64" ;;
+        armv7l|armv7|arm32v7) MIHOMO_TARGET="armv7" ;;
+        armv6l|armv6|arm32v6) MIHOMO_TARGET="armv6" ;;
+        armv5l|armv5|arm) MIHOMO_TARGET="armv5" ;;
+        x86_64|amd64) MIHOMO_TARGET="amd64-compatible" ;;
+        i386|i486|i586|i686|386) MIHOMO_TARGET="386" ;;
+        mipsel|mipsle) MIHOMO_TARGET="mipsle-softfloat" ;;
+        mips) MIHOMO_TARGET="mips-softfloat" ;;
+        mips64el|mips64le) MIHOMO_TARGET="mips64le" ;;
+        mips64) MIHOMO_TARGET="mips64" ;;
+        riscv64) MIHOMO_TARGET="riscv64" ;;
+        ppc64le) MIHOMO_TARGET="ppc64le" ;;
+        s390x) MIHOMO_TARGET="s390x" ;;
+        *) fail "Неподдерживаемая архитектура: $machine"; return 1 ;;
+    esac
+    PLATFORM="modern-$MIHOMO_TARGET"
 }
 
 install_controller(){
     tmp="$TMP_ROOT/goshacrash.sh"
     fetch_repo_file goshacrash.sh "$tmp" || { fail "Не удалось скачать goshacrash.sh"; return 1; }
-    [ "$(sed -n '1p' "$tmp" 2>/dev/null)" = '#!/bin/sh' ] || { fail "Вместо goshacrash.sh загружен неверный файл"; return 1; }
+    [ "$(sed -n '1p' "$tmp" 2>/dev/null)" = '#!/bin/sh' ] || { fail "goshacrash.sh скачан неверно"; return 1; }
     sh -n "$tmp" || { fail "Синтаксическая ошибка в goshacrash.sh"; return 1; }
-    if [ -f "$BASE/goshacrash.sh" ]; then cp "$BASE/goshacrash.sh" "$BASE/backups/goshacrash.sh.previous" 2>/dev/null || true; fi
+    [ -f "$BASE/goshacrash.sh" ] && cp -f "$BASE/goshacrash.sh" "$BASE/backups/goshacrash.sh.previous" 2>/dev/null || true
     mv -f "$tmp" "$BASE/goshacrash.sh" || return 1
     chmod 755 "$BASE/goshacrash.sh" || return 1
 }
 
-install_config_template(){
-    tmp="$TMP_ROOT/config.example.yaml"
-    fetch_repo_file config.example.yaml "$tmp" || { fail "Не удалось скачать config.example.yaml"; return 1; }
-    mv -f "$tmp" "$BASE/config.example.yaml" || return 1
-    prepare_config || { fail "Не удалось подготовить config.yaml"; return 1; }
+install_network_helper(){
+    if [ "$LEGACY" != 1 ]; then
+        GCNET_BIN=""
+        return 0
+    fi
+    tmp="$TMP_ROOT/gcnet-armv5"
+    fetch_repo_file assets/gcnet-armv5 "$tmp" || { fail "Не удалось скачать legacy network helper gcnet"; return 1; }
+    [ -s "$tmp" ] || { fail "gcnet скачан пустым"; return 1; }
+    chmod 755 "$tmp" || return 1
+    "$tmp" link-exists lo >/dev/null 2>&1 || { fail "gcnet не запускается на этом legacy-роутере"; return 1; }
+    mv -f "$tmp" "$BASE/bin/gcnet" || return 1
+    chmod 755 "$BASE/bin/gcnet" || return 1
+    GCNET_BIN="$BASE/bin/gcnet"
+    say "Установлен совместимый legacy network helper: $GCNET_BIN"
+}
+
+install_configs(){
+    tmp="$TMP_ROOT/$CONFIG_TEMPLATE"
+    fetch_repo_file "$CONFIG_TEMPLATE" "$tmp" || { fail "Не удалось скачать $CONFIG_TEMPLATE"; return 1; }
+
+    if [ ! -f "$BASE/config.yaml" ]; then
+        mv -f "$tmp" "$BASE/config.yaml" || return 1
+        say "Установлен config.yaml для профиля $PLATFORM"
+    else
+        say "Существующий config.yaml сохранён"
+        rm -f "$tmp"
+    fi
+    chmod 600 "$BASE/config.yaml" 2>/dev/null || true
+}
+
+json_asset_urls(){
+    file="$1"
+    grep '"browser_download_url"' "$file" 2>/dev/null |
+        sed -n 's#.*"browser_download_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*#\1#p' |
+        tr -d '\r'
+}
+
+latest_official_mihomo_url(){
+    api="$TMP_ROOT/mihomo-latest.json"
+    if fetch "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" "$api"; then
+        case "$MIHOMO_TARGET" in
+            amd64-compatible) pattern='/mihomo-linux-amd64-compatible-v[^/]*\.gz$' ;;
+            *) pattern="/mihomo-linux-$MIHOMO_TARGET-v[^/]*\\.gz$" ;;
+        esac
+        url="$(json_asset_urls "$api" | grep -E "$pattern" | head -n 1)"
+        if [ -n "$url" ]; then
+            MIHOMO_VERSION_SELECTED="$(printf '%s\n' "$url" | sed -n 's#.*/download/\([^/]*\)/.*#\1#p')"
+            printf '%s\n' "$url"
+            return 0
+        fi
+    fi
+
+    MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_FALLBACK"
+    printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$OFFICIAL_MIHOMO_FALLBACK/mihomo-linux-$MIHOMO_TARGET-$OFFICIAL_MIHOMO_FALLBACK.gz"
+}
+
+legacy_mihomo_urls(){
+    api="$TMP_ROOT/legacy-release.json"
+    if fetch "https://api.github.com/repos/$REPO/releases/tags/$LEGACY_MIHOMO_TAG" "$api"; then
+        json_asset_urls "$api" | grep -Ei '/[^/]*(armv5[^/]*gvisor|gvisor[^/]*armv5)[^/]*\.gz$'
+    fi
+    printf '%s\n' \
+        "https://github.com/$REPO/releases/download/$LEGACY_MIHOMO_TAG/mihomo-linux-armv5-gvisor-$LEGACY_MIHOMO_VERSION.gz" \
+        "https://github.com/$REPO/releases/download/$LEGACY_MIHOMO_TAG/mihomo-linux-armv5-with_gvisor.gz" \
+        "https://github.com/$REPO/releases/download/$LEGACY_MIHOMO_TAG/mihomo-linux-armv5-with-gvisor.gz"
+}
+
+
+validate_downloaded_mihomo(){
+    archive="$1"; newbin="$2"
+    "$GZIP_BIN" -t "$archive" >/dev/null 2>&1 || { fail "Архив Mihomo повреждён"; return 1; }
+    "$GZIP_BIN" -dc "$archive" > "$newbin" || { fail "Не удалось распаковать Mihomo"; return 1; }
+    chmod 755 "$newbin" || return 1
+    out="$("$newbin" -v 2>&1)" || { printf '%s\n' "$out" >&2; fail "Mihomo не запускается на этой архитектуре"; return 1; }
+    printf '%s\n' "$out" | grep -qi 'mihomo' || { printf '%s\n' "$out" >&2; fail "Скачанный файл не похож на Mihomo"; return 1; }
+    if [ "$LEGACY" = 1 ]; then
+        printf '%s\n' "$out" | grep -Fq 'Use tags: with_gvisor' || { printf '%s\n' "$out" >&2; fail "Legacy-профилю нужна сборка Mihomo with_gvisor"; return 1; }
+    fi
+    printf '%s\n' "$out" > "$BASE/state/mihomo-version.txt"
 }
 
 install_mihomo(){
     archive="$TMP_ROOT/mihomo.gz"
-    sha_file="$TMP_ROOT/mihomo.sha256"
-    say "Скачиваю проверенную Mihomo $MIHOMO_VERSION ARMv5 + gVisor"
-    fetch "$MIHOMO_URL" "$archive" || { fail "Не удалось скачать Mihomo: $MIHOMO_URL"; return 1; }
-    fetch "$MIHOMO_SHA_URL" "$sha_file" || :
-    verify_mihomo_archive "$archive" "$sha_file" || return 1
-    gzip -dc "$archive" > "$BASE/bin/mihomo.new" || return 1
-    chmod 755 "$BASE/bin/mihomo.new" || return 1
-    out="$($BASE/bin/mihomo.new -v 2>&1)" || { printf '%s\n' "$out" >&2; fail "Mihomo не запускается на этом роутере"; return 1; }
-    printf '%s\n' "$out" | grep -Fq 'Use tags: with_gvisor' || { printf '%s\n' "$out" >&2; fail "Mihomo собран без with_gvisor"; return 1; }
-    printf '%s\n' "$out" | grep -Eqi 'linux (arm|arm32)' || { printf '%s\n' "$out" >&2; fail "Загружен не ARM-бинарник"; return 1; }
-    [ -f "$BASE/bin/mihomo" ] && cp "$BASE/bin/mihomo" "$BASE/backups/mihomo.previous" 2>/dev/null || true
-    mv -f "$BASE/bin/mihomo.new" "$BASE/bin/mihomo" || return 1
+    newbin="$BASE/bin/mihomo.new"
+    rm -f "$archive" "$newbin"
+
+    if [ "$LEGACY" = 1 ]; then
+        success=0
+        legacy_mihomo_urls | while IFS= read -r url; do
+            [ -n "$url" ] || continue
+            printf '%s\n' "$url"
+        done > "$TMP_ROOT/legacy-urls.txt"
+        while IFS= read -r url; do
+            [ -n "$url" ] || continue
+            say "Скачиваю проверенный legacy Mihomo: $url"
+            if fetch "$url" "$archive" && validate_downloaded_mihomo "$archive" "$newbin"; then
+                MIHOMO_URL_SELECTED="$url"
+                success=1
+                break
+            fi
+            rm -f "$archive" "$newbin"
+        done < "$TMP_ROOT/legacy-urls.txt"
+        [ "$success" -eq 1 ] || { fail "Не удалось скачать совместимый ARMv5+gVisor Mihomo из Releases проекта"; return 1; }
+    else
+        MIHOMO_URL_SELECTED="$(latest_official_mihomo_url)" || return 1
+        MIHOMO_VERSION_SELECTED="$(printf '%s\n' "$MIHOMO_URL_SELECTED" | sed -n 's#.*/download/\([^/]*\)/.*#\1#p')"
+        [ -n "$MIHOMO_VERSION_SELECTED" ] || MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_FALLBACK"
+        say "Скачиваю официальный Mihomo $MIHOMO_VERSION_SELECTED для $MIHOMO_TARGET"
+        fetch "$MIHOMO_URL_SELECTED" "$archive" || { fail "Не удалось скачать $MIHOMO_URL_SELECTED"; return 1; }
+        validate_downloaded_mihomo "$archive" "$newbin" || return 1
+    fi
+
+    [ -f "$BASE/bin/mihomo" ] && cp -f "$BASE/bin/mihomo" "$BASE/backups/mihomo.previous" 2>/dev/null || true
+    mv -f "$newbin" "$BASE/bin/mihomo" || return 1
+    chmod 755 "$BASE/bin/mihomo" || return 1
 }
 
-flatten_ui(){
-    src="$1"; dst="$2"
-    index="$(find "$src" -type f -name index.html 2>/dev/null | head -n 1)"
-    [ -n "$index" ] || return 1
-    root="$(dirname "$index")"
-    rm -rf "$dst"
-    mkdir -p "$dst" || return 1
-    cp -R "$root"/. "$dst"/ || return 1
-    [ -f "$dst/index.html" ]
+find_ui_root(){
+    unpack="$1"
+    for p in "$unpack/index.html" "$unpack"/*/index.html "$unpack"/*/*/index.html; do
+        [ -f "$p" ] && { dirname "$p"; return 0; }
+    done
+    p="$(find "$unpack" -type f -name index.html 2>/dev/null | head -n 1)"
+    [ -n "$p" ] && { dirname "$p"; return 0; }
+    return 1
+}
+
+unpack_ui(){
+    archive="$1"; unpack="$2"; dst="$3"
+    "$UNZIP_BIN" -tqq "$archive" >/dev/null 2>&1 || return 1
+    rm -rf "$unpack" "$dst"
+    mkdir -p "$unpack" "$dst" || return 1
+    "$UNZIP_BIN" -oq "$archive" -d "$unpack" >> "$INSTALL_LOG" 2>&1 || return 1
+    src="$(find_ui_root "$unpack")" || return 1
+    [ -s "$src/index.html" ] || return 1
+    cp -R "$src"/. "$dst"/ || return 1
+    [ -s "$dst/index.html" ]
 }
 
 install_zashboard(){
     archive="$TMP_ROOT/zashboard.zip"
     unpack="$TMP_ROOT/zashboard-unpack"
     ui_new="$BASE/ui.new"
-    say "Скачиваю Zashboard"
-    fetch "$ZASHBOARD_URL" "$archive" || { fail "Не удалось скачать Zashboard"; return 1; }
-    rm -rf "$unpack" "$ui_new"
-    mkdir -p "$unpack" || return 1
-    unzip -oq "$archive" -d "$unpack" >> "$INSTALL_LOG" 2>&1 || { fail "Архив Zashboard не распаковался"; return 1; }
-    flatten_ui "$unpack" "$ui_new" || { fail "В архиве Zashboard нет index.html"; return 1; }
+    selected=""
+    last_url=""
+    for url in \
+        "$ZASHBOARD_PRIMARY" \
+        "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-cdn-fonts.zip" \
+        "https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip"; do
+        [ -n "$url" ] || continue
+        [ "$url" = "$last_url" ] && continue
+        last_url="$url"
+        say "Скачиваю Zashboard: $url"
+        if fetch "$url" "$archive" && unpack_ui "$archive" "$unpack" "$ui_new"; then
+            selected="$url"
+            break
+        fi
+        warn "Архив Zashboard не подошёл: $url"
+        rm -rf "$unpack" "$ui_new" "$archive"
+    done
+    [ -n "$selected" ] || { fail "Не удалось скачать и распаковать Zashboard"; return 1; }
+
     rm -rf "$BASE/ui.previous"
     [ -d "$BASE/ui" ] && mv "$BASE/ui" "$BASE/ui.previous" 2>/dev/null || true
-    mv "$ui_new" "$BASE/ui" || { [ -d "$BASE/ui.previous" ] && mv "$BASE/ui.previous" "$BASE/ui"; return 1; }
+    mv "$ui_new" "$BASE/ui" || {
+        [ -d "$BASE/ui.previous" ] && mv "$BASE/ui.previous" "$BASE/ui" 2>/dev/null || true
+        fail "Не удалось активировать Zashboard"
+        return 1
+    }
+    printf '%s\n' "$selected" > "$BASE/state/zashboard-source.txt"
+}
+
+write_platform_state(){
+    cat > "$BASE/state/platform.env" <<EOF
+PLATFORM='$PLATFORM'
+LEGACY='$LEGACY'
+ROUTING_MODE='$ROUTING_MODE'
+TUN_STACK='$TUN_STACK'
+MIHOMO_TARGET='$MIHOMO_TARGET'
+MIHOMO_SOURCE='$MIHOMO_SOURCE'
+MIHOMO_VERSION='$MIHOMO_VERSION_SELECTED'
+MIHOMO_URL='$MIHOMO_URL_SELECTED'
+GCNET_BIN='$GCNET_BIN'
+CONFIG_FILE='$BASE/config.yaml'
+DM_ROOT='$DM_ROOT'
+PKG_PATH='$PKG'
+ROUTER_MODEL='$(nvram get productid 2>/dev/null)'
+ROUTER_ARCH='$(uname -m 2>/dev/null)'
+ROUTER_KERNEL='$(uname -r 2>/dev/null)'
+INSTALLED_BY='$INSTALLER_VERSION'
+EOF
+    chmod 600 "$BASE/state/platform.env" 2>/dev/null || true
 }
 
 save_install_log(){
@@ -302,29 +473,15 @@ save_install_log(){
     fi
 }
 
-remove_installation(){
-    find_download_master || return 1
-    BASE="${INSTALL_DIR:-$USB_MOUNT/goshacrash}"
-    if [ -x "$BASE/goshacrash.sh" ]; then GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" stop >/dev/null 2>&1 || true; fi
-    if [ -f "$BASE/config.yaml" ]; then cp "$BASE/config.yaml" "$USB_MOUNT/goshacrash-config.yaml" || return 1; fi
-    rm -rf "$BASE"
-    rm -f "$DM_ROOT/bin/goshacrash" /opt/bin/goshacrash 2>/dev/null || true
-    rm -rf /jffs/addons/goshacrash 2>/dev/null || true
-    say "Удалено. Конфиг сохранён как $USB_MOUNT/goshacrash-config.yaml"
-}
 
 main(){
     : > "$TMP_LOG"
-    case "$ACTION" in
-        help|-h|--help) usage; return 0 ;;
-        remove|uninstall) remove_installation; return $? ;;
-        install|repair) ;;
-        *) usage; return 1 ;;
-    esac
+    [ "$#" -eq 0 ] || { fail "install.sh запускается без аргументов"; return 1; }
 
+    verify_asuswrt || return 1
     find_download_master || return 1
     BASE="${INSTALL_DIR:-$USB_MOUNT/goshacrash}"
-    mkdir -p "$TMP_ROOT" "$BASE/bin" "$BASE/ui" "$BASE/logs" "$BASE/run" "$BASE/state" "$BASE/backups" || return 1
+    mkdir -p "$TMP_ROOT" "$BASE/bin" "$BASE/ui" "$BASE/logs" "$BASE/run" "$BASE/state" "$BASE/backups" "$BASE/rulesets" "$BASE/proxies" || return 1
     save_install_log
 
     say "GoshaCrash installer $INSTALLER_VERSION"
@@ -332,18 +489,26 @@ main(){
     say "Download Master: $DM_ROOT"
     say "Каталог установки: $BASE"
 
-    case "$(uname -m 2>/dev/null)" in arm*|ARM*) ;; *) fail "Эта сборка предназначена для ARM ASUSWRT"; return 1 ;; esac
+    # During a reinstall, keep the currently running process alive until every
+    # downloaded component has passed validation. The final restart performs
+    # the controlled switchover.
+
+    detect_platform || return 1
+    say "Роутер: $(nvram get productid 2>/dev/null), архитектура $(uname -m 2>/dev/null), ядро $(uname -r 2>/dev/null)"
+    say "Профиль: $PLATFORM; routing=$ROUTING_MODE; tun.stack=$TUN_STACK"
 
     prepare_packages || return 1
     install_controller || return 1
-    install_config_template || return 1
+    install_network_helper || return 1
+    install_configs || return 1
     install_mihomo || return 1
     install_zashboard || return 1
+    write_platform_state || return 1
 
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" install-hooks || return 1
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" check || return 1
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" restart || {
-        fail "Первый запуск не удался. Лог: $BASE/logs/mihomo.log"
+        fail "Первый запуск не удался. Проверь $BASE/logs/mihomo.log и команду goshacrash doctor"
         return 1
     }
 
@@ -352,8 +517,9 @@ main(){
     echo
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" status
     echo
-    echo "Управление: goshacrash"
-    echo "Конфиг: $BASE/config.yaml"
+    echo "Справка: goshacrash help"
+    echo "Zashboard: $(GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" dashboard)"
+    echo "Обновление Zashboard: кнопка в панели"
 }
 
 main "$@"
