@@ -1,0 +1,50 @@
+# GoshaCrash: минимальный стартовый конфиг для legacy ASUSWRT.
+# После установки добавь свои proxies/proxy-providers, группы и правила.
+
+mixed-port: 7892
+allow-lan: true
+bind-address: "*"
+mode: rule
+log-level: info
+ipv6: false
+routing-mark: 9012
+
+external-controller: 0.0.0.0:9090
+external-ui: ui
+secret: "CHANGE_ME"
+
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter:
+    - "+.lan"
+    - "+.local"
+    - "+.arpa"
+    - "localhost"
+  default-nameserver:
+    - 1.1.1.1
+    - 9.9.9.9
+  nameserver:
+    - 1.1.1.1
+    - 9.9.9.9
+
+tun:
+  enable: true
+  stack: gvisor
+  device: tun0
+  auto-route: false
+  auto-redirect: false
+  strict-route: false
+  mtu: 1500
+
+# Минимальный конфиг запускается без прокси и оставляет трафик DIRECT.
+# Замени этот блок своими proxy-groups/rules после проверки установки.
+rules:
+  - MATCH,DIRECT

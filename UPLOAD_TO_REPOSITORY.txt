@@ -1,0 +1,52 @@
+КАК ЗАЛИТЬ GOSHACRASH 3.0.0-online В РЕПОЗИТОРИЙ
+=================================================
+
+Вариант через Git в PowerShell/WSL:
+
+1. Открой локальный клон репозитория GoshaCrash.
+2. Создай резервную ветку:
+
+   git checkout -b backup-before-online-v3
+   git push -u origin backup-before-online-v3
+   git checkout main
+
+3. Удали старую структуру, которая больше не используется:
+
+   git rm -r src
+   git rm BUILD_USB.sh README-RU.txt
+
+   Если какого-то файла уже нет, просто пропусти соответствующую команду.
+
+4. Скопируй в корень репозитория файлы из этого архива:
+
+   install.sh
+   goshacrash.sh
+   config.example.yaml
+   README.md
+   RELEASE_NOTES.md
+   .gitignore
+
+5. Зафиксируй изменения:
+
+   git add install.sh goshacrash.sh config.example.yaml README.md RELEASE_NOTES.md .gitignore
+   git commit -m "GoshaCrash 3.0.0 online installer"
+   git push origin main
+
+6. Проверь в браузере, что открываются:
+
+   https://raw.githubusercontent.com/goshamarat/GoshaCrash/refs/heads/main/install.sh
+   https://raw.githubusercontent.com/goshamarat/GoshaCrash/refs/heads/main/goshacrash.sh
+   https://raw.githubusercontent.com/goshamarat/GoshaCrash/refs/heads/main/config.example.yaml
+
+7. После этого команда установки на роутере:
+
+   wget -O /tmp/install.sh https://raw.githubusercontent.com/goshamarat/GoshaCrash/refs/heads/main/install.sh
+   sh /tmp/install.sh
+
+ВАЖНО
+------
+Не удаляй GitHub Release с тегом:
+
+   mihomo-gvisor-armv5-v1.19.28
+
+Из него install.sh скачивает проверенную legacy-сборку Mihomo.
