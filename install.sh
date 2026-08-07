@@ -3,14 +3,14 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.4.1-minimal"
+INSTALLER_VERSION="3.4.3-download-fix"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
 LEGACY_MIHOMO_VERSION="${LEGACY_MIHOMO_VERSION:-v1.19.28}"
 LEGACY_MIHOMO_TAG="${LEGACY_MIHOMO_TAG:-mihomo-gvisor-armv5-$LEGACY_MIHOMO_VERSION}"
 OFFICIAL_MIHOMO_FALLBACK="${OFFICIAL_MIHOMO_FALLBACK:-v1.19.29}"
-ZASHBOARD_PRIMARY="${ZASHBOARD_URL:-https://github.com/Zephyruso/zashboard/releases/latest/download/dist-cdn-fonts.zip}"
+ZASHBOARD_PRIMARY="${ZASHBOARD_URL:-https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip}"
 
 TMP_ROOT="/tmp/goshacrash-install.$$"
 TMP_LOG="/tmp/goshacrash-install.log"
@@ -22,6 +22,12 @@ PKG=""
 UNZIP_BIN=""
 GZIP_BIN=""
 DOWNLOADER=""
+NVRAM_BIN=""
+LOCK_DIR="/tmp/goshacrash-install.lock"
+LOCK_HELD="0"
+
+PATH="/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
+export PATH
 
 PLATFORM=""
 LEGACY="0"
@@ -41,14 +47,53 @@ ok(){ _emit OK "$@"; }
 warn(){ _emit WARN "$@" >&2; }
 fail(){ _emit ERROR "$@" >&2; return 1; }
 
-cleanup(){ rm -rf "$TMP_ROOT" 2>/dev/null || true; }
+cleanup(){
+    rm -rf "$TMP_ROOT" 2>/dev/null || true
+    [ "$LOCK_HELD" = 1 ] && rm -rf "$LOCK_DIR" 2>/dev/null || true
+}
 trap cleanup EXIT HUP INT TERM
 
+acquire_lock(){
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
+        LOCK_HELD="1"
+        return 0
+    fi
+
+    oldpid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+        fail "Установщик уже запущен, PID=$oldpid. Не запускай несколько установок одновременно"
+        return 1
+    fi
+
+    rm -rf "$LOCK_DIR" 2>/dev/null || true
+    mkdir "$LOCK_DIR" 2>/dev/null || { fail "Не удалось создать блокировку установщика"; return 1; }
+    printf '%s\n' "$$" > "$LOCK_DIR/pid" 2>/dev/null || true
+    LOCK_HELD="1"
+}
+
+
+find_nvram(){
+    [ -n "$NVRAM_BIN" ] && [ -x "$NVRAM_BIN" ] && return 0
+    for p in /usr/sbin/nvram /sbin/nvram /usr/bin/nvram /bin/nvram; do
+        [ -x "$p" ] && { NVRAM_BIN="$p"; return 0; }
+    done
+    p="$(command -v nvram 2>/dev/null)"
+    [ -n "$p" ] && [ -x "$p" ] && { NVRAM_BIN="$p"; return 0; }
+    return 1
+}
+
+nvram_get(){
+    key="$1"
+    find_nvram || return 0
+    "$NVRAM_BIN" get "$key" 2>/dev/null || true
+}
 
 verify_asuswrt(){
-    command -v nvram >/dev/null 2>&1 || { fail "nvram не найден: установщик предназначен для реального ASUSWRT"; return 1; }
     [ -d /jffs ] || { fail "/jffs не найден: это не поддерживаемая ASUSWRT-среда"; return 1; }
     [ -d /tmp/mnt ] || { fail "/tmp/mnt не найден: USB-подсистема ASUSWRT не готова"; return 1; }
+    [ -r /proc/version ] || { fail "/proc/version не найден: среда Linux не готова"; return 1; }
+    find_nvram || warn "Утилита nvram не найдена; модель роутера будет определена по архитектуре и ядру"
 }
 
 tool_path(){
@@ -69,7 +114,7 @@ refresh_tools(){
     hash -r 2>/dev/null || true
     UNZIP_BIN="$(tool_path unzip 2>/dev/null)"
     GZIP_BIN="$(tool_path gzip 2>/dev/null)"
-    if have curl; then DOWNLOADER="curl"; elif have wget; then DOWNLOADER="wget"; else DOWNLOADER=""; fi
+    if have wget; then DOWNLOADER="wget"; elif have curl; then DOWNLOADER="curl"; else DOWNLOADER=""; fi
 }
 
 find_download_master(){
@@ -143,20 +188,22 @@ prepare_packages(){
     find_pkg || { fail "В Download Master не найден ipkg/opkg"; return 1; }
     say "Менеджер пакетов ASUS: $PKG"
 
-    pkg_update_index || warn "Не удалось обновить индекс ipkg/opkg; пробую доступные пакеты"
-
+    missing=""
     for name in nano unzip wget gzip; do
-        if ! have "$name"; then
+        have "$name" || missing="$missing $name"
+    done
+
+    if [ -n "$missing" ]; then
+        say "Не хватает пакетов:$missing"
+        pkg_update_index || warn "Не удалось обновить индекс ipkg/opkg; пробую доступные пакеты"
+        for name in $missing; do
             say "Устанавливаю $name через $(basename "$PKG")"
             pkg_install_one "$name" || warn "Пакет $name не установился"
             prepare_path
             refresh_tools
-        fi
-    done
-
-    # Certificates have different names in Optware/Entware; install only as best effort.
-    if ! [ -f /opt/etc/ssl/certs/ca-certificates.crt ] && ! [ -f /etc/ssl/certs/ca-certificates.crt ]; then
-        pkg_install_one ca-certificates >/dev/null 2>&1 || pkg_install_one ca-bundle >/dev/null 2>&1 || true
+        done
+    else
+        say "Все необходимые пакеты Download Master уже установлены; обновление индекса пропущено"
     fi
 
     prepare_path
@@ -170,34 +217,53 @@ prepare_packages(){
 
 wget_fetch(){
     url="$1"; out="$2"
-    for w in "$DM_ROOT/bin/wget" /opt/bin/wget /tmp/opt/bin/wget /usr/sbin/wget /usr/bin/wget; do
-        [ -x "$w" ] || continue
-        "$w" -q --no-check-certificate -U "GoshaCrash/$INSTALLER_VERSION" -O "$out.part" "$url" >/dev/null 2>&1 && [ -s "$out.part" ] && { mv -f "$out.part" "$out"; return 0; }
-        "$w" -q --no-check-certificate -O "$out.part" "$url" >/dev/null 2>&1 && [ -s "$out.part" ] && { mv -f "$out.part" "$out"; return 0; }
-        "$w" -q -O "$out.part" "$url" >/dev/null 2>&1 && [ -s "$out.part" ] && { mv -f "$out.part" "$out"; return 0; }
+    w=""
+    for p in /usr/sbin/wget /usr/bin/wget "$DM_ROOT/bin/wget" /opt/bin/wget /tmp/opt/bin/wget; do
+        [ -x "$p" ] && { w="$p"; break; }
     done
+    [ -n "$w" ] || return 1
+
+    echo "--- wget: $url"
+    "$w" --no-check-certificate -O "$out.part" "$url" && [ -s "$out.part" ] && {
+        mv -f "$out.part" "$out"
+        return 0
+    }
     return 1
 }
 
 curl_fetch(){
     url="$1"; out="$2"
-    for c in "$DM_ROOT/bin/curl" /opt/bin/curl /tmp/opt/bin/curl /usr/bin/curl; do
-        [ -x "$c" ] || continue
-        "$c" -k -fL --retry 2 --connect-timeout 25 --max-time 900 -A "GoshaCrash/$INSTALLER_VERSION" -o "$out.part" "$url" >/dev/null 2>&1 && [ -s "$out.part" ] && { mv -f "$out.part" "$out"; return 0; }
+    c=""
+    for p in "$DM_ROOT/bin/curl" /opt/bin/curl /tmp/opt/bin/curl /usr/bin/curl; do
+        [ -x "$p" ] && { c="$p"; break; }
     done
+    [ -n "$c" ] || return 1
+
+    echo "--- curl: $url"
+    # No connect timeout and no overall max-time: the transfer may continue as
+    # long as the connection is alive. The progress bar remains visible.
+    "$c" -k -fL --retry 3 --retry-delay 3 -# \
+        -A "GoshaCrash/$INSTALLER_VERSION" -o "$out.part" "$url" && [ -s "$out.part" ] && {
+        mv -f "$out.part" "$out"
+        return 0
+    }
     return 1
 }
 
 fetch(){
     url="$1"; out="$2"
     rm -f "$out" "$out.part"
-    n=1
-    while [ "$n" -le 3 ]; do
-        curl_fetch "$url" "$out" && return 0
+
+    if [ "$DOWNLOADER" = "wget" ]; then
         wget_fetch "$url" "$out" && return 0
-        sleep 2
-        n=$((n + 1))
-    done
+        warn "wget не скачал файл; пробую curl"
+        curl_fetch "$url" "$out" && return 0
+    else
+        curl_fetch "$url" "$out" && return 0
+        warn "curl не скачал файл; пробую wget"
+        wget_fetch "$url" "$out" && return 0
+    fi
+
     rm -f "$out" "$out.part"
     return 1
 }
@@ -220,7 +286,7 @@ fetch_repo_file(){
 detect_platform(){
     machine="$(uname -m 2>/dev/null | tr 'A-Z' 'a-z')"
     kernel="$(uname -r 2>/dev/null)"
-    model="$(nvram get productid 2>/dev/null)"
+    model="$(nvram_get productid)"
 
     case "$machine:$kernel:$model" in
         armv7*:2.6.*:*|arm*:2.6.*:*|*:*:RT-AC68U*|*:*:RT-AC68P*|*:*:RT-AC1900*|*:*:RT-AC66U_B1*)
@@ -328,10 +394,8 @@ latest_official_mihomo_url(){
 }
 
 legacy_mihomo_urls(){
-    api="$TMP_ROOT/legacy-release.json"
-    if fetch "https://api.github.com/repos/$REPO/releases/tags/$LEGACY_MIHOMO_TAG" "$api"; then
-        json_asset_urls "$api" | grep -Ei '/[^/]*(armv5[^/]*gvisor|gvisor[^/]*armv5)[^/]*\.gz$'
-    fi
+    # The legacy build is pinned and stored in the project release. Avoid the
+    # GitHub API here: direct asset URLs are faster and predictable on ASUSWRT.
     printf '%s\n' \
         "https://github.com/$REPO/releases/download/$LEGACY_MIHOMO_TAG/mihomo-linux-armv5-gvisor-$LEGACY_MIHOMO_VERSION.gz" \
         "https://github.com/$REPO/releases/download/$LEGACY_MIHOMO_TAG/mihomo-linux-armv5-with_gvisor.gz" \
@@ -356,6 +420,16 @@ install_mihomo(){
     archive="$TMP_ROOT/mihomo.gz"
     newbin="$BASE/bin/mihomo.new"
     rm -f "$archive" "$newbin"
+
+    if [ "$LEGACY" = 1 ] && [ "${FORCE_CORE_REINSTALL:-0}" != 1 ] && [ -x "$BASE/bin/mihomo" ]; then
+        existing_out="$("$BASE/bin/mihomo" -v 2>&1)"
+        if printf '%s\n' "$existing_out" | grep -qi 'mihomo' && \
+           printf '%s\n' "$existing_out" | grep -Fq 'Use tags: with_gvisor'; then
+            printf '%s\n' "$existing_out" > "$BASE/state/mihomo-version.txt"
+            say "Совместимый legacy Mihomo уже установлен; повторная загрузка ядра пропущена"
+            return 0
+        fi
+    fi
 
     if [ "$LEGACY" = 1 ]; then
         success=0
@@ -418,6 +492,7 @@ install_zashboard(){
     last_url=""
     for url in \
         "$ZASHBOARD_PRIMARY" \
+        "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip" \
         "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-cdn-fonts.zip" \
         "https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip"; do
         [ -n "$url" ] || continue
@@ -457,7 +532,7 @@ GCNET_BIN='$GCNET_BIN'
 CONFIG_FILE='$BASE/config.yaml'
 DM_ROOT='$DM_ROOT'
 PKG_PATH='$PKG'
-ROUTER_MODEL='$(nvram get productid 2>/dev/null)'
+ROUTER_MODEL='$(nvram_get productid)'
 ROUTER_ARCH='$(uname -m 2>/dev/null)'
 ROUTER_KERNEL='$(uname -r 2>/dev/null)'
 INSTALLED_BY='$INSTALLER_VERSION'
@@ -477,6 +552,7 @@ save_install_log(){
 main(){
     : > "$TMP_LOG"
     [ "$#" -eq 0 ] || { fail "install.sh запускается без аргументов"; return 1; }
+    acquire_lock || return 1
 
     verify_asuswrt || return 1
     find_download_master || return 1
@@ -494,7 +570,8 @@ main(){
     # the controlled switchover.
 
     detect_platform || return 1
-    say "Роутер: $(nvram get productid 2>/dev/null), архитектура $(uname -m 2>/dev/null), ядро $(uname -r 2>/dev/null)"
+    model_name="$(nvram_get productid)"; [ -n "$model_name" ] || model_name="$(hostname 2>/dev/null)"; [ -n "$model_name" ] || model_name="ASUSWRT"
+    say "Роутер: $model_name, архитектура $(uname -m 2>/dev/null), ядро $(uname -r 2>/dev/null)"
     say "Профиль: $PLATFORM; routing=$ROUTING_MODE; tun.stack=$TUN_STACK"
 
     prepare_packages || return 1

@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.4.0-minimal"
-BUILD_ID="2026-08-07-asuswrt-minimal-r4"
+VERSION="3.4.3-download-fix"
+BUILD_ID="2026-08-07-download-fix-r6"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -73,6 +73,7 @@ ROUTER_ARCH=""
 ROUTER_KERNEL=""
 
 PKG=""
+NVRAM_BIN=""
 IP_BIN=""
 IPTABLES=""
 IPT_WAIT=""
@@ -153,6 +154,34 @@ tool_path(){
 
 have(){ tool_path "$1" >/dev/null 2>&1; }
 
+find_nvram(){
+    [ -n "$NVRAM_BIN" ] && [ -x "$NVRAM_BIN" ] && return 0
+    refresh_path >/dev/null 2>&1 || true
+    for p in /usr/sbin/nvram /sbin/nvram /usr/bin/nvram /bin/nvram; do
+        [ -x "$p" ] && { NVRAM_BIN="$p"; return 0; }
+    done
+    p="$(command -v nvram 2>/dev/null)"
+    [ -n "$p" ] && [ -x "$p" ] && { NVRAM_BIN="$p"; return 0; }
+    return 1
+}
+
+nvram_get(){
+    key="$1"
+    find_nvram || return 0
+    "$NVRAM_BIN" get "$key" 2>/dev/null || true
+}
+
+nvram_set(){
+    key="$1"; value="$2"
+    find_nvram || return 1
+    "$NVRAM_BIN" set "$key=$value" 2>/dev/null
+}
+
+nvram_commit(){
+    find_nvram || return 1
+    "$NVRAM_BIN" commit >/dev/null 2>&1
+}
+
 find_pkg(){
     PKG=""
     find_dm_root || return 1
@@ -205,8 +234,8 @@ pkg_install(){
     ok "Пакет установлен: $name"
 }
 
-lan_ip(){ x="$(nvram get lan_ipaddr 2>/dev/null)"; [ -n "$x" ] || x=192.168.1.1; printf '%s\n' "$x"; }
-lan_ifaces(){ if [ -n "${GOSHACRASH_LAN_IFACES:-}" ]; then printf '%s\n' "$GOSHACRASH_LAN_IFACES"; else x="$(nvram get lan_ifname 2>/dev/null)"; [ -n "$x" ] || x=br0; printf '%s\n' "$x"; fi; }
+lan_ip(){ x="$(nvram_get lan_ipaddr)"; [ -n "$x" ] || x=192.168.1.1; printf '%s\n' "$x"; }
+lan_ifaces(){ if [ -n "${GOSHACRASH_LAN_IFACES:-}" ]; then printf '%s\n' "$GOSHACRASH_LAN_IFACES"; else x="$(nvram_get lan_ifname)"; [ -n "$x" ] || x=br0; printf '%s\n' "$x"; fi; }
 
 strip_value(){ printf '%s\n' "$1" | sed 's/[[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//'; }
 yaml_top(){
@@ -646,9 +675,9 @@ remove_legacy_hook_lines(){
 
 rewrite_nvram_hook(){
     key="$1"; begin="$2"; end="$3"; body="$4"
-    command -v nvram >/dev/null 2>&1 || return 0
+    find_nvram || return 0
     tmp="$RUN/nvram-hook.$$"
-    old="$(nvram get "$key" 2>/dev/null)"
+    old="$(nvram_get "$key")"
     printf '%s\n' "$old" | awk -v b="$begin" -v e="$end" '
       index($0,b) {skip=1; next}
       index($0,e) {skip=0; next}
@@ -660,32 +689,34 @@ rewrite_nvram_hook(){
         printf '%s\n' "$body"
         printf '%s\n' "$end"
     } > "$tmp.new" || return 1
-    nvram set "$key=$(cat "$tmp.new")" 2>/dev/null || { rm -f "$tmp" "$tmp.new"; return 1; }
+    value="$(cat "$tmp.new")"
+    nvram_set "$key" "$value" || { rm -f "$tmp" "$tmp.new"; return 1; }
     rm -f "$tmp" "$tmp.new"
 }
 
 install_nvram_usb_hooks(){
-    command -v nvram >/dev/null 2>&1 || return 0
+    find_nvram || { warn "nvram недоступен: USB hooks через NVRAM пропущены; JFFS и Download Master hooks уже установлены"; return 0; }
     rewrite_nvram_hook script_usbmount '# GOSHACRASH_USBMOUNT_BEGIN' '# GOSHACRASH_USBMOUNT_END'       'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); [ -x "$BASE/goshacrash.sh" ] && /jffs/addons/goshacrash/start.sh &' || warn "Не удалось записать stock ASUS USB-mount hook"
     rewrite_nvram_hook script_usbumount '# GOSHACRASH_USBUMOUNT_BEGIN' '# GOSHACRASH_USBUMOUNT_END'       'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" stop >/dev/null 2>&1' || warn "Не удалось записать stock ASUS USB-unmount hook"
-    [ "$(nvram get jffs2_scripts 2>/dev/null)" = 1 ] || nvram set jffs2_scripts=1 2>/dev/null || true
-    nvram commit >/dev/null 2>&1 || true
+    [ "$(nvram_get jffs2_scripts)" = 1 ] || nvram_set jffs2_scripts 1 || true
+    nvram_commit || true
 }
 
 remove_nvram_usb_hooks(){
-    command -v nvram >/dev/null 2>&1 || return 0
-    for spec in       'script_usbmount|# GOSHACRASH_USBMOUNT_BEGIN|# GOSHACRASH_USBMOUNT_END'       'script_usbumount|# GOSHACRASH_USBUMOUNT_BEGIN|# GOSHACRASH_USBUMOUNT_END'; do
+    find_nvram || return 0
+    for spec in       'script_usbmount|# GOSHACRASH_USBMOUNT_BEGIN|# GOSHACRASH_USBMOUNT_END'       'script_usbumount|# GOSHACRASH_USBMOUNT_BEGIN|# GOSHACRASH_USBUMOUNT_END'; do
         key="${spec%%|*}"; rest="${spec#*|}"; begin="${rest%%|*}"; end="${rest#*|}"
         tmp="$RUN/nvram-remove.$$"
-        nvram get "$key" 2>/dev/null | awk -v b="$begin" -v e="$end" '
+        nvram_get "$key" | awk -v b="$begin" -v e="$end" '
           index($0,b) {skip=1; next}
           index($0,e) {skip=0; next}
           !skip {print}
         ' > "$tmp" || continue
-        nvram set "$key=$(cat "$tmp")" 2>/dev/null || true
+        value="$(cat "$tmp")"
+        nvram_set "$key" "$value" || true
         rm -f "$tmp"
     done
-    nvram commit >/dev/null 2>&1 || true
+    nvram_commit || true
 }
 
 write_nano_wrapper(){
@@ -854,7 +885,7 @@ status(){
     echo "GoshaCrash: $VERSION"
     echo "BASE: $BASE"
     echo "Платформа: ${PLATFORM:-не определена}; legacy=${LEGACY:-?}; routing=${ROUTING_MODE:-?}; stack=${TUN_STACK:-?}"
-    echo "Роутер: ${ROUTER_MODEL:-$(nvram get productid 2>/dev/null)}; arch=${ROUTER_ARCH:-$(uname -m 2>/dev/null)}; kernel=${ROUTER_KERNEL:-$(uname -r 2>/dev/null)}"
+    model_now="${ROUTER_MODEL:-$(nvram_get productid)}"; [ -n "$model_now" ] || model_now="$(hostname 2>/dev/null)"; echo "Роутер: $model_now; arch=${ROUTER_ARCH:-$(uname -m 2>/dev/null)}; kernel=${ROUTER_KERNEL:-$(uname -r 2>/dev/null)}"
     echo "Mihomo target/source: ${MIHOMO_TARGET:-?} / ${MIHOMO_SOURCE:-?}"
     echo "Config: $CONFIG"
     net_link_exists "$TUN_DEVICE" && echo "TUN: $TUN_DEVICE работает" || echo "TUN: $TUN_DEVICE не найден"
