@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.5.3-beautiful-menu"
-BUILD_ID="2026-08-07-beautiful-menu-r1"
+VERSION="3.5.4-tty-fix"
+BUILD_ID="2026-08-07-tty-fix-r1"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -909,12 +909,47 @@ doctor(){
 }
 
 
+menu_terminal_init(){
+    MENU_TTY_MODE=""
+    MENU_OLD_STTY=""
+
+    MENU_OLD_STTY="$(stty -g </dev/tty 2>/dev/null)" || MENU_OLD_STTY=""
+    if [ -n "$MENU_OLD_STTY" ]; then
+        MENU_TTY_MODE="devtty"
+        return 0
+    fi
+
+    MENU_OLD_STTY="$(stty -g 2>/dev/null)" || MENU_OLD_STTY=""
+    if [ -n "$MENU_OLD_STTY" ]; then
+        MENU_TTY_MODE="stdin"
+        return 0
+    fi
+
+    return 1
+}
+
+menu_stty(){
+    if [ "$MENU_TTY_MODE" = "devtty" ]; then
+        stty "$@" </dev/tty 2>/dev/null
+    else
+        stty "$@" 2>/dev/null
+    fi
+}
+
+menu_read_byte(){
+    if [ "$MENU_TTY_MODE" = "devtty" ]; then
+        dd if=/dev/tty bs=1 count=1 2>/dev/null
+    else
+        dd bs=1 count=1 2>/dev/null
+    fi
+}
+
 menu_pause(){
     printf '\n\033[2mPress any key to return...\033[0m'
-    pause_stty="$(stty -g </dev/tty 2>/dev/null)"
-    stty -echo -icanon min 1 time 0 </dev/tty 2>/dev/null || true
-    dd if=/dev/tty bs=1 count=1 >/dev/null 2>&1 || true
-    [ -n "$pause_stty" ] && stty "$pause_stty" </dev/tty 2>/dev/null || true
+    pause_stty="$(menu_stty -g 2>/dev/null)"
+    menu_stty -echo -icanon min 1 time 0 >/dev/null 2>&1 || true
+    menu_read_byte >/dev/null 2>&1 || true
+    [ -n "$pause_stty" ] && menu_stty "$pause_stty" >/dev/null 2>&1 || true
 }
 
 menu_state_core(){
@@ -997,11 +1032,11 @@ menu_draw(){
 }
 
 menu_read_key(){
-    k="$(dd if=/dev/tty bs=1 count=1 2>/dev/null)"
+    k="$(menu_read_byte)"
     case "$k" in
         "$(printf '\033')")
-            k2="$(dd if=/dev/tty bs=1 count=1 2>/dev/null)"
-            k3="$(dd if=/dev/tty bs=1 count=1 2>/dev/null)"
+            k2="$(menu_read_byte)"
+            k3="$(menu_read_byte)"
             [ "$k2" = "[" ] && {
                 [ "$k3" = A ] && { echo up; return; }
                 [ "$k3" = B ] && { echo down; return; }
@@ -1023,15 +1058,21 @@ menu_logs_simple(){
 }
 
 menu(){
-    [ -r /dev/tty ] || { usage; return 1; }
-    oldstty="$(stty -g </dev/tty 2>/dev/null)"
-    [ -n "$oldstty" ] || { usage; return 1; }
+    if ! menu_terminal_init; then
+        echo "Interactive terminal is unavailable." >&2
+        echo "Use: goshacrash help" >&2
+        return 1
+    fi
 
     items_count=5
     selected=1
 
-    stty -echo -icanon min 1 time 0 </dev/tty 2>/dev/null || { usage; return 1; }
-    trap 'stty "$oldstty" </dev/tty 2>/dev/null; printf "\033[0m\n"' HUP INT TERM EXIT
+    menu_stty -echo -icanon min 1 time 0 >/dev/null 2>&1 || {
+        echo "Failed to initialize interactive terminal." >&2
+        return 1
+    }
+
+    trap 'menu_stty "$MENU_OLD_STTY" >/dev/null 2>&1; printf "\033[0m\n"' HUP INT TERM EXIT
 
     while :; do
         load_platform >/dev/null 2>&1 || true
@@ -1050,7 +1091,7 @@ menu(){
                 break
                 ;;
             enter)
-                stty "$oldstty" </dev/tty 2>/dev/null || true
+                menu_stty "$MENU_OLD_STTY" >/dev/null 2>&1 || true
                 printf '\033[2J\033[H'
                 case "$selected" in
                     1) status; menu_pause ;;
@@ -1060,12 +1101,12 @@ menu(){
                     5) break ;;
                 esac
                 load_platform >/dev/null 2>&1 || true
-                stty -echo -icanon min 1 time 0 </dev/tty 2>/dev/null || true
+                menu_stty -echo -icanon min 1 time 0 >/dev/null 2>&1 || true
                 ;;
         esac
     done
 
-    stty "$oldstty" </dev/tty 2>/dev/null || true
+    menu_stty "$MENU_OLD_STTY" >/dev/null 2>&1 || true
     trap - HUP INT TERM EXIT
     printf '\033[0m\033[2J\033[H'
 }

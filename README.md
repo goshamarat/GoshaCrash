@@ -1,4 +1,4 @@
-# GoshaCrash 3.5.3
+# GoshaCrash 3.5.4
 
 Минимальная онлайн-сборка для ASUSWRT. Пользователь копирует только `install.sh`; всё остальное установщик получает из GitHub.
 
@@ -119,3 +119,7 @@ goshacrash pkg install nano
 ## Zashboard
 
 Zashboard устанавливается `install.sh`. Обновление панели выполняется кнопкой внутри Zashboard. На legacy ссылка скрывает обновление ядра Mihomo.
+
+
+### 3.5.4
+Interactive menu terminal detection now falls back from `/dev/tty` to the current SSH stdin for older ASUSWRT environments.
