@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.4.5-public-placeholders"
-BUILD_ID="2026-08-07-public-placeholders-r8"
+VERSION="3.5.3-beautiful-menu"
+BUILD_ID="2026-08-07-beautiful-menu-r1"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -77,6 +77,7 @@ NVRAM_BIN=""
 IP_BIN=""
 IPTABLES=""
 IPT_WAIT=""
+NET_BACKEND=""
 
 ensure_dirs(){ mkdir -p "$BASE/bin" "$UI" "$RUN" "$LOGS" "$STATE" "$BACKUPS" "$ROUTE_STATE" "$BASE/proxies" "$BASE/rulesets"; }
 now(){ date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date; }
@@ -312,7 +313,12 @@ validate_binary_file(){
 required_config(){
     [ -f "$CONFIG" ] || { fail "Не найден $CONFIG"; return 1; }
     is_true "$(yaml_section "$CONFIG" tun enable)" || { fail "tun.enable должен быть true"; return 1; }
-    [ "$(yaml_section "$CONFIG" tun stack)" = "$TUN_STACK" ] || { fail "tun.stack должен быть $TUN_STACK"; return 1; }
+    stack="$(yaml_section "$CONFIG" tun stack)"
+    [ -n "$stack" ] || { fail "tun.stack не задан"; return 1; }
+    if [ "$MIHOMO_TARGET" = armv5 ] && [ "$stack" != gvisor ]; then
+        fail "ARMv5 требует tun.stack: gvisor"
+        return 1
+    fi
     [ "$(yaml_section "$CONFIG" tun device)" = "$TUN_DEVICE" ] || { fail "tun.device должен быть $TUN_DEVICE"; return 1; }
     is_true "$(yaml_section "$CONFIG" dns enable)" || { fail "dns.enable должен быть true"; return 1; }
     [ "$(yaml_section "$CONFIG" dns listen)" = "127.0.0.1:$DNS_PORT" ] || { fail "dns.listen должен быть 127.0.0.1:$DNS_PORT"; return 1; }
@@ -320,20 +326,21 @@ required_config(){
     [ -n "$(yaml_top "$CONFIG" external-ui-url)" ] || { fail "Добавь external-ui-url для обновления Zashboard из самой панели"; return 1; }
 
     if [ "$ROUTING_MODE" = manual ]; then
-        is_false "$(yaml_section "$CONFIG" tun auto-route)" || { fail "legacy: tun.auto-route должен быть false"; return 1; }
-        is_false "$(yaml_section "$CONFIG" tun auto-redirect)" || { fail "legacy: tun.auto-redirect должен быть false"; return 1; }
-        [ "$(yaml_top "$CONFIG" routing-mark)" = "$OUTBOUND_MARK_DEC" ] || { fail "legacy: routing-mark должен быть $OUTBOUND_MARK_DEC"; return 1; }
+        is_false "$(yaml_section "$CONFIG" tun auto-route)" || { fail "manual: tun.auto-route должен быть false"; return 1; }
+        is_false "$(yaml_section "$CONFIG" tun auto-redirect)" || { fail "manual: tun.auto-redirect должен быть false"; return 1; }
+        [ "$(yaml_top "$CONFIG" routing-mark)" = "$OUTBOUND_MARK_DEC" ] || { fail "manual: routing-mark должен быть $OUTBOUND_MARK_DEC"; return 1; }
     else
-        is_true "$(yaml_section "$CONFIG" tun auto-route)" || { fail "modern: tun.auto-route должен быть true"; return 1; }
-        is_true "$(yaml_section "$CONFIG" tun auto-redirect)" || { fail "modern: tun.auto-redirect должен быть true"; return 1; }
-        [ -z "$(yaml_top "$CONFIG" routing-mark)" ] || { fail "modern: routing-mark в config.yaml не нужен"; return 1; }
+        [ "$MIHOMO_TARGET" != armv5 ] || { fail "ARMv5 не поддерживает automatic routing в GoshaCrash"; return 1; }
+        is_true "$(yaml_section "$CONFIG" tun auto-route)" || { fail "auto: tun.auto-route должен быть true"; return 1; }
+        is_true "$(yaml_section "$CONFIG" tun auto-redirect)" || { fail "auto: tun.auto-redirect должен быть true"; return 1; }
+        [ -z "$(yaml_top "$CONFIG" routing-mark)" ] || { fail "auto: routing-mark в конфиге не нужен"; return 1; }
     fi
 }
 
 check_config_with(){
     file="$1"
     load_platform || return 1
-    req=0; [ "$LEGACY" = 1 ] && req=1
+    req=0; [ "$MIHOMO_TARGET" = armv5 ] && req=1
     validate_binary_file "$file" "$req" || return 1
     required_config || return 1
     "$file" -t -d "$BASE" -f "$CONFIG"
@@ -350,19 +357,47 @@ net_link_exists(){
 }
 wait_tun(){ n=0; while [ "$n" -lt 20 ]; do net_link_exists "$TUN_DEVICE" && return 0; sleep 1; n=$((n + 1)); done; return 1; }
 
-net_rule_add(){ if [ "$ROUTING_MODE" = manual ]; then "$GCNET_BIN" rule-add "$1" "$2" "$3"; else "$IP_BIN" rule add fwmark "$1" table "$2" pref "$3"; fi; }
+select_net_backend(){
+    NET_BACKEND=""
+    if [ "$MIHOMO_TARGET" = armv5 ] && [ -x "$GCNET_BIN" ]; then
+        "$GCNET_BIN" link-exists lo >/dev/null 2>&1 && NET_BACKEND="gcnet"
+    fi
+    if [ -z "$NET_BACKEND" ] && [ -n "$IP_BIN" ]; then NET_BACKEND="ip"; fi
+    if [ -z "$NET_BACKEND" ] && [ -x "$GCNET_BIN" ]; then
+        "$GCNET_BIN" link-exists lo >/dev/null 2>&1 && NET_BACKEND="gcnet"
+    fi
+    [ -n "$NET_BACKEND" ] || { fail "Нет инструмента policy routing: нужен ip или совместимый gcnet"; return 1; }
+}
+
+net_rule_add(){
+    [ -n "$NET_BACKEND" ] || select_net_backend || return 1
+    if [ "$NET_BACKEND" = gcnet ]; then "$GCNET_BIN" rule-add "$1" "$2" "$3"; else "$IP_BIN" rule add fwmark "$1" table "$2" pref "$3"; fi
+}
 net_rule_del(){
     mark="$1"; table="$2"; pref="${3:-}"
-    if [ "$ROUTING_MODE" = manual ]; then
+    [ -n "$NET_BACKEND" ] || select_net_backend >/dev/null 2>&1 || return 1
+    if [ "$NET_BACKEND" = gcnet ]; then
         if [ -n "$pref" ]; then "$GCNET_BIN" rule-del "$mark" "$table" "$pref"; else "$GCNET_BIN" rule-del "$mark" "$table"; fi
     else
         if [ -n "$pref" ]; then "$IP_BIN" rule del fwmark "$mark" table "$table" pref "$pref"; else "$IP_BIN" rule del fwmark "$mark" table "$table"; fi
     fi
 }
-net_rule_exists(){ if [ "$ROUTING_MODE" = manual ]; then "$GCNET_BIN" rule-exists "$1" "$2" >/dev/null 2>&1; else "$IP_BIN" rule show 2>/dev/null | grep -Eq "fwmark[[:space:]]+$1.*(lookup|table)[[:space:]]+$2"; fi; }
-net_route_add_default(){ if [ "$ROUTING_MODE" = manual ]; then "$GCNET_BIN" route-add-default "$1" "$2"; else "$IP_BIN" route replace default dev "$1" table "$2"; fi; }
-net_route_flush(){ if [ "$ROUTING_MODE" = manual ]; then "$GCNET_BIN" route-flush "$1"; else "$IP_BIN" route flush table "$1"; fi; }
-net_route_default_exists(){ if [ "$ROUTING_MODE" = manual ]; then "$GCNET_BIN" route-default-exists "$1" "$2" >/dev/null 2>&1; else "$IP_BIN" route show table "$2" 2>/dev/null | grep -Eq "^default .*dev[[:space:]]+$1([[:space:]]|$)"; fi; }
+net_rule_exists(){
+    [ -n "$NET_BACKEND" ] || select_net_backend >/dev/null 2>&1 || return 1
+    if [ "$NET_BACKEND" = gcnet ]; then "$GCNET_BIN" rule-exists "$1" "$2" >/dev/null 2>&1; else "$IP_BIN" rule show 2>/dev/null | grep -Eq "fwmark[[:space:]]+$1.*(lookup|table)[[:space:]]+$2"; fi
+}
+net_route_add_default(){
+    [ -n "$NET_BACKEND" ] || select_net_backend || return 1
+    if [ "$NET_BACKEND" = gcnet ]; then "$GCNET_BIN" route-add-default "$1" "$2"; else "$IP_BIN" route replace default dev "$1" table "$2"; fi
+}
+net_route_flush(){
+    [ -n "$NET_BACKEND" ] || select_net_backend >/dev/null 2>&1 || return 0
+    if [ "$NET_BACKEND" = gcnet ]; then "$GCNET_BIN" route-flush "$1"; else "$IP_BIN" route flush table "$1"; fi
+}
+net_route_default_exists(){
+    [ -n "$NET_BACKEND" ] || select_net_backend >/dev/null 2>&1 || return 1
+    if [ "$NET_BACKEND" = gcnet ]; then "$GCNET_BIN" route-default-exists "$1" "$2" >/dev/null 2>&1; else "$IP_BIN" route show table "$2" 2>/dev/null | grep -Eq "^default .*dev[[:space:]]+$1([[:space:]]|$)"; fi
+}
 
 flush_route_cache(){ [ -w "$PROC_SYS/net/ipv4/route/flush" ] && printf '%s\n' -1 > "$PROC_SYS/net/ipv4/route/flush" 2>/dev/null || true; }
 ipt_init(){ IPT_WAIT=""; [ -x "$IPTABLES" ] && "$IPTABLES" -h 2>&1 | grep -q '\-w' && IPT_WAIT="-w"; }
@@ -493,8 +528,7 @@ build_forward(){
 }
 
 manual_route_start(){
-    [ -x "$GCNET_BIN" ] || { fail "Legacy helper gcnet не найден: $GCNET_BIN"; return 1; }
-    "$GCNET_BIN" link-exists lo >/dev/null 2>&1 || { fail "gcnet не запускается"; return 1; }
+    select_net_backend || return 1
     [ -x "$IPTABLES" ] || { fail "iptables не найден"; return 1; }
     net_link_exists "$TUN_DEVICE" || { fail "TUN-интерфейс $TUN_DEVICE не найден"; return 1; }
     "$IPTABLES" -j MARK -h >/dev/null 2>&1 || { fail "Ядро не поддерживает iptables MARK"; return 1; }
@@ -510,7 +544,7 @@ manual_route_start(){
     build_forward || { cleanup_manual_rules; restore_sysctls; fail "Не созданы FORWARD-правила"; return 1; }
     flush_route_cache
     printf 'mode=manual\ndevice=%s\ntable=%s\nmark=%s\n' "$TUN_DEVICE" "$TUN_TABLE" "$TUN_MARK" > "$ROUTE_ACTIVE"
-    log_event OK route "legacy route: mark $TUN_MARK -> table $TUN_TABLE -> $TUN_DEVICE"
+    log_event OK route "manual route ($NET_BACKEND): mark $TUN_MARK -> table $TUN_TABLE -> $TUN_DEVICE"
 }
 manual_route_stop(){ cleanup_manual_rules; restore_sysctls; }
 manual_route_status(){
@@ -525,22 +559,20 @@ manual_route_status(){
 modern_route_start(){
     prepare_sysctls || true
     net_link_exists "$TUN_DEVICE" || { fail "Mihomo не создал $TUN_DEVICE"; return 1; }
-    if [ -n "$IP_BIN" ]; then
-        "$IP_BIN" route show table "$TUN_TABLE" 2>/dev/null | grep -q . || { fail "Mihomo не создал auto-route в table $TUN_TABLE"; return 1; }
-        "$IP_BIN" rule show 2>/dev/null | grep -Eq "(lookup|table)[[:space:]]+$TUN_TABLE([[:space:]]|$)" || { fail "Mihomo не создал policy rule для table $TUN_TABLE"; return 1; }
-    fi
-    printf 'mode=auto\ndevice=%s\ntable=%s\n' "$TUN_DEVICE" "$TUN_TABLE" > "$ROUTE_ACTIVE"
-    log_event OK route "modern auto-route: table $TUN_TABLE -> $TUN_DEVICE"
+    is_true "$(yaml_section "$CONFIG" tun auto-route)" || { fail "В конфиге выключен auto-route"; return 1; }
+    is_true "$(yaml_section "$CONFIG" tun auto-redirect)" || { fail "В конфиге выключен auto-redirect"; return 1; }
+    printf 'mode=auto\ndevice=%s\n' "$TUN_DEVICE" > "$ROUTE_ACTIVE"
+    log_event OK route "automatic routing управляется Mihomo"
 }
 modern_route_stop(){ restore_sysctls; rm -f "$ROUTE_ACTIVE"; }
 modern_route_status(){
     net_link_exists "$TUN_DEVICE" || return 1
+    is_true "$(yaml_section "$CONFIG" tun auto-route)" || return 1
+    is_true "$(yaml_section "$CONFIG" tun auto-redirect)" || return 1
     if [ -n "$IP_BIN" ]; then
-        "$IP_BIN" route show table "$TUN_TABLE" 2>/dev/null | grep -q . || return 1
-        "$IP_BIN" rule show 2>/dev/null | grep -Eq "(lookup|table)[[:space:]]+$TUN_TABLE([[:space:]]|$)" || return 1
+        "$IP_BIN" route show table all 2>/dev/null | grep -Eq "dev[[:space:]]+$TUN_DEVICE([[:space:]]|$)" || return 1
     fi
 }
-
 route_start(){
     if [ "$ROUTING_MODE" = manual ]; then manual_route_start; else modern_route_start; fi
 }
@@ -640,169 +672,6 @@ boot(){
 }
 firewall_reload(){ load_platform || return 0; running_pid >/dev/null 2>&1 || return 0; if [ "$ROUTING_MODE" = manual ]; then route_start || { warn "Не восстановлены legacy-правила после firewall restart"; return 1; }; else restart; fi; }
 
-add_once(){ file="$1"; line="$2"; [ -f "$file" ] || printf '#!/bin/sh\n' > "$file"; grep -Fqx "$line" "$file" 2>/dev/null || printf '%s\n' "$line" >> "$file"; chmod 755 "$file"; }
-remove_hook_line(){ file="$1"; pattern="$2"; [ -f "$file" ] || return 0; tmp="$file.gc.$$"; grep -Fv "$pattern" "$file" > "$tmp" 2>/dev/null || true; mv -f "$tmp" "$file"; chmod 755 "$file" 2>/dev/null || true; }
-
-write_command_wrapper(){
-    dst="$1"
-    cat > "$dst" <<'WRAP'
-#!/bin/sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] && [ -x "$BASE/goshacrash.sh" ] || { echo "GoshaCrash не найден на USB" >&2; exit 1; }
-GOSHACRASH_BASE="$BASE"
-export GOSHACRASH_BASE
-exec "$BASE/goshacrash.sh" "$@"
-WRAP
-    chmod 755 "$dst"
-}
-
-remove_legacy_hook_lines(){
-    file="$1"
-    [ -f "$file" ] || return 0
-    tmp="$file.goshacrash.$$"
-    awk '
-      /goshacrash-autostart/ {next}
-      /goshacrash-route/ {next}
-      /GoshaCrash-USB\/install\.sh/ {next}
-      /GoshaCrash-USB\/goshacrash[[:space:]]+(boot|firewall|firewall-reload)/ {next}
-      /\/jffs\/scripts\/goshacrash-start/ {next}
-      /\/jffs\/scripts\/goshacrash-firewall/ {next}
-      {print}
-    ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
-    mv -f "$tmp" "$file" || return 1
-    chmod 755 "$file" 2>/dev/null || true
-}
-
-rewrite_nvram_hook(){
-    key="$1"; begin="$2"; end="$3"; body="$4"
-    find_nvram || return 0
-    tmp="$RUN/nvram-hook.$$"
-    old="$(nvram_get "$key")"
-    printf '%s\n' "$old" | awk -v b="$begin" -v e="$end" '
-      index($0,b) {skip=1; next}
-      index($0,e) {skip=0; next}
-      !skip {print}
-    ' > "$tmp" || return 1
-    {
-        cat "$tmp"
-        printf '%s\n' "$begin"
-        printf '%s\n' "$body"
-        printf '%s\n' "$end"
-    } > "$tmp.new" || return 1
-    value="$(cat "$tmp.new")"
-    nvram_set "$key" "$value" || { rm -f "$tmp" "$tmp.new"; return 1; }
-    rm -f "$tmp" "$tmp.new"
-}
-
-install_nvram_usb_hooks(){
-    find_nvram || { warn "nvram недоступен: USB hooks через NVRAM пропущены; JFFS и Download Master hooks уже установлены"; return 0; }
-    rewrite_nvram_hook script_usbmount '# GOSHACRASH_USBMOUNT_BEGIN' '# GOSHACRASH_USBMOUNT_END'       'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); [ -x "$BASE/goshacrash.sh" ] && /jffs/addons/goshacrash/start.sh &' || warn "Не удалось записать stock ASUS USB-mount hook"
-    rewrite_nvram_hook script_usbumount '# GOSHACRASH_USBUMOUNT_BEGIN' '# GOSHACRASH_USBUMOUNT_END'       'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" stop >/dev/null 2>&1' || warn "Не удалось записать stock ASUS USB-unmount hook"
-    [ "$(nvram_get jffs2_scripts)" = 1 ] || nvram_set jffs2_scripts 1 || true
-    nvram_commit || true
-}
-
-remove_nvram_usb_hooks(){
-    find_nvram || return 0
-    for spec in       'script_usbmount|# GOSHACRASH_USBMOUNT_BEGIN|# GOSHACRASH_USBMOUNT_END'       'script_usbumount|# GOSHACRASH_USBMOUNT_BEGIN|# GOSHACRASH_USBUMOUNT_END'; do
-        key="${spec%%|*}"; rest="${spec#*|}"; begin="${rest%%|*}"; end="${rest#*|}"
-        tmp="$RUN/nvram-remove.$$"
-        nvram_get "$key" | awk -v b="$begin" -v e="$end" '
-          index($0,b) {skip=1; next}
-          index($0,e) {skip=0; next}
-          !skip {print}
-        ' > "$tmp" || continue
-        value="$(cat "$tmp")"
-        nvram_set "$key" "$value" || true
-        rm -f "$tmp"
-    done
-    nvram_commit || true
-}
-
-write_nano_wrapper(){
-    dst="$1"
-    cat > "$dst" <<'WRAP'
-#!/bin/sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-DM=""
-[ -f "$BASE/state/platform.env" ] && . "$BASE/state/platform.env"
-for p in /opt/bin/nano /tmp/opt/bin/nano "$DM_ROOT/bin/nano"; do
-  [ -x "$p" ] && exec "$p" "$@"
-done
-echo "nano не найден. Запусти: goshacrash pkg install nano" >&2
-exit 1
-WRAP
-    chmod 755 "$dst"
-}
-
-install_hooks(){
-    ensure_dirs || return 1; load_platform || return 1; find_dm_root || { fail "Download Master не найден"; return 1; }
-    mkdir -p "$JFFS_DIR" /jffs/scripts /jffs/configs "$DM_ROOT/bin" "$DM_ROOT/etc/init.d" || return 1
-    printf '%s\n' "$BASE" > "$JFFS_BASE_FILE" || return 1
-
-    cat > "$JFFS_DIR/start.sh" <<'HOOK'
-#!/bin/sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -x "$BASE/goshacrash.sh" ] || exit 0
-mkdir -p "$BASE/logs" "$BASE/run" "$BASE/state" 2>/dev/null || true
-touch "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-if command -v nohup >/dev/null 2>&1; then
-  GOSHACRASH_BASE="$BASE" nohup "$BASE/goshacrash.sh" boot </dev/null >> "$BASE/logs/boot.log" 2>&1 &
-else
-  GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" boot </dev/null >> "$BASE/logs/boot.log" 2>&1 &
-fi
-HOOK
-    chmod 755 "$JFFS_DIR/start.sh" || return 1
-
-    cat > "$JFFS_DIR/firewall.sh" <<'HOOK'
-#!/bin/sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" firewall-reload >/dev/null 2>&1
-HOOK
-    chmod 755 "$JFFS_DIR/firewall.sh" || return 1
-
-    remove_legacy_hook_lines /jffs/scripts/services-start || return 1
-    remove_legacy_hook_lines /jffs/scripts/firewall-start || return 1
-    rm -f /jffs/scripts/goshacrash-start /jffs/scripts/goshacrash-firewall /jffs/scripts/goshacrash-autostart /jffs/scripts/goshacrash-route 2>/dev/null || true
-    add_once /jffs/scripts/services-start "$JFFS_DIR/start.sh &"
-    add_once /jffs/scripts/firewall-start "$JFFS_DIR/firewall.sh &"
-    write_command_wrapper /jffs/scripts/goshacrash
-    write_nano_wrapper /jffs/scripts/nano
-    write_command_wrapper "$DM_ROOT/bin/goshacrash"
-
-    # /opt is managed by Download Master. Copy only when its bin directory is writable.
-    if [ -d /opt/bin ] && [ -w /opt/bin ]; then write_command_wrapper /opt/bin/goshacrash 2>/dev/null || true; fi
-
-    add_once /jffs/configs/profile.add 'export PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"'
-
-    cat > "$DM_ROOT/etc/init.d/S99goshacrash" <<'INIT'
-#!/bin/sh
-case "$1" in
-  start) /jffs/addons/goshacrash/start.sh & ;;
-  stop) /jffs/scripts/goshacrash stop ;;
-  restart) /jffs/scripts/goshacrash restart ;;
-  firewall-start|firewall-restart) /jffs/addons/goshacrash/firewall.sh & ;;
-esac
-INIT
-    chmod 755 "$DM_ROOT/etc/init.d/S99goshacrash" || return 1
-
-    install_nvram_usb_hooks || true
-    ok "Автозапуск установлен: JFFS + Download Master + stock ASUS USB hook"
-    ok "goshacrash и nano доступны без привязки к текущему каталогу"
-}
-
-remove_hooks(){
-    load_platform >/dev/null 2>&1 || true; find_dm_root >/dev/null 2>&1 || true
-    remove_hook_line /jffs/scripts/services-start "$JFFS_DIR/start.sh &"
-    remove_hook_line /jffs/scripts/firewall-start "$JFFS_DIR/firewall.sh &"
-    rm -f /jffs/scripts/goshacrash /jffs/scripts/nano 2>/dev/null || true
-    if [ -n "$DM_ROOT" ]; then
-        rm -f "$DM_ROOT/bin/goshacrash" "$DM_ROOT/etc/init.d/S99goshacrash" 2>/dev/null || true
-    fi
-    remove_nvram_usb_hooks || true
-    rm -rf "$JFFS_DIR" 2>/dev/null || true
-}
-
 backup_config(){
     [ -f "$CONFIG" ] || return 1
     stamp="$(date '+%Y%m%d-%H%M%S' 2>/dev/null)"; [ -n "$stamp" ] || stamp="backup"
@@ -843,6 +712,114 @@ edit_config(){
     if ! check_config; then cp -f "$backup" "$CONFIG"; fail "Конфиг некорректен; восстановлена предыдущая версия"; return 1; fi
     if ! restart; then cp -f "$backup" "$CONFIG"; warn "Новый конфиг не запустился; восстановлен старый"; restart || true; return 1; fi
     ok "config.yaml сохранён и применён"
+}
+
+
+yaml_set_section_key(){
+    file="$1"; section="$2"; key="$3"; value="$4"; tmp="$file.gc.$$"
+    awk -v section="$section" -v key="$key" -v value="$value" '
+      BEGIN {inside=0; found=0}
+      $0 ~ "^" section ":[[:space:]]*($|#)" {inside=1; found=0; print; next}
+      inside && /^[^[:space:]#]/ {if(!found) print "  " key ": " value; inside=0}
+      inside && $0 ~ "^[[:space:]]+" key ":[[:space:]]*" {indent=$0; sub(/[^[:space:]].*$/, "", indent); print indent key ": " value; found=1; next}
+      {print}
+      END {if(inside && !found) print "  " key ": " value}
+    ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$file"
+}
+
+yaml_set_top_key(){
+    file="$1"; key="$2"; value="$3"; tmp="$file.gc.$$"
+    awk -v key="$key" -v value="$value" 'BEGIN{done=0} $0 ~ "^" key ":[[:space:]]*" {if(!done){print key ": " value; done=1}; next} {print} END{if(!done) print key ": " value}' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$file"
+}
+
+yaml_remove_top_key(){
+    file="$1"; key="$2"; tmp="$file.gc.$$"
+    awk -v key="$key" '$0 !~ "^" key ":[[:space:]]*" {print}' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$file"
+}
+
+platform_set(){
+    key="$1"; value="$2"; tmp="$PLATFORM_FILE.gc.$$"
+    awk -v key="$key" -v value="$value" '
+      BEGIN{done=0}
+      $0 ~ "^" key "=" {if(!done){print key "=\"" value "\""; done=1}; next}
+      {print}
+      END{if(!done) print key "=\"" value "\""}
+    ' "$PLATFORM_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$PLATFORM_FILE"
+    chmod 600 "$PLATFORM_FILE" 2>/dev/null || true
+}
+
+rewrite_config_for_routing(){
+    mode="$1"
+    if [ "$mode" = auto ]; then
+        [ "$MIHOMO_TARGET" != armv5 ] || { fail "ARMv5: automatic routing недоступен"; return 1; }
+        yaml_set_section_key "$CONFIG" tun stack system || return 1
+        yaml_set_section_key "$CONFIG" tun auto-route true || return 1
+        yaml_set_section_key "$CONFIG" tun auto-redirect true || return 1
+        yaml_set_section_key "$CONFIG" tun auto-detect-interface true || return 1
+        yaml_remove_top_key "$CONFIG" routing-mark || return 1
+    else
+        stack="system"; [ "$MIHOMO_TARGET" = armv5 ] && stack="gvisor"
+        yaml_set_section_key "$CONFIG" tun stack "$stack" || return 1
+        yaml_set_section_key "$CONFIG" tun auto-route false || return 1
+        yaml_set_section_key "$CONFIG" tun auto-redirect false || return 1
+        yaml_set_section_key "$CONFIG" tun auto-detect-interface false || return 1
+        yaml_set_top_key "$CONFIG" routing-mark "$OUTBOUND_MARK_DEC" || return 1
+    fi
+}
+
+set_routing_mode(){
+    mode="$1"
+    case "$mode" in manual|auto) ;; *) fail "routing: manual|auto|status"; return 1;; esac
+    load_platform || return 1
+    [ "$mode" != auto ] || [ "$MIHOMO_TARGET" != armv5 ] || { fail "ARMv5 поддерживает только manual routing"; return 1; }
+    if [ "$ROUTING_MODE" = "$mode" ]; then
+        say "Маршрутизация уже: $mode"
+        return 0
+    fi
+
+    ensure_dirs || return 1
+    cfg_backup="$BACKUPS/$(basename "$CONFIG").routing-before-$(date '+%Y%m%d-%H%M%S' 2>/dev/null)"
+    state_backup="$BACKUPS/platform.env.routing-before-$$"
+    cp -f "$CONFIG" "$cfg_backup" || return 1
+    cp -f "$PLATFORM_FILE" "$state_backup" || return 1
+
+    watchdog_stop
+    stop_runtime
+    if ! rewrite_config_for_routing "$mode"; then
+        cp -f "$cfg_backup" "$CONFIG"; return 1
+    fi
+    stack="system"; [ "$MIHOMO_TARGET" = armv5 ] && stack="gvisor"
+    platform_set ROUTING_MODE "$mode" || { cp -f "$cfg_backup" "$CONFIG"; cp -f "$state_backup" "$PLATFORM_FILE"; return 1; }
+    platform_set TUN_STACK "$stack" || { cp -f "$cfg_backup" "$CONFIG"; cp -f "$state_backup" "$PLATFORM_FILE"; return 1; }
+    load_platform || return 1
+
+    if check_config && with_start_lock start_runtime; then
+        rm -f "$MANUAL_STOP"
+        watchdog_start
+        cp -f "$CONFIG" "$BACKUPS/config.last-good.yaml" 2>/dev/null || true
+        ok "Маршрутизация переключена на $mode"
+        return 0
+    fi
+
+    warn "Новый режим не запустился; возвращаю предыдущую конфигурацию"
+    stop_runtime >/dev/null 2>&1 || true
+    cp -f "$cfg_backup" "$CONFIG"
+    cp -f "$state_backup" "$PLATFORM_FILE"
+    load_platform >/dev/null 2>&1 || true
+    with_start_lock start_runtime >/dev/null 2>&1 || true
+    watchdog_start >/dev/null 2>&1 || true
+    return 1
+}
+
+routing_status(){
+    load_platform || return 1
+    echo "Routing: $ROUTING_MODE"
+    echo "Mihomo target: $MIHOMO_TARGET"
+    if [ "$MIHOMO_TARGET" = armv5 ]; then echo "Automatic: недоступен для ARMv5"; else echo "Automatic: доступен"; fi
 }
 
 controller_port(){
@@ -904,13 +881,14 @@ status(){
     else
         echo "Профиль: modern"
     fi
+    echo "Режим маршрутизации: $ROUTING_MODE"
 
     echo "Конфиг: $CONFIG"
     net_link_exists "$TUN_DEVICE" && echo "TUN: $TUN_DEVICE работает" || echo "TUN: $TUN_DEVICE не найден"
     if running_pid >/dev/null 2>&1 && route_status >/dev/null 2>&1; then
-        echo "Маршрутизация: работает"
+        echo "Состояние маршрутизации: работает"
     else
-        echo "Маршрутизация: не работает"
+        echo "Состояние маршрутизации: не работает"
     fi
     echo "Zashboard: $(dashboard_base_url)"
 }
@@ -925,20 +903,186 @@ doctor(){
     echo; echo '=== tun ==='; ensure_tun && echo '/dev/net/tun: OK' || echo '/dev/net/tun: ERROR'
     echo; echo '=== status ==='; status
     echo; echo '=== routes ==='
-    if [ "$ROUTING_MODE" = manual ] && [ -x "$GCNET_BIN" ]; then "$GCNET_BIN" rule-list 2>/dev/null || true; "$GCNET_BIN" route-list "$TUN_TABLE" 2>/dev/null || true; elif [ -n "$IP_BIN" ]; then "$IP_BIN" rule show 2>/dev/null || true; "$IP_BIN" route show table "$TUN_TABLE" 2>/dev/null || true; fi
+    if [ "$ROUTING_MODE" = manual ]; then select_net_backend >/dev/null 2>&1 || true; [ "$NET_BACKEND" = gcnet ] && { "$GCNET_BIN" rule-list 2>/dev/null || true; "$GCNET_BIN" route-list "$TUN_TABLE" 2>/dev/null || true; }; [ "$NET_BACKEND" = ip ] && { "$IP_BIN" rule show 2>/dev/null || true; "$IP_BIN" route show table "$TUN_TABLE" 2>/dev/null || true; }; elif [ -n "$IP_BIN" ]; then "$IP_BIN" rule show 2>/dev/null || true; "$IP_BIN" route show 2>/dev/null || true; fi
     echo; echo '=== iptables ==='; [ -x "$IPTABLES" ] && { "$IPTABLES" -t mangle -L "$LAN_CHAIN" -n -v 2>/dev/null || true; "$IPTABLES" -t nat -L "$DNS_OUT_CHAIN" -n -v 2>/dev/null || true; }
     echo; echo '=== recent Mihomo log ==='; tail -n 100 "$MIHOMO_LOG" 2>/dev/null || true
+}
+
+
+menu_pause(){
+    printf '\n\033[2mPress any key to return...\033[0m'
+    pause_stty="$(stty -g </dev/tty 2>/dev/null)"
+    stty -echo -icanon min 1 time 0 </dev/tty 2>/dev/null || true
+    dd if=/dev/tty bs=1 count=1 >/dev/null 2>&1 || true
+    [ -n "$pause_stty" ] && stty "$pause_stty" </dev/tty 2>/dev/null || true
+}
+
+menu_state_core(){
+    if running_pid >/dev/null 2>&1; then
+        printf 'ONLINE'
+    else
+        printf 'OFFLINE'
+    fi
+}
+
+menu_state_tun(){
+    if net_link_exists "$TUN_DEVICE"; then
+        printf 'UP'
+    else
+        printf 'DOWN'
+    fi
+}
+
+menu_profile_name(){
+    if [ "${LEGACY:-1}" = 1 ]; then
+        printf 'LEGACY'
+    else
+        printf 'MODERN'
+    fi
+}
+
+menu_print_state(){
+    value="$1"
+    width="$2"
+    case "$value" in
+        ONLINE|UP) printf '\033[1;32m%-*s\033[0m' "$width" "$value" ;;
+        OFFLINE|DOWN) printf '\033[1;31m%-*s\033[0m' "$width" "$value" ;;
+        *) printf '%-*s' "$width" "$value" ;;
+    esac
+}
+
+menu_item(){
+    current="$1"; number="$2"; label="$3"
+    if [ "$current" -eq "$number" ]; then
+        printf '│    \033[1;36m▶ %-34s\033[0m   │\n' "$label"
+    else
+        printf '│      %-34s   │\n' "$label"
+    fi
+}
+
+menu_draw(){
+    selected="$1"
+    printf '\033[2J\033[H'
+    printf '\033[1;36m'
+    printf '┌───────────────────────────────────────────┐\n'
+    printf '│               G O S H A C R A S H         │\n'
+    printf '│              ROUTER CONTROLLER             │\n'
+    printf '├───────────────────────────────────────────┤\n'
+    printf '\033[0m'
+    core_state="$(menu_state_core)"
+    tun_state="$(menu_state_tun)"
+    profile_state="$(menu_profile_name)"
+    routing_state="$(printf '%s' "${ROUTING_MODE:-unknown}" | tr '[:lower:]' '[:upper:]')"
+    printf '│  MIHOMO  '
+    menu_print_state "$core_state" 12
+    printf ' TUN  '
+    menu_print_state "$tun_state" 10
+    printf ' │\n'
+    printf '│  PROFILE %-10s       ROUTING %-8s │\n' "$profile_state" "$routing_state"
+    printf '\033[1;36m'
+    printf '├───────────────────────────────────────────┤\n'
+    printf '\033[0m'
+    menu_item "$selected" 1 "Status"
+    menu_item "$selected" 2 "Restart"
+    menu_item "$selected" 3 "Stop"
+    menu_item "$selected" 4 "Logs"
+    menu_item "$selected" 5 "Exit"
+    printf '\033[1;36m'
+    printf '├───────────────────────────────────────────┤\n'
+    printf '\033[0m'
+    printf '│  \033[2m↑/↓ Navigate    Enter Select    Q Quit\033[0m     │\n'
+    printf '\033[1;36m'
+    printf '└───────────────────────────────────────────┘\n'
+    printf '\033[0m'
+}
+
+menu_read_key(){
+    k="$(dd if=/dev/tty bs=1 count=1 2>/dev/null)"
+    case "$k" in
+        "$(printf '\033')")
+            k2="$(dd if=/dev/tty bs=1 count=1 2>/dev/null)"
+            k3="$(dd if=/dev/tty bs=1 count=1 2>/dev/null)"
+            [ "$k2" = "[" ] && {
+                [ "$k3" = A ] && { echo up; return; }
+                [ "$k3" = B ] && { echo down; return; }
+            }
+            echo other
+            ;;
+        ''|"$(printf '\r')"|"$(printf '\n')") echo enter ;;
+        q|Q) echo quit ;;
+        *) echo other ;;
+    esac
+}
+
+menu_logs_simple(){
+    printf '\033[1;36m=== MIHOMO LOG ===\033[0m\n'
+    tail -n 100 "$MIHOMO_LOG" 2>/dev/null || echo "Mihomo log is empty"
+    echo
+    printf '\033[1;36m=== GOSHACRASH LOG ===\033[0m\n'
+    tail -n 50 "$SYSTEM_LOG" 2>/dev/null || echo "GoshaCrash log is empty"
+}
+
+menu(){
+    [ -r /dev/tty ] || { usage; return 1; }
+    oldstty="$(stty -g </dev/tty 2>/dev/null)"
+    [ -n "$oldstty" ] || { usage; return 1; }
+
+    items_count=5
+    selected=1
+
+    stty -echo -icanon min 1 time 0 </dev/tty 2>/dev/null || { usage; return 1; }
+    trap 'stty "$oldstty" </dev/tty 2>/dev/null; printf "\033[0m\n"' HUP INT TERM EXIT
+
+    while :; do
+        load_platform >/dev/null 2>&1 || true
+        menu_draw "$selected"
+        key="$(menu_read_key)"
+        case "$key" in
+            up)
+                selected=$((selected - 1))
+                [ "$selected" -lt 1 ] && selected=$items_count
+                ;;
+            down)
+                selected=$((selected + 1))
+                [ "$selected" -gt "$items_count" ] && selected=1
+                ;;
+            quit)
+                break
+                ;;
+            enter)
+                stty "$oldstty" </dev/tty 2>/dev/null || true
+                printf '\033[2J\033[H'
+                case "$selected" in
+                    1) status; menu_pause ;;
+                    2) restart; menu_pause ;;
+                    3) stop; menu_pause ;;
+                    4) menu_logs_simple; menu_pause ;;
+                    5) break ;;
+                esac
+                load_platform >/dev/null 2>&1 || true
+                stty -echo -icanon min 1 time 0 </dev/tty 2>/dev/null || true
+                ;;
+        esac
+    done
+
+    stty "$oldstty" </dev/tty 2>/dev/null || true
+    trap - HUP INT TERM EXIT
+    printf '\033[0m\033[2J\033[H'
 }
 
 usage(){
     cat <<USAGE
 GoshaCrash
 
+  goshacrash                  интерактивное меню со стрелками
   goshacrash help
   goshacrash status
   goshacrash start
   goshacrash restart
   goshacrash stop
+  goshacrash routing status
+  goshacrash routing manual
+  goshacrash routing auto     недоступно на ARMv5
   goshacrash check
   goshacrash apply
   goshacrash edit
@@ -949,15 +1093,17 @@ GoshaCrash
   goshacrash pkg install ИМЯ
   goshacrash doctor
 
-Zashboard обновляется кнопкой в самой панели.
-На legacy обновление Mihomo не предлагается.
+Initial routing mode is selected by install.sh.
+After installation all runtime control is performed only by goshacrash.sh.
+Zashboard updates from the button inside the panel.
 USAGE
 }
 
 ensure_dirs >/dev/null 2>&1 || true
 load_platform >/dev/null 2>&1 || true
 refresh_path >/dev/null 2>&1 || true
-case "${1:-help}" in
+case "${1:-menu}" in
+    menu) menu;;
     help|-h|--help) usage;;
     start) start;;
     stop|direct) stop;;
@@ -967,6 +1113,15 @@ case "${1:-help}" in
     apply) apply_config;;
     edit|nano) edit_config;;
     dashboard|url|ui) dashboard_url;;
+    routing)
+        shift
+        case "${1:-status}" in
+            status) routing_status;;
+            manual) set_routing_mode manual;;
+            auto) set_routing_mode auto;;
+            *) echo 'Использование: goshacrash routing status|manual|auto'; exit 1;;
+        esac
+        ;;
     logs) shift; show_logs "${1:-mihomo}" "${2:-100}";;
     pkg|package)
         shift
@@ -982,8 +1137,6 @@ case "${1:-help}" in
     firewall-reload) firewall_reload;;
     watchdog-loop) watchdog_loop;;
     watchdog-check) watchdog_check;;
-    install-hooks) install_hooks;;
-    remove-hooks) remove_hooks;;
     version) echo "$VERSION";;
     *) echo "Неизвестная команда: $1" >&2; echo >&2; usage; exit 1;;
 esac

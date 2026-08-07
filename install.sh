@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.4.5-public-placeholders"
+INSTALLER_VERSION="3.5.3-beautiful-menu"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -31,6 +31,7 @@ export PATH
 
 PLATFORM=""
 LEGACY="0"
+ROUTING_REQUEST="${GOSHACRASH_ROUTING:-${ROUTING_MODE:-}}"
 ROUTING_MODE=""
 TUN_STACK=""
 MIHOMO_TARGET=""
@@ -88,6 +89,17 @@ nvram_get(){
     key="$1"
     find_nvram || return 0
     "$NVRAM_BIN" get "$key" 2>/dev/null || true
+}
+
+nvram_set(){
+    key="$1"; value="$2"
+    find_nvram || return 1
+    "$NVRAM_BIN" set "$key=$value" 2>/dev/null
+}
+
+nvram_commit(){
+    find_nvram || return 1
+    "$NVRAM_BIN" commit >/dev/null 2>&1
 }
 
 verify_asuswrt(){
@@ -293,8 +305,6 @@ detect_platform(){
         armv7*:2.6.*:*|arm*:2.6.*:*|*:*:RT-AC68U*|*:*:RT-AC68P*|*:*:RT-AC1900*|*:*:RT-AC66U_B1*)
             PLATFORM="legacy-armv5-gvisor"
             LEGACY="1"
-            ROUTING_MODE="manual"
-            TUN_STACK="gvisor"
             MIHOMO_TARGET="armv5"
             MIHOMO_SOURCE="project-legacy-release"
             MIHOMO_VERSION_SELECTED="$LEGACY_MIHOMO_VERSION"
@@ -305,8 +315,6 @@ detect_platform(){
     esac
 
     LEGACY="0"
-    ROUTING_MODE="auto"
-    TUN_STACK="system"
     MIHOMO_SOURCE="official-latest"
     CONFIG_TEMPLATE="config.yaml"
     ACTIVE_CONFIG="$BASE/config.yaml"
@@ -327,7 +335,64 @@ detect_platform(){
         s390x) MIHOMO_TARGET="s390x" ;;
         *) fail "Неподдерживаемая архитектура: $machine"; return 1 ;;
     esac
+    if [ "$MIHOMO_TARGET" = armv5 ]; then
+        MIHOMO_SOURCE="project-legacy-release"
+        MIHOMO_VERSION_SELECTED="$LEGACY_MIHOMO_VERSION"
+        CONFIG_TEMPLATE="config-legacy.yaml"
+        ACTIVE_CONFIG="$BASE/config-legacy.yaml"
+    fi
     PLATFORM="modern-$MIHOMO_TARGET"
+}
+
+existing_routing_mode(){
+    f="$BASE/state/platform.env"
+    [ -f "$f" ] || return 1
+    mode="$( ( . "$f" 2>/dev/null; printf '%s\n' "${ROUTING_MODE:-}" ) 2>/dev/null )"
+    case "$mode" in manual|auto) printf '%s\n' "$mode"; return 0;; esac
+    return 1
+}
+
+choose_routing_mode(){
+    # ARMv5 is intentionally manual-only: this includes the RT-AC68U legacy build.
+    if [ "$MIHOMO_TARGET" = armv5 ]; then
+        if [ "$ROUTING_REQUEST" = auto ]; then
+            fail "Автоматическая маршрутизация для ARMv5 отключена. Используй manual"
+            return 1
+        fi
+        ROUTING_MODE="manual"
+        TUN_STACK="gvisor"
+        say "Маршрутизация: manual (ARMv5: auto-route запрещён)"
+        return 0
+    fi
+
+    case "$ROUTING_REQUEST" in
+        manual|auto) ROUTING_MODE="$ROUTING_REQUEST" ;;
+        '')
+            old="$(existing_routing_mode 2>/dev/null)"
+            if [ -n "$old" ]; then
+                ROUTING_MODE="$old"
+                say "Сохраняю ранее выбранную маршрутизацию: $ROUTING_MODE"
+            elif [ -t 0 ] && [ -t 1 ]; then
+                echo
+                echo "Выбери маршрутизацию:"
+                echo "  1) automatic — маршруты создаёт Mihomo (auto-route + auto-redirect)"
+                echo "  2) manual    — GoshaCrash создаёт ip rule / route / iptables"
+                printf "Выбор [1]: "
+                IFS= read -r choice
+                case "$choice" in 2|manual|MANUAL) ROUTING_MODE="manual";; *) ROUTING_MODE="auto";; esac
+            else
+                ROUTING_MODE="auto"
+                say "Неинтерактивная установка: выбрана automatic маршрутизация"
+            fi
+            ;;
+        *) fail "Неизвестный GOSHACRASH_ROUTING=$ROUTING_REQUEST (manual|auto)"; return 1 ;;
+    esac
+
+    case "$ROUTING_MODE" in
+        manual) TUN_STACK="system" ;;
+        auto) TUN_STACK="system" ;;
+    esac
+    say "Маршрутизация выбрана: $ROUTING_MODE"
 }
 
 install_controller(){
@@ -341,7 +406,7 @@ install_controller(){
 }
 
 install_network_helper(){
-    if [ "$LEGACY" != 1 ]; then
+    if [ "$MIHOMO_TARGET" != armv5 ]; then
         GCNET_BIN=""
         return 0
     fi
@@ -371,11 +436,67 @@ generate_dashboard_secret(){
 
 replace_placeholder_secret(){
     file="$1"
-    grep -q '^secret:[[:space:]]*["'\'']CHANGE_ME["'\''][[:space:]]*$' "$file" 2>/dev/null || return 0
+    grep -q '^secret:[[:space:]]*["'"'"']CHANGE_ME["'"'"'][[:space:]]*$' "$file" 2>/dev/null || return 0
     secret="$(generate_dashboard_secret)"
     [ -n "$secret" ] || return 1
     sed -i "s@^secret:.*@secret: \"$secret\"@" "$file" || return 1
     say "Для Zashboard создан уникальный локальный secret"
+}
+
+yaml_set_section_key(){
+    file="$1"; section="$2"; key="$3"; value="$4"; tmp="$file.gc.$$"
+    awk -v section="$section" -v key="$key" -v value="$value" '
+      BEGIN {inside=0; found=0}
+      $0 ~ "^" section ":[[:space:]]*($|#)" {inside=1; found=0; print; next}
+      inside && /^[^[:space:]#]/ {
+        if (!found) print "  " key ": " value
+        inside=0
+      }
+      inside && $0 ~ "^[[:space:]]+" key ":[[:space:]]*" {
+        indent=$0; sub(/[^[:space:]].*$/, "", indent)
+        print indent key ": " value
+        found=1
+        next
+      }
+      {print}
+      END {if (inside && !found) print "  " key ": " value}
+    ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$file"
+}
+
+yaml_set_top_key(){
+    file="$1"; key="$2"; value="$3"; tmp="$file.gc.$$"
+    awk -v key="$key" -v value="$value" '
+      BEGIN{done=0}
+      $0 ~ "^" key ":[[:space:]]*" {if(!done){print key ": " value; done=1}; next}
+      {print}
+      END{if(!done) print key ": " value}
+    ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$file"
+}
+
+yaml_remove_top_key(){
+    file="$1"; key="$2"; tmp="$file.gc.$$"
+    awk -v key="$key" '$0 !~ "^" key ":[[:space:]]*" {print}' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$file"
+}
+
+configure_routing_in_config(){
+    file="$1"
+    [ -f "$file" ] || return 1
+    if [ "$ROUTING_MODE" = manual ]; then
+        yaml_set_section_key "$file" tun stack "$TUN_STACK" || return 1
+        yaml_set_section_key "$file" tun auto-route false || return 1
+        yaml_set_section_key "$file" tun auto-redirect false || return 1
+        yaml_set_section_key "$file" tun auto-detect-interface false || return 1
+        yaml_set_top_key "$file" routing-mark 9012 || return 1
+    else
+        yaml_set_section_key "$file" tun stack "$TUN_STACK" || return 1
+        yaml_set_section_key "$file" tun auto-route true || return 1
+        yaml_set_section_key "$file" tun auto-redirect true || return 1
+        yaml_set_section_key "$file" tun auto-detect-interface true || return 1
+        yaml_remove_top_key "$file" routing-mark || return 1
+    fi
 }
 
 install_configs(){
@@ -389,9 +510,11 @@ install_configs(){
         say "Установлена безопасная DIRECT-заглушка: $ACTIVE_CONFIG"
         warn "VPN ещё не настроен: загрузи свой конфиг и выполни goshacrash apply"
     else
-        say "Существующий $ACTIVE_CONFIG сохранён"
+        cp -f "$ACTIVE_CONFIG" "$BASE/backups/$(basename "$ACTIVE_CONFIG").before-install" 2>/dev/null || true
+        say "Существующий $ACTIVE_CONFIG сохранён; меняются только параметры выбранной маршрутизации"
         rm -f "$tmp"
     fi
+    configure_routing_in_config "$ACTIVE_CONFIG" || { fail "Не удалось применить routing=$ROUTING_MODE к конфигу"; return 1; }
     chmod 600 "$ACTIVE_CONFIG" 2>/dev/null || true
 }
 
@@ -438,7 +561,7 @@ validate_downloaded_mihomo(){
     chmod 755 "$newbin" || return 1
     out="$("$newbin" -v 2>&1)" || { printf '%s\n' "$out" >&2; fail "Mihomo не запускается на этой архитектуре"; return 1; }
     printf '%s\n' "$out" | grep -qi 'mihomo' || { printf '%s\n' "$out" >&2; fail "Скачанный файл не похож на Mihomo"; return 1; }
-    if [ "$LEGACY" = 1 ]; then
+    if [ "$MIHOMO_TARGET" = armv5 ]; then
         printf '%s\n' "$out" | grep -Fq 'Use tags: with_gvisor' || { printf '%s\n' "$out" >&2; fail "Legacy-профилю нужна сборка Mihomo with_gvisor"; return 1; }
     fi
     printf '%s\n' "$out" > "$BASE/state/mihomo-version.txt"
@@ -449,7 +572,7 @@ install_mihomo(){
     newbin="$BASE/bin/mihomo.new"
     rm -f "$archive" "$newbin"
 
-    if [ "$LEGACY" = 1 ] && [ "${FORCE_CORE_REINSTALL:-0}" != 1 ] && [ -x "$BASE/bin/mihomo" ]; then
+    if [ "$MIHOMO_TARGET" = armv5 ] && [ "${FORCE_CORE_REINSTALL:-0}" != 1 ] && [ -x "$BASE/bin/mihomo" ]; then
         existing_out="$("$BASE/bin/mihomo" -v 2>&1)"
         if printf '%s\n' "$existing_out" | grep -qi 'mihomo' && \
            printf '%s\n' "$existing_out" | grep -Fq 'Use tags: with_gvisor'; then
@@ -459,7 +582,7 @@ install_mihomo(){
         fi
     fi
 
-    if [ "$LEGACY" = 1 ]; then
+    if [ "$MIHOMO_TARGET" = armv5 ]; then
         success=0
         legacy_mihomo_urls | while IFS= read -r url; do
             [ -n "$url" ] || continue
@@ -546,6 +669,142 @@ install_zashboard(){
     printf '%s\n' "$selected" > "$BASE/state/zashboard-source.txt"
 }
 
+
+add_once(){
+    file="$1"; line="$2"
+    [ -f "$file" ] || printf '#!/bin/sh\n' > "$file"
+    grep -Fqx "$line" "$file" 2>/dev/null || printf '%s\n' "$line" >> "$file"
+    chmod 755 "$file" 2>/dev/null || true
+}
+
+remove_legacy_hook_lines(){
+    file="$1"
+    [ -f "$file" ] || return 0
+    tmp="$file.goshacrash.$$"
+    awk '
+      /goshacrash-autostart/ {next}
+      /goshacrash-route/ {next}
+      /GoshaCrash-USB\/install\.sh/ {next}
+      /GoshaCrash-USB\/goshacrash[[:space:]]+(boot|firewall|firewall-reload)/ {next}
+      /\/jffs\/scripts\/goshacrash-start/ {next}
+      /\/jffs\/scripts\/goshacrash-firewall/ {next}
+      {print}
+    ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$file" || return 1
+    chmod 755 "$file" 2>/dev/null || true
+}
+
+write_command_wrapper(){
+    dst="$1"
+    cat > "$dst" <<'WRAP'
+#!/bin/sh
+BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+[ -n "$BASE" ] && [ -x "$BASE/goshacrash.sh" ] || { echo "GoshaCrash не найден на USB" >&2; exit 1; }
+GOSHACRASH_BASE="$BASE"
+export GOSHACRASH_BASE
+exec "$BASE/goshacrash.sh" "$@"
+WRAP
+    chmod 755 "$dst"
+}
+
+write_nano_wrapper(){
+    dst="$1"
+    cat > "$dst" <<'WRAP'
+#!/bin/sh
+BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+DM_ROOT=""
+[ -f "$BASE/state/platform.env" ] && . "$BASE/state/platform.env"
+for p in /opt/bin/nano /tmp/opt/bin/nano "$DM_ROOT/bin/nano"; do
+  [ -x "$p" ] && exec "$p" "$@"
+done
+echo "nano не найден. Запусти: goshacrash pkg install nano" >&2
+exit 1
+WRAP
+    chmod 755 "$dst"
+}
+
+rewrite_nvram_hook(){
+    key="$1"; begin="$2"; end="$3"; body="$4"
+    find_nvram || return 0
+    tmp="$TMP_ROOT/nvram-hook.$$"
+    old="$(nvram_get "$key")"
+    printf '%s\n' "$old" | awk -v b="$begin" -v e="$end" '
+      index($0,b) {skip=1; next}
+      index($0,e) {skip=0; next}
+      !skip {print}
+    ' > "$tmp" || return 1
+    {
+        cat "$tmp"
+        printf '%s\n' "$begin"
+        printf '%s\n' "$body"
+        printf '%s\n' "$end"
+    } > "$tmp.new" || return 1
+    value="$(cat "$tmp.new")"
+    nvram_set "$key" "$value" || { rm -f "$tmp" "$tmp.new"; return 1; }
+    rm -f "$tmp" "$tmp.new"
+}
+
+install_nvram_usb_hooks(){
+    find_nvram || { warn "nvram недоступен: stock USB hook пропущен; JFFS и Download Master hooks установлены"; return 0; }
+    rewrite_nvram_hook script_usbmount '# GOSHACRASH_USBMOUNT_BEGIN' '# GOSHACRASH_USBMOUNT_END' \
+      'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); [ -x "$BASE/goshacrash.sh" ] && /jffs/addons/goshacrash/start.sh &' || warn "Не удалось записать USB-mount hook"
+    rewrite_nvram_hook script_usbumount '# GOSHACRASH_USBUMOUNT_BEGIN' '# GOSHACRASH_USBUMOUNT_END' \
+      'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" stop >/dev/null 2>&1' || warn "Не удалось записать USB-unmount hook"
+    [ "$(nvram_get jffs2_scripts)" = 1 ] || nvram_set jffs2_scripts 1 || true
+    nvram_commit || true
+}
+
+install_hooks(){
+    JFFS_DIR="/jffs/addons/goshacrash"
+    mkdir -p "$JFFS_DIR" /jffs/scripts /jffs/configs "$DM_ROOT/bin" "$DM_ROOT/etc/init.d" || return 1
+    printf '%s\n' "$BASE" > "$JFFS_DIR/base" || return 1
+
+    cat > "$JFFS_DIR/start.sh" <<'HOOK'
+#!/bin/sh
+BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+[ -x "$BASE/goshacrash.sh" ] || exit 0
+mkdir -p "$BASE/logs" "$BASE/run" "$BASE/state" 2>/dev/null || true
+touch "$BASE/state/autostart-hook-ran" 2>/dev/null || true
+if command -v nohup >/dev/null 2>&1; then
+  GOSHACRASH_BASE="$BASE" nohup "$BASE/goshacrash.sh" boot </dev/null >> "$BASE/logs/boot.log" 2>&1 &
+else
+  GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" boot </dev/null >> "$BASE/logs/boot.log" 2>&1 &
+fi
+HOOK
+    chmod 755 "$JFFS_DIR/start.sh" || return 1
+
+    cat > "$JFFS_DIR/firewall.sh" <<'HOOK'
+#!/bin/sh
+BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+[ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" firewall-reload >/dev/null 2>&1
+HOOK
+    chmod 755 "$JFFS_DIR/firewall.sh" || return 1
+
+    remove_legacy_hook_lines /jffs/scripts/services-start || return 1
+    remove_legacy_hook_lines /jffs/scripts/firewall-start || return 1
+    rm -f /jffs/scripts/goshacrash-start /jffs/scripts/goshacrash-firewall /jffs/scripts/goshacrash-autostart /jffs/scripts/goshacrash-route 2>/dev/null || true
+    add_once /jffs/scripts/services-start "$JFFS_DIR/start.sh &"
+    add_once /jffs/scripts/firewall-start "$JFFS_DIR/firewall.sh &"
+    write_command_wrapper /jffs/scripts/goshacrash
+    write_nano_wrapper /jffs/scripts/nano
+    write_command_wrapper "$DM_ROOT/bin/goshacrash"
+    if [ -d /opt/bin ] && [ -w /opt/bin ]; then write_command_wrapper /opt/bin/goshacrash 2>/dev/null || true; fi
+    add_once /jffs/configs/profile.add 'export PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"'
+
+    cat > "$DM_ROOT/etc/init.d/S99goshacrash" <<'INIT'
+#!/bin/sh
+case "$1" in
+  start) /jffs/addons/goshacrash/start.sh & ;;
+  stop) /jffs/scripts/goshacrash stop ;;
+  restart) /jffs/scripts/goshacrash restart ;;
+  firewall-start|firewall-restart) /jffs/addons/goshacrash/firewall.sh & ;;
+esac
+INIT
+    chmod 755 "$DM_ROOT/etc/init.d/S99goshacrash" || return 1
+    install_nvram_usb_hooks || true
+    ok "Автозапуск и глобальные команды установлены из install.sh"
+}
+
 write_platform_state(){
     cat > "$BASE/state/platform.env" <<EOF
 PLATFORM='$PLATFORM'
@@ -598,6 +857,7 @@ main(){
     # the controlled switchover.
 
     detect_platform || return 1
+    choose_routing_mode || return 1
     model_name="$(nvram_get productid)"; [ -n "$model_name" ] || model_name="$(hostname 2>/dev/null)"; [ -n "$model_name" ] || model_name="ASUSWRT"
     say "Роутер: $model_name, архитектура $(uname -m 2>/dev/null), ядро $(uname -r 2>/dev/null)"
     say "Профиль: $PLATFORM; routing=$ROUTING_MODE; tun.stack=$TUN_STACK"
@@ -610,7 +870,7 @@ main(){
     install_zashboard || return 1
     write_platform_state || return 1
 
-    GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" install-hooks || return 1
+    install_hooks || return 1
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" check || return 1
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" restart || {
         fail "Первый запуск не удался. Проверь $BASE/logs/mihomo.log и команду goshacrash doctor"
@@ -622,7 +882,7 @@ main(){
     echo
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" status
     echo
-    echo "Справка: goshacrash help"
+    echo "Меню: goshacrash    |    Справка: goshacrash help"
     echo "Zashboard: $(GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" dashboard)"
     echo "Обновление Zashboard: кнопка в панели"
 }

@@ -34,7 +34,7 @@ dns:
     - 1.1.1.1
     - 8.8.8.8
 
-# Legacy-профиль: маршрутизацией управляет goshacrash.sh.
+# ARMv5 legacy: используется только ручная маршрутизация GoshaCrash.
 tun:
   enable: true
   stack: gvisor
