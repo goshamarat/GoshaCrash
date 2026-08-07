@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.4.3-download-fix"
-BUILD_ID="2026-08-07-download-fix-r6"
+VERSION="3.4.4-config-dashboard-fix"
+BUILD_ID="2026-08-07-config-dashboard-fix-r7"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -853,15 +853,24 @@ controller_port(){
     printf '%s\n' "$p"
 }
 
+dashboard_base_url(){
+    ip="$(lan_ip)"
+    port="$(controller_port)"
+    printf 'http://%s:%s/ui/
+' "$ip" "$port"
+}
+
 dashboard_url(){
     load_platform >/dev/null 2>&1 || true
     ip="$(lan_ip)"
     port="$(controller_port)"
     secret="$(yaml_top "$CONFIG" secret)"
-    url="http://$ip:$port/ui/#/setup?hostname=$ip&port=$port&type=clash"
+    url="http://$ip:$port/ui/#/setup?hostname=$ip&port=$port"
     [ -n "$secret" ] && url="$url&secret=$secret"
     [ "${LEGACY:-1}" = 1 ] && url="$url&disableUpgradeCore=1"
-    printf '%s\n' "$url"
+    url="$url&type=clash"
+    printf '%s
+' "$url"
 }
 
 
@@ -880,24 +889,30 @@ show_logs(){
 }
 
 status(){
-    ensure_dirs >/dev/null 2>&1 || true; load_platform >/dev/null 2>&1 || true; refresh_path
-    if p="$(running_pid)"; then echo "Mihomo: работает, PID=$p"; else echo "Mihomo: не запущен"; fi
-    echo "GoshaCrash: $VERSION"
-    echo "BASE: $BASE"
-    echo "Платформа: ${PLATFORM:-не определена}; legacy=${LEGACY:-?}; routing=${ROUTING_MODE:-?}; stack=${TUN_STACK:-?}"
-    model_now="${ROUTER_MODEL:-$(nvram_get productid)}"; [ -n "$model_now" ] || model_now="$(hostname 2>/dev/null)"; echo "Роутер: $model_now; arch=${ROUTER_ARCH:-$(uname -m 2>/dev/null)}; kernel=${ROUTER_KERNEL:-$(uname -r 2>/dev/null)}"
-    echo "Mihomo target/source: ${MIHOMO_TARGET:-?} / ${MIHOMO_SOURCE:-?}"
-    echo "Config: $CONFIG"
+    ensure_dirs >/dev/null 2>&1 || true
+    load_platform >/dev/null 2>&1 || true
+    refresh_path
+
+    if p="$(running_pid)"; then
+        echo "Mihomo: работает, PID=$p"
+    else
+        echo "Mihomo: не запущен"
+    fi
+
+    if [ "${LEGACY:-0}" = 1 ]; then
+        echo "Профиль: legacy"
+    else
+        echo "Профиль: modern"
+    fi
+
+    echo "Конфиг: $CONFIG"
     net_link_exists "$TUN_DEVICE" && echo "TUN: $TUN_DEVICE работает" || echo "TUN: $TUN_DEVICE не найден"
-    if running_pid >/dev/null 2>&1 && route_status >/dev/null 2>&1; then echo "Маршрутизация: работает"; else echo "Маршрутизация: выключена или неполна"; fi
-    find_dm_root && echo "Download Master: $DM_ROOT" || echo "Download Master: не найден"
-    find_pkg && echo "Пакеты: $PKG" || echo "Пакеты: ipkg/opkg не найден"
-    [ -f "$STATE/autostart-hook-ran" ] && echo "Автозапуск: hook уже выполнялся" || echo "Автозапуск: установлен, проверка после перезагрузки"
-    [ "$LEGACY" = 1 ] && echo "Обновление legacy: только Zashboard"
-    if p="$(watchdog_pid)"; then echo "Watchdog: работает, PID=$p"; else echo "Watchdog: не запущен"; fi
-    [ -x "$BIN" ] && "$BIN" -v 2>/dev/null | head -n 2 || true
-    echo "Zashboard: $(dashboard_url)"
-    if [ "${LEGACY:-1}" = 1 ]; then echo "Zashboard policy: кнопка обновления панели доступна; обновление ядра скрыто"; fi
+    if running_pid >/dev/null 2>&1 && route_status >/dev/null 2>&1; then
+        echo "Маршрутизация: работает"
+    else
+        echo "Маршрутизация: не работает"
+    fi
+    echo "Zashboard: $(dashboard_base_url)"
 }
 
 doctor(){

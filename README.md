@@ -281,7 +281,7 @@ grep 'INSTALLER_VERSION=' /tmp/install.sh
 Для этой сборки ожидается:
 
 ```text
-INSTALLER_VERSION="3.4.3-download-fix"
+INSTALLER_VERSION="3.4.4-config-dashboard-fix"
 ```
 
 ---
@@ -1256,3 +1256,11 @@ goshacrash dashboard
 ```
 
 Обновление Zashboard выполняется кнопкой внутри самой панели.
+
+## Имена конфигов
+
+- Legacy: рабочий файл `config-legacy.yaml`.
+- Modern: рабочий файл `config.yaml`.
+- Legacy-конфиг больше не переименовывается.
+
+`goshacrash status` показывает короткий адрес панели. `goshacrash dashboard` печатает полную ссылку подключения; на legacy она скрывает кнопку обновления ядра.

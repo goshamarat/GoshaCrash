@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.4.3-download-fix"
+INSTALLER_VERSION="3.4.4-config-dashboard-fix"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -38,6 +38,7 @@ MIHOMO_SOURCE=""
 MIHOMO_VERSION_SELECTED=""
 MIHOMO_URL_SELECTED=""
 CONFIG_TEMPLATE=""
+ACTIVE_CONFIG=""
 GCNET_BIN=""
 
 now(){ date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date; }
@@ -298,6 +299,7 @@ detect_platform(){
             MIHOMO_SOURCE="project-legacy-release"
             MIHOMO_VERSION_SELECTED="$LEGACY_MIHOMO_VERSION"
             CONFIG_TEMPLATE="config-legacy.yaml"
+            ACTIVE_CONFIG="$BASE/config-legacy.yaml"
             return 0
             ;;
     esac
@@ -307,6 +309,7 @@ detect_platform(){
     TUN_STACK="system"
     MIHOMO_SOURCE="official-latest"
     CONFIG_TEMPLATE="config.yaml"
+    ACTIVE_CONFIG="$BASE/config.yaml"
 
     case "${MIHOMO_ARCH:-$machine}" in
         aarch64|arm64) MIHOMO_TARGET="arm64" ;;
@@ -355,16 +358,17 @@ install_network_helper(){
 
 install_configs(){
     tmp="$TMP_ROOT/$CONFIG_TEMPLATE"
+    [ -n "$ACTIVE_CONFIG" ] || ACTIVE_CONFIG="$BASE/$CONFIG_TEMPLATE"
     fetch_repo_file "$CONFIG_TEMPLATE" "$tmp" || { fail "Не удалось скачать $CONFIG_TEMPLATE"; return 1; }
 
-    if [ ! -f "$BASE/config.yaml" ]; then
-        mv -f "$tmp" "$BASE/config.yaml" || return 1
-        say "Установлен config.yaml для профиля $PLATFORM"
+    if [ ! -f "$ACTIVE_CONFIG" ]; then
+        mv -f "$tmp" "$ACTIVE_CONFIG" || return 1
+        say "Установлен $ACTIVE_CONFIG"
     else
-        say "Существующий config.yaml сохранён"
+        say "Существующий $ACTIVE_CONFIG сохранён"
         rm -f "$tmp"
     fi
-    chmod 600 "$BASE/config.yaml" 2>/dev/null || true
+    chmod 600 "$ACTIVE_CONFIG" 2>/dev/null || true
 }
 
 json_asset_urls(){
@@ -529,7 +533,7 @@ MIHOMO_SOURCE='$MIHOMO_SOURCE'
 MIHOMO_VERSION='$MIHOMO_VERSION_SELECTED'
 MIHOMO_URL='$MIHOMO_URL_SELECTED'
 GCNET_BIN='$GCNET_BIN'
-CONFIG_FILE='$BASE/config.yaml'
+CONFIG_FILE='$ACTIVE_CONFIG'
 DM_ROOT='$DM_ROOT'
 PKG_PATH='$PKG'
 ROUTER_MODEL='$(nvram_get productid)'

@@ -44,7 +44,7 @@ secret: "3665"
 
 # Локальный веб-интерфейс
 external-ui: ui
-external-ui-url: "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-cdn-fonts.zip"
+external-ui-url: "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip"
 
 profile:
   store-selected: true
