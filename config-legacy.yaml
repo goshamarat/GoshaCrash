@@ -1,48 +1,10 @@
-proxy-providers:
-  provider1:
-    url: "https://firebasestorage.googleapis.com/v0/b/subscriptions-tm.firebasestorage.app/o/files%2FClients%2Fs19_sub.txt?alt=media"
-    type: http
-    interval: 1200
-    path: ./proxies/provider1.yaml
-    health-check:
-      enable: true
-      url: "https://www.gstatic.com/generate_204"
-      interval: 600
-    override:
-      additional-prefix: "[main]"
-      
-  free-nodes:
-    type: http
-    url: "https://www.xrayvip.com/free.txt"
-    interval: 3600
-    path: ./proxies/free.yaml
-    health-check:
-      enable: true
-      interval: 600
-      url: http://www.gstatic.com/generate_204
-    override:
-      additional-prefix: "[china]"
+# Публичная безопасная заглушка для старых ASUSWRT legacy-роутеров.
+# В ней нет подписок, UUID, серверов и других приватных данных.
+# После установки замени файл своим настоящим legacy-конфигом и выполни:
+#   goshacrash apply
 
-proxies:
-  - name: "🇪🇺 Европа | через РФ ⚡️"
-    type: vless
-    server: tun.proxy1.raketa-balance.com
-    port: 443
-    uuid: ab4fa1cb-0cc9-4b43-b225-1cc24af257f1
-    udp: true
-    tls: true
-    flow: xtls-rprx-vision
-    servername: eh.vk.com
-    reality-opts:
-      public-key: JaP4bhvIMW-l7T0_RkLra59DeBYI6W9XemKa8MyRPSY
-      short-id: 6c6082a2223c1d03
-    client-fingerprint: firefox
-
-# Настройки для доступа через браузер (API)
 external-controller: 0.0.0.0:9090
-secret: "3665"
-
-# Локальный веб-интерфейс
+secret: "CHANGE_ME"
 external-ui: ui
 external-ui-url: "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip"
 
@@ -50,332 +12,40 @@ profile:
   store-selected: true
   store-fake-ip: true
 
-# Основные порты прокси
 mixed-port: 7892
 routing-mark: 9012
 allow-lan: true
-mode: rule
-ipv6: false
 bind-address: "*"
+mode: rule
 log-level: info
-find-process-mode: strict
-unified-delay: false
-tcp-concurrent: true
+ipv6: false
 
+# Минимальный DNS, необходимый для запуска и проверки установки.
 dns:
   enable: true
   listen: 127.0.0.1:1053
-  prefer-h3: false
-  use-hosts: false
-  use-system-hosts: false
-  hosts:
-    "www.msftconnecttest.com": 13.107.4.52
-    "dns.msftncsi.com": 131.107.255.255
   ipv6: false
-  default-nameserver:
-    - tls://149.112.112.112:853
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
-  fake-ip-filter-mode: blacklist
-  fake-ip-filter:
-    - "+.lan"
-    - "+.local"
-    - "+.arpa"
-    - "localhost"
-    - "+.tm"
-    - "+.ntp.org"
-    - "time.nist.gov"
-    - "time.windows.com"
-    - "+.msftncsi.com"
-    - "+.msftconnecttest.com"
-  nameserver-policy:
-    "gemini.google.com": system
+  default-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
   nameserver:
-    - tls://common.dot.dns.yandex.net
-  proxy-server-nameserver:
-    - tls://149.112.112.112:853
-  direct-nameserver:
-    - system
+    - 1.1.1.1
+    - 8.8.8.8
 
-sniffer:
-  enable: true
-  sniff:
-    HTTP:
-      ports: [80, 8080-8880]
-      override-destination: true
-    TLS:
-      ports: [443, 8443]
-    QUIC:
-      ports: [443, 8443]
-  skip-domain:
-    - "Mijia Cloud"
-    - "+.push.apple.com"
-
+# Legacy-профиль: маршрутизацией управляет goshacrash.sh.
 tun:
   enable: true
   stack: gvisor
   device: tun0
   dns-hijack:
-    - "any:53"
-    - "tcp://any:53"
+    - any:53
+    - tcp://any:53
   auto-route: false
   auto-redirect: false
   auto-detect-interface: false
 
-proxy-groups:
-  - name: RU-PROXY
-    type: select
-    proxies:
-      - DIRECT
-    include-all: true
-
-  - name: GLOBAL-PROXY
-    type: select
-    include-all: true
-    exclude-type: direct
-
-rule-providers:
-  domain_ru:
-    type: http
-    behavior: domain
-    url: "https://firebasestorage.googleapis.com/v0/b/subscriptions-tm.firebasestorage.app/o/files%2FRules%2Fruleset_domain_ru.mrs?alt=media"
-    path: ./rulesets/ruleset_domain_ru.mrs
-    interval: 86400
-    format: mrs
-    proxy: DIRECT
-
-  ipcidr_ru:
-    type: http
-    behavior: ipcidr
-    url: "https://firebasestorage.googleapis.com/v0/b/subscriptions-tm.firebasestorage.app/o/files%2FRules%2Fruleset_ipcidr_ru.mrs?alt=media"
-    path: ./rulesets/ruleset_ipcidr_ru.mrs
-    interval: 86400
-    format: mrs
-    proxy: DIRECT
-
-  domain_global:
-    type: http
-    behavior: domain
-    url: "https://firebasestorage.googleapis.com/v0/b/subscriptions-tm.firebasestorage.app/o/files%2FRules%2Fruleset_domain_global.mrs?alt=media"
-    path: ./rulesets/ruleset_domain_global.mrs
-    interval: 86400
-    format: mrs
-    proxy: DIRECT
-
-  ipcidr_global:
-    type: http
-    behavior: ipcidr
-    url: "https://firebasestorage.googleapis.com/v0/b/subscriptions-tm.firebasestorage.app/o/files%2FRules%2Fruleset_ipcidr_global.mrs?alt=media"
-    path: ./rulesets/ruleset_ipcidr_global.mrs
-    interval: 86400
-    format: mrs
-    proxy: DIRECT
-
-  geo_bing:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/bing.mrs"
-    path: ./rulesets/geo_bing.mrs
-    interval: 86400
-    proxy: RU-PROXY
-
-  geo_epicgames:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/epicgames.mrs"
-    path: ./rulesets/geo_epicgames.mrs
-    interval: 86400
-    proxy: RU-PROXY
-
-  geo_github:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/github.mrs"
-    path: ./rulesets/geo_github.mrs
-    interval: 86400
-    proxy: RU-PROXY
-
-  geo_playstation:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/playstation.mrs"
-    path: ./rulesets/geo_playstation.mrs
-    interval: 86400
-    proxy: RU-PROXY
-
-  geo_vk:
-    type: http
-    behavior: classical
-    format: yaml
-    url: "https://github.com/legiz-ru/mihomo-rule-sets/raw/main/other/ru-app-list.yaml"
-    path: ./rulesets/geo_vk.yaml
-    interval: 86400
-    proxy: RU-PROXY
-
-  geo_facebook_ip:
-    type: http
-    behavior: ipcidr
-    format: mrs
-    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geoip/facebook.mrs"
-    path: ./rulesets/geo_facebook_ip.mrs
-    interval: 86400
-    proxy: RU-PROXY
-
-  geo_amazon:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/amazon.mrs"
-    path: ./rulesets/geo_amazon.mrs
-    interval: 86400
-    proxy: RU-PROXY
-
-  geo_discord:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/discord.mrs"
-    path: ./rulesets/geo_discord.mrs
-    interval: 86400
-    proxy: RU-PROXY
-
-  geo_linkedin:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/linkedin.mrs"
-    path: ./rulesets/geo_linkedin.mrs
-    interval: 86400
-    proxy: RU-PROXY
-
-  geo_netflix:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/netflix.mrs"
-    path: ./rulesets/geo_netflix.mrs
-    interval: 86400
-    proxy: RU-PROXY
-
-  geo_openai:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/openai.mrs"
-    path: ./rulesets/geo_openai.mrs
-    interval: 86400
-    proxy: RU-PROXY
-
-  geo_signal:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/signal.mrs"
-    path: ./rulesets/geo_signal.mrs
-    interval: 86400
-    proxy: RU-PROXY
-
-  geo_spotify:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/spotify.mrs"
-    path: ./rulesets/geo_spotify.mrs
-    interval: 86400
-    proxy: RU-PROXY
-
-  geo_tiktok:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/tiktok.mrs"
-    path: ./rulesets/geo_tiktok.mrs
-    interval: 86400
-    proxy: RU-PROXY
-
-  geo_twitter:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/twitter.mrs"
-    path: ./rulesets/geo_twitter.mrs
-    interval: 86400
-    proxy: RU-PROXY
-
-  geo_youtube:
-    type: http
-    behavior: domain
-    format: mrs
-    url: "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/youtube.mrs"
-    path: ./rulesets/geo_youtube.mrs
-    interval: 86400
-    proxy: RU-PROXY
-
+# Заглушка не включает VPN: весь трафик идёт напрямую.
 rules:
-  # PRIVATE IP, SHARED ADDRESS SPACE (CGN), MULTICAST IP
-  - IP-CIDR,198.18.0.0/16,DIRECT,no-resolve
-  - IP-CIDR,100.64.0.0/10,DIRECT,no-resolve
-  - IP-CIDR,224.0.0.0/4,DIRECT,no-resolve
-
-  # TM IP
-  - IP-CIDR,93.171.220.0/22,DIRECT,no-resolve
-  - IP-CIDR,95.85.96.0/19,DIRECT,no-resolve
-  - IP-CIDR,103.220.0.0/22,DIRECT,no-resolve
-  - IP-CIDR,119.235.112.0/20,DIRECT,no-resolve
-  - IP-CIDR,177.93.143.0/24,DIRECT,no-resolve
-  - IP-CIDR,185.69.184.0/24,DIRECT,no-resolve
-  - IP-CIDR,185.69.185.0/24,DIRECT,no-resolve
-  - IP-CIDR,185.69.186.0/24,DIRECT,no-resolve
-  - IP-CIDR,216.250.8.0/21,DIRECT,no-resolve
-  - IP-CIDR,217.174.224.0/20,DIRECT,no-resolve
-
-  # GEMINI & GOOGLE AI
-  - DOMAIN-SUFFIX,bard.google.com,GLOBAL-PROXY
-  - DOMAIN-SUFFIX,gemini.google.com,GLOBAL-PROXY
-  - DOMAIN-SUFFIX,generativelanguage.googleapis.com,GLOBAL-PROXY
-  - DOMAIN-SUFFIX,ai.google.dev,GLOBAL-PROXY
-  - DOMAIN-SUFFIX,aistudio.google.com,GLOBAL-PROXY
-  - DOMAIN-KEYWORD,alkalimeta-pa.googleapis.com,GLOBAL-PROXY
-
-  # SYNC.COM
-  - DOMAIN-SUFFIX,sync.com,GLOBAL-PROXY
-  - DOMAIN-SUFFIX,sync.com.cdn.cloudflare.net,GLOBAL-PROXY
-  - DOMAIN-KEYWORD,sync.com,GLOBAL-PROXY
-
-  # GMX (Почта и веб-сервисы)
-  - DOMAIN-SUFFIX,gmx.com,GLOBAL-PROXY
-  - DOMAIN-SUFFIX,gmx.de,GLOBAL-PROXY
-  - DOMAIN-SUFFIX,gmx.net,GLOBAL-PROXY
-  - DOMAIN-KEYWORD,gmx,GLOBAL-PROXY
-
-  # Rule sets
-  - RULE-SET,domain_ru,RU-PROXY
-  - RULE-SET,ipcidr_ru,RU-PROXY
-  - RULE-SET,domain_global,GLOBAL-PROXY
-  - RULE-SET,ipcidr_global,GLOBAL-PROXY
-
-  # RU RULES (MRS / YAML)
-  - RULE-SET,geo_bing,RU-PROXY
-  - RULE-SET,geo_epicgames,RU-PROXY
-  - RULE-SET,geo_github,RU-PROXY
-  - RULE-SET,geo_playstation,RU-PROXY
-  - RULE-SET,geo_vk,RU-PROXY
-
-  # GLOBAL RULES (MRS)
-  - RULE-SET,geo_facebook_ip,GLOBAL-PROXY
-  - RULE-SET,geo_amazon,GLOBAL-PROXY
-  - RULE-SET,geo_discord,GLOBAL-PROXY
-  - RULE-SET,geo_linkedin,GLOBAL-PROXY
-  - RULE-SET,geo_netflix,GLOBAL-PROXY
-  - RULE-SET,geo_openai,GLOBAL-PROXY
-  - RULE-SET,geo_signal,GLOBAL-PROXY
-  - RULE-SET,geo_spotify,GLOBAL-PROXY
-  - RULE-SET,geo_tiktok,GLOBAL-PROXY
-  - RULE-SET,geo_twitter,GLOBAL-PROXY
-  - RULE-SET,geo_youtube,GLOBAL-PROXY
-
   - MATCH,DIRECT

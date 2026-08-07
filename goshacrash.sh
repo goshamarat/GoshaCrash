@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.4.4-config-dashboard-fix"
-BUILD_ID="2026-08-07-config-dashboard-fix-r7"
+VERSION="3.4.5-public-placeholders"
+BUILD_ID="2026-08-07-public-placeholders-r8"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"

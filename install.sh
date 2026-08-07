@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.4.4-config-dashboard-fix"
+INSTALLER_VERSION="3.4.5-public-placeholders"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -356,6 +356,28 @@ install_network_helper(){
     say "Установлен совместимый legacy network helper: $GCNET_BIN"
 }
 
+generate_dashboard_secret(){
+    secret=""
+    if [ -r /dev/urandom ]; then
+        if command -v od >/dev/null 2>&1; then
+            secret="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+        elif command -v hexdump >/dev/null 2>&1; then
+            secret="$(hexdump -n 16 -e '16/1 "%02x"' /dev/urandom 2>/dev/null)"
+        fi
+    fi
+    [ -n "$secret" ] || secret="GC$(date +%s 2>/dev/null)$$"
+    printf '%s\n' "$secret"
+}
+
+replace_placeholder_secret(){
+    file="$1"
+    grep -q '^secret:[[:space:]]*["'\'']CHANGE_ME["'\''][[:space:]]*$' "$file" 2>/dev/null || return 0
+    secret="$(generate_dashboard_secret)"
+    [ -n "$secret" ] || return 1
+    sed -i "s@^secret:.*@secret: \"$secret\"@" "$file" || return 1
+    say "Для Zashboard создан уникальный локальный secret"
+}
+
 install_configs(){
     tmp="$TMP_ROOT/$CONFIG_TEMPLATE"
     [ -n "$ACTIVE_CONFIG" ] || ACTIVE_CONFIG="$BASE/$CONFIG_TEMPLATE"
@@ -363,7 +385,9 @@ install_configs(){
 
     if [ ! -f "$ACTIVE_CONFIG" ]; then
         mv -f "$tmp" "$ACTIVE_CONFIG" || return 1
-        say "Установлен $ACTIVE_CONFIG"
+        replace_placeholder_secret "$ACTIVE_CONFIG" || { fail "Не удалось создать secret для Zashboard"; return 1; }
+        say "Установлена безопасная DIRECT-заглушка: $ACTIVE_CONFIG"
+        warn "VPN ещё не настроен: загрузи свой конфиг и выполни goshacrash apply"
     else
         say "Существующий $ACTIVE_CONFIG сохранён"
         rm -f "$tmp"
