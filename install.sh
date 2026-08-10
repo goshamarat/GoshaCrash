@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.6.0-configgen"
+INSTALLER_VERSION="3.6.1-tty-sftp"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -195,6 +195,18 @@ pkg_install_one(){
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
 }
 
+find_sftp_server(){
+    for p in \
+        /opt/libexec/sftp-server \
+        /tmp/opt/libexec/sftp-server \
+        "$DM_ROOT/libexec/sftp-server" \
+        /opt/lib/openssh/sftp-server \
+        /tmp/opt/lib/openssh/sftp-server; do
+        [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+    done
+    return 1
+}
+
 prepare_packages(){
     prepare_path
     find_pkg || { fail "В Download Master не найден ipkg/opkg"; return 1; }
@@ -204,9 +216,12 @@ prepare_packages(){
     for name in nano unzip wget gzip; do
         have "$name" || missing="$missing $name"
     done
+    need_sftp="0"
+    find_sftp_server >/dev/null 2>&1 || need_sftp="1"
 
-    if [ -n "$missing" ]; then
-        say "Не хватает пакетов:$missing"
+    if [ -n "$missing" ] || [ "$need_sftp" = 1 ]; then
+        [ -n "$missing" ] && say "Не хватает пакетов:$missing"
+        [ "$need_sftp" = 1 ] && say "SFTP subsystem не найден; установлю openssh-sftp-server"
         pkg_update_index || warn "Не удалось обновить индекс ipkg/opkg; пробую доступные пакеты"
         for name in $missing; do
             say "Устанавливаю $name через $(basename "$PKG")"
@@ -214,8 +229,12 @@ prepare_packages(){
             prepare_path
             refresh_tools
         done
+        if [ "$need_sftp" = 1 ]; then
+            say "Устанавливаю openssh-sftp-server через $(basename "$PKG")"
+            pkg_install_one openssh-sftp-server || warn "openssh-sftp-server не установился; SSH продолжит работать без SFTP"
+        fi
     else
-        say "Все необходимые пакеты Download Master уже установлены; обновление индекса пропущено"
+        say "Все необходимые пакеты Download Master и SFTP уже установлены; обновление индекса пропущено"
     fi
 
     prepare_path
@@ -224,6 +243,12 @@ prepare_packages(){
     [ -x "$GZIP_BIN" ] || { fail "gzip не найден после установки через Download Master"; return 1; }
     [ -n "$DOWNLOADER" ] || { fail "Не найден wget или curl"; return 1; }
     have nano || warn "nano не найден; GoshaCrash сможет повторить установку позже командой goshacrash pkg install nano"
+    sftp_server="$(find_sftp_server 2>/dev/null)"
+    if [ -n "$sftp_server" ]; then
+        say "SFTP subsystem: $sftp_server"
+    else
+        warn "SFTP subsystem не найден после установки; это не блокирует GoshaCrash"
+    fi
     say "Инструменты: unzip=$UNZIP_BIN, gzip=$GZIP_BIN, downloader=$DOWNLOADER"
 }
 

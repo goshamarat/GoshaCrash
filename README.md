@@ -1,4 +1,4 @@
-# GoshaCrash 3.6.0-configgen
+# GoshaCrash 3.6.1-tty-sftp
 
 Минимальная онлайн-сборка для ASUSWRT. Пользователь копирует только `install.sh`; всё остальное установщик получает из GitHub.
 
@@ -122,6 +122,13 @@ goshacrash pkg install nano
 
 Zashboard устанавливается `install.sh`. Обновление панели выполняется кнопкой внутри Zashboard. На legacy ссылка скрывает обновление ядра Mihomo.
 
+
+
+### 3.6.1-tty-sftp
+
+- Исправлено интерактивное меню на ASUSWRT, где `stty` отсутствует как отдельная команда, но доступен как applet `busybox stty`.
+- `install.sh` автоматически проверяет SFTP subsystem и при необходимости ставит `openssh-sftp-server` через Download Master `ipkg/opkg`.
+- Никаких новых пунктов в меню `goshacrash` не добавлено. SFTP используется штатным Dropbear ASUS, если его сборка ссылается на установленный `sftp-server`.
 
 ### 3.6.0-configgen
 `install.sh` теперь сам генерирует базовый `config.yaml` под архитектуру и выбранный routing. Добавлена миграция legacy `config-legacy.yaml` без потери пользовательского конфига. Меню `goshacrash` не расширялось.

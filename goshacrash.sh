@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.6.0-configgen"
-BUILD_ID="2026-08-09-configgen-r1"
+VERSION="3.6.1-tty-sftp"
+BUILD_ID="2026-08-10-tty-sftp-r1"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -909,20 +909,57 @@ doctor(){
 }
 
 
-menu_terminal_init(){
-    MENU_TTY_MODE=""
-    MENU_OLD_STTY=""
+menu_find_stty(){
+    MENU_STTY_BACKEND=""
+    MENU_STTY_BIN=""
 
-    MENU_OLD_STTY="$(stty -g </dev/tty 2>/dev/null)" || MENU_OLD_STTY=""
-    if [ -n "$MENU_OLD_STTY" ]; then
-        MENU_TTY_MODE="devtty"
+    stty_bin="$(command -v stty 2>/dev/null)"
+    if [ -n "$stty_bin" ] && [ -x "$stty_bin" ]; then
+        MENU_STTY_BACKEND="binary"
+        MENU_STTY_BIN="$stty_bin"
         return 0
     fi
 
-    MENU_OLD_STTY="$(stty -g 2>/dev/null)" || MENU_OLD_STTY=""
-    if [ -n "$MENU_OLD_STTY" ]; then
-        MENU_TTY_MODE="stdin"
+    busybox_bin="$(command -v busybox 2>/dev/null)"
+    if [ -n "$busybox_bin" ] && "$busybox_bin" stty --help >/dev/null 2>&1; then
+        MENU_STTY_BACKEND="busybox"
+        MENU_STTY_BIN="$busybox_bin"
         return 0
+    fi
+
+    return 1
+}
+
+menu_stty_raw(){
+    case "$MENU_STTY_BACKEND" in
+        binary) "$MENU_STTY_BIN" "$@" ;;
+        busybox) "$MENU_STTY_BIN" stty "$@" ;;
+        *) return 127 ;;
+    esac
+}
+
+menu_terminal_init(){
+    MENU_TTY_MODE=""
+    MENU_OLD_STTY=""
+    MENU_STTY_BACKEND=""
+    MENU_STTY_BIN=""
+
+    menu_find_stty || return 1
+
+    if [ -r /dev/tty ] || [ -w /dev/tty ]; then
+        MENU_OLD_STTY="$(menu_stty_raw -g </dev/tty 2>/dev/null)" || MENU_OLD_STTY=""
+        if [ -n "$MENU_OLD_STTY" ]; then
+            MENU_TTY_MODE="devtty"
+            return 0
+        fi
+    fi
+
+    if [ -t 0 ] && [ -t 1 ]; then
+        MENU_OLD_STTY="$(menu_stty_raw -g 2>/dev/null)" || MENU_OLD_STTY=""
+        if [ -n "$MENU_OLD_STTY" ]; then
+            MENU_TTY_MODE="stdin"
+            return 0
+        fi
     fi
 
     return 1
@@ -930,9 +967,9 @@ menu_terminal_init(){
 
 menu_stty(){
     if [ "$MENU_TTY_MODE" = "devtty" ]; then
-        stty "$@" </dev/tty 2>/dev/null
+        menu_stty_raw "$@" </dev/tty 2>/dev/null
     else
-        stty "$@" 2>/dev/null
+        menu_stty_raw "$@" 2>/dev/null
     fi
 }
 
