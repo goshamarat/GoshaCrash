@@ -1,4 +1,4 @@
-# GoshaCrash 3.6.1-tty-sftp
+# GoshaCrash 3.6.2-live-logs-sftp
 
 Минимальная онлайн-сборка для ASUSWRT. Пользователь копирует только `install.sh`; всё остальное установщик получает из GitHub.
 
@@ -38,7 +38,7 @@ goshacrash routing auto
 goshacrash
 ```
 
-The arrow-key menu is intentionally minimal but styled as a compact terminal dashboard. It shows live Mihomo/TUN state, profile and routing mode, with only Status, Restart, Stop, Logs and Exit. All advanced functions remain available through `goshacrash help`.
+The arrow-key menu is intentionally minimal but styled as a compact terminal dashboard. It shows live Mihomo/TUN state, profile and routing mode, with only Status, Restart, Stop, Logs and Exit. All advanced functions remain available through `gc help`.
 
 Справка без меню:
 
@@ -106,6 +106,8 @@ goshacrash edit
 goshacrash apply
 goshacrash logs mihomo 100
 goshacrash logs system 100
+goshacrash logs live mihomo 100
+goshacrash logs live system 100
 goshacrash dashboard
 goshacrash doctor
 ```
@@ -128,10 +130,17 @@ Zashboard устанавливается `install.sh`. Обновление па
 
 - Исправлено интерактивное меню на ASUSWRT, где `stty` отсутствует как отдельная команда, но доступен как applet `busybox stty`.
 - `install.sh` автоматически проверяет SFTP subsystem и при необходимости ставит `openssh-sftp-server` через Download Master `ipkg/opkg`.
-- Никаких новых пунктов в меню `goshacrash` не добавлено. SFTP используется штатным Dropbear ASUS, если его сборка ссылается на установленный `sftp-server`.
+- Никаких новых пунктов в меню `gc` не добавлено. SFTP используется штатным Dropbear ASUS, если его сборка ссылается на установленный `sftp-server`.
 
 ### 3.6.0-configgen
-`install.sh` теперь сам генерирует базовый `config.yaml` под архитектуру и выбранный routing. Добавлена миграция legacy `config-legacy.yaml` без потери пользовательского конфига. Меню `goshacrash` не расширялось.
+`install.sh` теперь сам генерирует базовый `config.yaml` под архитектуру и выбранный routing. Добавлена миграция legacy `config-legacy.yaml` без потери пользовательского конфига. Меню `gc` не расширялось.
 
 ### 3.5.4
 Interactive menu terminal detection now falls back from `/dev/tty` to the current SSH stdin for older ASUSWRT environments.
+
+
+### 3.6.2-live-logs-sftp
+
+- Пункт `Logs` теперь позволяет смотреть последние 100 строк либо включать LIVE-поток Mihomo/GoshaCrash.
+- CLI: `gc logs live mihomo 100` и `gc logs live system 100`; старый alias `follow` сохранён.
+- `install.sh` автоматически устанавливает `openssh-sftp-server` через Download Master `ipkg/opkg`, если SFTP subsystem отсутствует.

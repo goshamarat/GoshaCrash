@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.6.1-tty-sftp"
-BUILD_ID="2026-08-10-tty-sftp-r1"
+VERSION="3.7.2"
+BUILD_ID="2026-08-10-clean-cli-r1"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -654,8 +654,38 @@ stop(){
     watchdog_stop; stop_runtime; rmdir "$CONTROL_LOCK" 2>/dev/null || true; ok "Mihomo остановлен; обычный DIRECT восстановлен"
 }
 restart(){
-    ensure_dirs || return 1; load_platform || return 1; rm -f "$MANUAL_STOP"; mkdir "$CONTROL_LOCK" 2>/dev/null || true
-    watchdog_stop; stop_runtime; with_start_lock start_runtime; rc=$?; rmdir "$CONTROL_LOCK" 2>/dev/null || true; [ "$rc" -eq 0 ] && watchdog_start; return "$rc"
+    ensure_dirs || return 1
+    load_platform || return 1
+    refresh_path
+
+    # restart is the only public start/apply action:
+    # validate before touching a working runtime, then restart/start it.
+    check_config || return 1
+    backup_config >/dev/null 2>&1 || true
+
+    rm -f "$MANUAL_STOP"
+    mkdir "$CONTROL_LOCK" 2>/dev/null || true
+    watchdog_stop
+    stop_runtime
+    with_start_lock start_runtime
+    rc=$?
+    rmdir "$CONTROL_LOCK" 2>/dev/null || true
+    if [ "$rc" -eq 0 ]; then
+        watchdog_start
+        return 0
+    fi
+
+    # If a newly edited config starts badly, restore the last known-good one.
+    if [ -f "$BACKUPS/config.last-good.yaml" ]; then
+        warn "Новый config.yaml не запустился; возвращаю последний рабочий"
+        cp -f "$BACKUPS/config.last-good.yaml" "$CONFIG" || return 1
+        rm -f "$MANUAL_STOP"
+        mkdir "$CONTROL_LOCK" 2>/dev/null || true
+        with_start_lock start_runtime >/dev/null 2>&1 || true
+        rmdir "$CONTROL_LOCK" 2>/dev/null || true
+        running_pid >/dev/null 2>&1 && watchdog_start >/dev/null 2>&1 || true
+    fi
+    return 1
 }
 
 main_default_route(){
@@ -681,20 +711,6 @@ backup_config(){
 find_editor(){
     refresh_path
     for e in /opt/bin/nano /tmp/opt/bin/nano "$DM_ROOT/bin/nano" /jffs/scripts/nano; do [ -x "$e" ] && { printf '%s\n' "$e"; return 0; }; done
-    return 1
-}
-
-apply_config(){
-    check_config || return 1
-    backup="$(backup_config)" || true
-    if restart; then ok "config.yaml проверен и применён"; return 0; fi
-    if [ -f "$BACKUPS/config.last-good.yaml" ]; then
-        warn "Новый конфиг не запустился; возвращаю последний рабочий"
-        cp -f "$BACKUPS/config.last-good.yaml" "$CONFIG" || return 1
-        restart
-        return $?
-    fi
-    [ -n "$backup" ] && warn "Резервная копия: $backup"
     return 1
 }
 
@@ -851,18 +867,37 @@ dashboard_url(){
 }
 
 
+log_file_for_kind(){
+    case "${1:-mihomo}" in
+        mihomo) printf '%s\n' "$MIHOMO_LOG";;
+        system|goshacrash) printf '%s\n' "$SYSTEM_LOG";;
+        install) printf '%s\n' "$INSTALL_LOG";;
+        boot) printf '%s\n' "$BOOT_LOG";;
+        watchdog) printf '%s\n' "$WATCHDOG_LOG";;
+        packages) printf '%s\n' "$PACKAGES_LOG";;
+        *) return 1;;
+    esac
+}
+
 show_logs(){
     kind="${1:-mihomo}"; lines="${2:-100}"; case "$lines" in ''|*[!0-9]*) lines=100;; esac
-    case "$kind" in
-        mihomo) tail -n "$lines" "$MIHOMO_LOG" 2>/dev/null || true;;
-        system|goshacrash) tail -n "$lines" "$SYSTEM_LOG" 2>/dev/null || true;;
-        install) tail -n "$lines" "$INSTALL_LOG" 2>/dev/null || true;;
-        boot) tail -n "$lines" "$BOOT_LOG" 2>/dev/null || true;;
-        watchdog) tail -n "$lines" "$WATCHDOG_LOG" 2>/dev/null || true;;
-        packages) tail -n "$lines" "$PACKAGES_LOG" 2>/dev/null || true;;
-        follow) tail -f "$MIHOMO_LOG";;
-        *) echo "logs: mihomo|system|install|boot|watchdog|packages|follow"; return 1;;
-    esac
+    file="$(log_file_for_kind "$kind")" || {
+        echo "logs: mihomo|system|install|boot|watchdog|packages"
+        return 1
+    }
+    tail -n "$lines" "$file" 2>/dev/null || true
+}
+
+follow_logs(){
+    kind="${1:-mihomo}"; lines="${2:-100}"; case "$lines" in ''|*[!0-9]*) lines=100;; esac
+    file="$(log_file_for_kind "$kind")" || {
+        echo "live logs: mihomo|system|install|boot|watchdog|packages"
+        return 1
+    }
+    [ -e "$file" ] || : > "$file"
+    echo "Live log: $kind ($file)"
+    echo "Ctrl+C — выйти из live-режима"
+    tail -n "$lines" -f "$file"
 }
 
 status(){
@@ -892,22 +927,6 @@ status(){
     fi
     echo "Zashboard: $(dashboard_base_url)"
 }
-
-doctor(){
-    load_platform >/dev/null 2>&1 || true; refresh_path
-    echo '=== platform ==='; cat "$PLATFORM_FILE" 2>/dev/null || true
-    echo; echo '=== files ==='; ls -l "$BASE/goshacrash.sh" "$BIN" "$GCNET_BIN" "$CONFIG" "$UI/index.html" 2>/dev/null || true
-    echo; echo '=== package environment ==='; ls -ld /opt /tmp/opt "$DM_ROOT" 2>/dev/null || true; find_pkg && echo "PKG=$PKG" || echo 'PKG=MISSING'
-    echo; echo '=== binary ==='; [ -x "$BIN" ] && "$BIN" -v 2>&1 || true
-    echo; echo '=== config ==='; check_config || true
-    echo; echo '=== tun ==='; ensure_tun && echo '/dev/net/tun: OK' || echo '/dev/net/tun: ERROR'
-    echo; echo '=== status ==='; status
-    echo; echo '=== routes ==='
-    if [ "$ROUTING_MODE" = manual ]; then select_net_backend >/dev/null 2>&1 || true; [ "$NET_BACKEND" = gcnet ] && { "$GCNET_BIN" rule-list 2>/dev/null || true; "$GCNET_BIN" route-list "$TUN_TABLE" 2>/dev/null || true; }; [ "$NET_BACKEND" = ip ] && { "$IP_BIN" rule show 2>/dev/null || true; "$IP_BIN" route show table "$TUN_TABLE" 2>/dev/null || true; }; elif [ -n "$IP_BIN" ]; then "$IP_BIN" rule show 2>/dev/null || true; "$IP_BIN" route show 2>/dev/null || true; fi
-    echo; echo '=== iptables ==='; [ -x "$IPTABLES" ] && { "$IPTABLES" -t mangle -L "$LAN_CHAIN" -n -v 2>/dev/null || true; "$IPTABLES" -t nat -L "$DNS_OUT_CHAIN" -n -v 2>/dev/null || true; }
-    echo; echo '=== recent Mihomo log ==='; tail -n 100 "$MIHOMO_LOG" 2>/dev/null || true
-}
-
 
 menu_find_stty(){
     MENU_STTY_BACKEND=""
@@ -1086,18 +1105,33 @@ menu_read_key(){
     esac
 }
 
-menu_logs_simple(){
-    printf '\033[1;36m=== MIHOMO LOG ===\033[0m\n'
-    tail -n 100 "$MIHOMO_LOG" 2>/dev/null || echo "Mihomo log is empty"
-    echo
-    printf '\033[1;36m=== GOSHACRASH LOG ===\033[0m\n'
-    tail -n 50 "$SYSTEM_LOG" 2>/dev/null || echo "GoshaCrash log is empty"
+menu_logs(){
+    while :; do
+        printf '\033[2J\033[H'
+        printf '\033[1;36m=== LOGS ===\033[0m\n\n'
+        echo "  1) Mihomo — последние 100 строк"
+        echo "  2) GoshaCrash — последние 100 строк"
+        echo "  3) Mihomo — LIVE"
+        echo "  4) GoshaCrash — LIVE"
+        echo "  5) Назад"
+        echo
+        printf "Выбор [1-5]: "
+        IFS= read -r log_choice || return 0
+        case "$log_choice" in
+            1) show_logs mihomo 100; menu_pause ;;
+            2) show_logs system 100; menu_pause ;;
+            3) follow_logs mihomo 100; menu_pause ;;
+            4) follow_logs system 100; menu_pause ;;
+            5|q|Q) return 0 ;;
+            *) echo "Неверный выбор"; sleep 1 ;;
+        esac
+    done
 }
 
 menu(){
     if ! menu_terminal_init; then
         echo "Interactive terminal is unavailable." >&2
-        echo "Use: goshacrash help" >&2
+        echo "Use: gc help" >&2
         return 1
     fi
 
@@ -1134,7 +1168,7 @@ menu(){
                     1) status; menu_pause ;;
                     2) restart; menu_pause ;;
                     3) stop; menu_pause ;;
-                    4) menu_logs_simple; menu_pause ;;
+                    4) menu_logs ;;
                     5) break ;;
                 esac
                 load_platform >/dev/null 2>&1 || true
@@ -1152,28 +1186,20 @@ usage(){
     cat <<USAGE
 GoshaCrash
 
-  goshacrash                  интерактивное меню со стрелками
-  goshacrash help
-  goshacrash status
-  goshacrash start
-  goshacrash restart
-  goshacrash stop
-  goshacrash routing status
-  goshacrash routing manual
-  goshacrash routing auto     недоступно на ARMv5
-  goshacrash check
-  goshacrash apply
-  goshacrash edit
-  goshacrash dashboard
-  goshacrash logs [mihomo|system|install|boot|watchdog|packages|follow] [N]
-  goshacrash pkg repair
-  goshacrash pkg update
-  goshacrash pkg install ИМЯ
-  goshacrash doctor
+  gc                    интерактивное меню
+  gc status              состояние
+  gc restart             проверить config.yaml и запустить/перезапустить
+  gc stop                остановить VPN и вернуть DIRECT
+  gc logs                логи
+  gc logs live           live-лог Mihomo
+  gc edit                редактировать config.yaml
+  gc dashboard           адрес Zashboard
+  gc routing status
+  gc routing manual
+  gc routing auto        недоступно на ARMv5
+  gc help
 
-Initial routing mode is selected by install.sh.
-After installation all runtime control is performed only by goshacrash.sh.
-Zashboard updates from the button inside the panel.
+Режим маршрутизации первоначально выбирается install.sh.
 USAGE
 }
 
@@ -1183,34 +1209,34 @@ refresh_path >/dev/null 2>&1 || true
 case "${1:-menu}" in
     menu) menu;;
     help|-h|--help) usage;;
-    start) start;;
-    stop|direct) stop;;
+    stop) stop;;
     restart) restart;;
     status) status;;
-    check) check_config;;
-    apply) apply_config;;
-    edit|nano) edit_config;;
-    dashboard|url|ui) dashboard_url;;
+    edit) edit_config;;
+    dashboard) dashboard_url;;
     routing)
         shift
         case "${1:-status}" in
             status) routing_status;;
             manual) set_routing_mode manual;;
             auto) set_routing_mode auto;;
-            *) echo 'Использование: goshacrash routing status|manual|auto'; exit 1;;
+            *) echo 'Использование: gc routing status|manual|auto'; exit 1;;
         esac
         ;;
-    logs) shift; show_logs "${1:-mihomo}" "${2:-100}";;
-    pkg|package)
+    logs)
         shift
-        case "${1:-}" in
-            repair|check) repair_opt;;
-            update) pkg_update_index;;
-            install) [ -n "${2:-}" ] || { fail "Укажи имя пакета"; exit 1; }; pkg_install "$2";;
-            *) echo 'Использование: goshacrash pkg repair|update|install ИМЯ'; exit 1;;
+        case "${1:-mihomo}" in
+            live)
+                shift
+                follow_logs "${1:-mihomo}" "${2:-100}"
+                ;;
+            *) show_logs "${1:-mihomo}" "${2:-100}" ;;
         esac
         ;;
-    doctor) doctor;;
+
+    # Internal commands used by install/autostart/watchdog. They are intentionally
+    # omitted from help and are not part of the public CLI.
+    check) check_config;;
     boot) boot;;
     firewall-reload) firewall_reload;;
     watchdog-loop) watchdog_loop;;

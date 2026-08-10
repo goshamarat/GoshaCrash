@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.6.1-tty-sftp"
+INSTALLER_VERSION="3.7.2-gc"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -242,7 +242,7 @@ prepare_packages(){
     [ -x "$UNZIP_BIN" ] || { fail "unzip не найден после установки через Download Master"; return 1; }
     [ -x "$GZIP_BIN" ] || { fail "gzip не найден после установки через Download Master"; return 1; }
     [ -n "$DOWNLOADER" ] || { fail "Не найден wget или curl"; return 1; }
-    have nano || warn "nano не найден; GoshaCrash сможет повторить установку позже командой goshacrash pkg install nano"
+    have nano || warn "nano не найден; встроенный редактор gc edit будет недоступен, пока nano не установлен"
     sftp_server="$(find_sftp_server 2>/dev/null)"
     if [ -n "$sftp_server" ]; then
         say "SFTP subsystem: $sftp_server"
@@ -590,7 +590,7 @@ install_configs(){
     if [ ! -f "$ACTIVE_CONFIG" ]; then
         generate_base_config "$ACTIVE_CONFIG" || { fail "Не удалось сгенерировать базовый config.yaml"; return 1; }
         say "Базовый config.yaml создан install.sh для $PLATFORM (routing=$ROUTING_MODE, tun.stack=$TUN_STACK)"
-        warn "VPN ещё не настроен: добавь свои proxy/rules и выполни goshacrash apply"
+        warn "VPN ещё не настроен: добавь свои proxy/rules и выполни gc restart"
     else
         cp -f "$ACTIVE_CONFIG" "$BASE/backups/config.yaml.before-install" 2>/dev/null || true
         say "Существующий $ACTIVE_CONFIG сохранён; меняются только параметры выбранной маршрутизации"
@@ -798,7 +798,7 @@ DM_ROOT=""
 for p in /opt/bin/nano /tmp/opt/bin/nano "$DM_ROOT/bin/nano"; do
   [ -x "$p" ] && exec "$p" "$@"
 done
-echo "nano не найден. Запусти: goshacrash pkg install nano" >&2
+echo "nano не найден. Установи nano через пакетный менеджер Download Master" >&2
 exit 1
 WRAP
     chmod 755 "$dst"
@@ -866,18 +866,21 @@ HOOK
     rm -f /jffs/scripts/goshacrash-start /jffs/scripts/goshacrash-firewall /jffs/scripts/goshacrash-autostart /jffs/scripts/goshacrash-route 2>/dev/null || true
     add_once /jffs/scripts/services-start "$JFFS_DIR/start.sh &"
     add_once /jffs/scripts/firewall-start "$JFFS_DIR/firewall.sh &"
-    write_command_wrapper /jffs/scripts/goshacrash
+    rm -f /jffs/scripts/goshacrash /opt/bin/goshacrash "$DM_ROOT/bin/goshacrash" \
+          /jffs/scripts/crash /opt/bin/gc "$DM_ROOT/bin/crash" \
+          /jffs/scripts/gc /opt/bin/gc "$DM_ROOT/bin/gc" 2>/dev/null || true
+    write_command_wrapper /jffs/scripts/gc
     write_nano_wrapper /jffs/scripts/nano
-    write_command_wrapper "$DM_ROOT/bin/goshacrash"
-    if [ -d /opt/bin ] && [ -w /opt/bin ]; then write_command_wrapper /opt/bin/goshacrash 2>/dev/null || true; fi
+    write_command_wrapper "$DM_ROOT/bin/gc"
+    if [ -d /opt/bin ] && [ -w /opt/bin ]; then write_command_wrapper /opt/bin/gc 2>/dev/null || true; fi
     add_once /jffs/configs/profile.add 'export PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"'
 
     cat > "$DM_ROOT/etc/init.d/S99goshacrash" <<'INIT'
 #!/bin/sh
 case "$1" in
   start) /jffs/addons/goshacrash/start.sh & ;;
-  stop) /jffs/scripts/goshacrash stop ;;
-  restart) /jffs/scripts/goshacrash restart ;;
+  stop) /jffs/scripts/gc stop ;;
+  restart) /jffs/scripts/gc restart ;;
   firewall-start|firewall-restart) /jffs/addons/goshacrash/firewall.sh & ;;
 esac
 INIT
@@ -954,7 +957,7 @@ main(){
     install_hooks || return 1
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" check || return 1
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" restart || {
-        fail "Первый запуск не удался. Проверь $BASE/logs/mihomo.log и команду goshacrash doctor"
+        fail "Первый запуск не удался. Проверь $BASE/logs/mihomo.log и команду gc logs"
         return 1
     }
 
@@ -963,7 +966,7 @@ main(){
     echo
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" status
     echo
-    echo "Меню: goshacrash    |    Справка: goshacrash help"
+    echo "Меню: gc    |    Справка: gc help"
     echo "Zashboard: $(GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" dashboard)"
     echo "Обновление Zashboard: кнопка в панели"
 }
