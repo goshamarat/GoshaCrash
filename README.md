@@ -1,4 +1,4 @@
-# GoshaCrash 3.6.2-live-logs-sftp
+# GoshaCrash 3.7.3
 
 Минимальная онлайн-сборка для ASUSWRT. Пользователь копирует только `install.sh`; всё остальное установщик получает из GitHub.
 
@@ -38,7 +38,7 @@ goshacrash routing auto
 goshacrash
 ```
 
-The arrow-key menu is intentionally minimal but styled as a compact terminal dashboard. It shows live Mihomo/TUN state, profile and routing mode, with only Status, Restart, Stop, Logs and Exit. All advanced functions remain available through `gc help`.
+Интерактивное меню минимальное: Status, Restart, Stop, Logs и Exit. На прошивках, где raw-TTY/`stty` недоступны или несовместимы, `gc` автоматически переключается на переносимое нумерованное меню через `read`, а не завершается ошибкой `Interactive terminal is unavailable`. Все расширенные функции остаются доступны через `gc help`.
 
 Справка без меню:
 
@@ -122,10 +122,21 @@ goshacrash pkg install nano
 
 ## Zashboard
 
-Zashboard устанавливается `install.sh`. На старом ASUSWRT встроенный BusyBox `unzip` не считается полноценной зависимостью: установщик автоматически ставит совместимый `unzip` через Download Master и проверяет архив фактической распаковкой. Обновление панели выполняется кнопкой внутри Zashboard. На legacy ссылка скрывает обновление ядра Mihomo.
+Zashboard устанавливается `install.sh`. На старом ASUSWRT встроенный BusyBox `unzip` не считается полноценной зависимостью: установщик автоматически ставит совместимый Info-ZIP `unzip` через Download Master и проверяет архив фактической распаковкой.
 
-`nano` и SFTP больше не блокируют первоначальную установку VPN. `gc edit` устанавливает `nano` по требованию; отсутствие SFTP выводится только как предупреждение.
+Для `legacy-armv5-gvisor` Mihomo закреплён на совместимой ARMv5 + gVisor сборке. Все ссылки на Zashboard, которые выдаёт GoshaCrash, передают `disableUpgradeCore=1`, поэтому действие обновления ядра скрыто.
 
+`nano` и SFTP не блокируют первоначальную установку VPN. `gc edit` может установить `nano` по требованию; отсутствие SFTP выводится только как предупреждение.
+
+
+## 3.7.3
+
+- Исправлена установка Zashboard на legacy ASUSWRT: BusyBox `unzip` больше не принимается за полноценный Info-ZIP; совместимый `unzip` автоматически устанавливается через Download Master.
+- Проверка Zashboard выполняется фактической распаковкой, без несовместимого с BusyBox `unzip -tqq`.
+- `nano` и SFTP больше не являются блокирующими зависимостями первоначальной установки.
+- `gc` получил line-oriented fallback-меню для SSH/BusyBox окружений без рабочего raw-TTY/`stty`.
+- Для `legacy-armv5-gvisor` Zashboard всегда открывается с `disableUpgradeCore=1`; в `gc status` явно указано, что ARMv5-ядро закреплено и его обновление отключено.
+- RT-AC68U с kernel 2.6 остаётся на `manual` routing + `tun.stack: gvisor` и pinned Mihomo ARMv5.
 
 
 ### 3.6.1-tty-sftp

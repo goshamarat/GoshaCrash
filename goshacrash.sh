@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.7.2"
-BUILD_ID="2026-08-10-clean-cli-r1"
+VERSION="3.7.3"
+BUILD_ID="2026-08-12-release-r3"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -846,24 +846,39 @@ controller_port(){
     printf '%s\n' "$p"
 }
 
-dashboard_base_url(){
+dashboard_plain_url(){
     ip="$(lan_ip)"
     port="$(controller_port)"
-    printf 'http://%s:%s/ui/
-' "$ip" "$port"
+    printf 'http://%s:%s/ui/\n' "$ip" "$port"
 }
 
 dashboard_url(){
+    # Always hand users a setup URL so Zashboard receives the per-backend
+    # feature flags.  On legacy ARMv5 the Mihomo binary is deliberately
+    # pinned, therefore the native core-upgrade action must never be offered.
     load_platform >/dev/null 2>&1 || true
     ip="$(lan_ip)"
     port="$(controller_port)"
     secret="$(yaml_top "$CONFIG" secret)"
     url="http://$ip:$port/ui/#/setup?hostname=$ip&port=$port"
     [ -n "$secret" ] && url="$url&secret=$secret"
-    [ "${LEGACY:-1}" = 1 ] && url="$url&disableUpgradeCore=1"
+    if [ "${MIHOMO_TARGET:-}" = armv5 ] || [ "${LEGACY:-0}" = 1 ]; then
+        url="$url&disableUpgradeCore=1"
+    fi
     url="$url&type=clash"
-    printf '%s
-' "$url"
+    printf '%s\n' "$url"
+}
+
+dashboard_base_url(){
+    # Do not leak an unprotected plain /ui/ URL for legacy ARMv5. Opening the
+    # plain URL bypasses Zashboard's disableUpgradeCore setup flag and makes
+    # the dangerous core-upgrade button visible again.
+    load_platform >/dev/null 2>&1 || true
+    if [ "${MIHOMO_TARGET:-}" = armv5 ] || [ "${LEGACY:-0}" = 1 ]; then
+        dashboard_url
+    else
+        dashboard_plain_url
+    fi
 }
 
 
@@ -913,6 +928,7 @@ status(){
 
     if [ "${LEGACY:-0}" = 1 ]; then
         echo "Профиль: legacy"
+        [ "${MIHOMO_TARGET:-}" = armv5 ] && echo "Ядро: закреплено для legacy ARMv5; обновление ядра отключено"
     else
         echo "Профиль: modern"
     fi
