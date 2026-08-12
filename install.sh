@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.7.2-gc"
+INSTALLER_VERSION="3.7.2-gc.1"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -122,9 +122,30 @@ tool_path(){
 
 have(){ tool_path "$1" >/dev/null 2>&1; }
 
+# ASUSWRT ships a BusyBox unzip applet.  It can extract many archives, but it
+# does not implement Info-ZIP's test mode (-t/-tqq), which older revisions of
+# this installer used to validate Zashboard.  Prefer a real unzip from
+# Download Master when available and install it automatically when needed.
+unzip_is_full(){
+    u="$1"
+    [ -n "$u" ] && [ -x "$u" ] || return 1
+    "$u" -h 2>&1 | grep -qi 'BusyBox' && return 1
+    "$u" -h 2>&1 | grep -Eq '(^|[[:space:]])-t([[:space:],]|$)|test archive'
+}
+
+find_full_unzip(){
+    for p in \
+        /opt/bin/unzip /tmp/opt/bin/unzip \
+        "$DM_ROOT/bin/unzip" "$DM_ROOT/sbin/unzip"; do
+        unzip_is_full "$p" && { printf '%s\n' "$p"; return 0; }
+    done
+    return 1
+}
+
 refresh_tools(){
     hash -r 2>/dev/null || true
-    UNZIP_BIN="$(tool_path unzip 2>/dev/null)"
+    UNZIP_BIN="$(find_full_unzip 2>/dev/null)"
+    [ -n "$UNZIP_BIN" ] || UNZIP_BIN="$(tool_path unzip 2>/dev/null)"
     GZIP_BIN="$(tool_path gzip 2>/dev/null)"
     if have wget; then DOWNLOADER="wget"; elif have curl; then DOWNLOADER="curl"; else DOWNLOADER=""; fi
 }
@@ -212,42 +233,46 @@ prepare_packages(){
     find_pkg || { fail "В Download Master не найден ipkg/opkg"; return 1; }
     say "Менеджер пакетов ASUS: $PKG"
 
+    refresh_tools
     missing=""
-    for name in nano unzip wget gzip; do
-        have "$name" || missing="$missing $name"
-    done
-    need_sftp="0"
-    find_sftp_server >/dev/null 2>&1 || need_sftp="1"
 
-    if [ -n "$missing" ] || [ "$need_sftp" = 1 ]; then
-        [ -n "$missing" ] && say "Не хватает пакетов:$missing"
-        [ "$need_sftp" = 1 ] && say "SFTP subsystem не найден; установлю openssh-sftp-server"
+    # A BusyBox unzip is intentionally treated as insufficient here.
+    # Download Master's Info-ZIP build is installed automatically so current
+    # Zashboard release archives work on legacy ASUSWRT too.
+    full_unzip="$(find_full_unzip 2>/dev/null)"
+    [ -n "$full_unzip" ] || missing="$missing unzip"
+    [ -x "$GZIP_BIN" ] || missing="$missing gzip"
+    [ -n "$DOWNLOADER" ] || missing="$missing wget"
+
+    if [ -n "$missing" ]; then
+        say "Не хватает совместимых обязательных пакетов:$missing"
         pkg_update_index || warn "Не удалось обновить индекс ipkg/opkg; пробую доступные пакеты"
         for name in $missing; do
             say "Устанавливаю $name через $(basename "$PKG")"
-            pkg_install_one "$name" || warn "Пакет $name не установился"
+            pkg_install_one "$name" || { fail "Пакет $name не установился"; return 1; }
             prepare_path
             refresh_tools
         done
-        if [ "$need_sftp" = 1 ]; then
-            say "Устанавливаю openssh-sftp-server через $(basename "$PKG")"
-            pkg_install_one openssh-sftp-server || warn "openssh-sftp-server не установился; SSH продолжит работать без SFTP"
-        fi
     else
-        say "Все необходимые пакеты Download Master и SFTP уже установлены; обновление индекса пропущено"
+        say "Все обязательные пакеты Download Master уже установлены; обновление индекса пропущено"
     fi
 
     prepare_path
     refresh_tools
-    [ -x "$UNZIP_BIN" ] || { fail "unzip не найден после установки через Download Master"; return 1; }
+    full_unzip="$(find_full_unzip 2>/dev/null)"
+    [ -n "$full_unzip" ] || { fail "Полноценный unzip не найден после установки через Download Master"; return 1; }
+    UNZIP_BIN="$full_unzip"
     [ -x "$GZIP_BIN" ] || { fail "gzip не найден после установки через Download Master"; return 1; }
     [ -n "$DOWNLOADER" ] || { fail "Не найден wget или curl"; return 1; }
-    have nano || warn "nano не найден; встроенный редактор gc edit будет недоступен, пока nano не установлен"
+
+    # nano и SFTP не нужны для запуска GoshaCrash. gc edit умеет поставить
+    # nano по требованию, а отсутствие SFTP не должно задерживать установку VPN.
+    have nano || warn "nano не установлен; команда gc edit предложит установить его при первом использовании"
     sftp_server="$(find_sftp_server 2>/dev/null)"
     if [ -n "$sftp_server" ]; then
         say "SFTP subsystem: $sftp_server"
     else
-        warn "SFTP subsystem не найден после установки; это не блокирует GoshaCrash"
+        warn "SFTP subsystem не найден; это не блокирует GoshaCrash"
     fi
     say "Инструменты: unzip=$UNZIP_BIN, gzip=$GZIP_BIN, downloader=$DOWNLOADER"
 }
@@ -706,9 +731,12 @@ find_ui_root(){
 
 unpack_ui(){
     archive="$1"; unpack="$2"; dst="$3"
-    "$UNZIP_BIN" -tqq "$archive" >/dev/null 2>&1 || return 1
     rm -rf "$unpack" "$dst"
     mkdir -p "$unpack" "$dst" || return 1
+
+    # Validate by actually extracting.  Do not use `unzip -tqq`: ASUSWRT's
+    # BusyBox unzip does not support -t and used to make every valid Zashboard
+    # archive look broken on RT-AC68U-class routers.
     "$UNZIP_BIN" -oq "$archive" -d "$unpack" >> "$INSTALL_LOG" 2>&1 || return 1
     src="$(find_ui_root "$unpack")" || return 1
     [ -s "$src/index.html" ] || return 1

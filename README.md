@@ -122,14 +122,16 @@ goshacrash pkg install nano
 
 ## Zashboard
 
-Zashboard устанавливается `install.sh`. Обновление панели выполняется кнопкой внутри Zashboard. На legacy ссылка скрывает обновление ядра Mihomo.
+Zashboard устанавливается `install.sh`. На старом ASUSWRT встроенный BusyBox `unzip` не считается полноценной зависимостью: установщик автоматически ставит совместимый `unzip` через Download Master и проверяет архив фактической распаковкой. Обновление панели выполняется кнопкой внутри Zashboard. На legacy ссылка скрывает обновление ядра Mihomo.
+
+`nano` и SFTP больше не блокируют первоначальную установку VPN. `gc edit` устанавливает `nano` по требованию; отсутствие SFTP выводится только как предупреждение.
 
 
 
 ### 3.6.1-tty-sftp
 
 - Исправлено интерактивное меню на ASUSWRT, где `stty` отсутствует как отдельная команда, но доступен как applet `busybox stty`.
-- `install.sh` автоматически проверяет SFTP subsystem и при необходимости ставит `openssh-sftp-server` через Download Master `ipkg/opkg`.
+- `install.sh` проверяет SFTP subsystem, но его отсутствие не блокирует установку VPN; при необходимости пакет можно поставить через `gc pkg install openssh-sftp-server`.
 - Никаких новых пунктов в меню `gc` не добавлено. SFTP используется штатным Dropbear ASUS, если его сборка ссылается на установленный `sftp-server`.
 
 ### 3.6.0-configgen
