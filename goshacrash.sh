@@ -1128,11 +1128,39 @@ menu_logs(){
     done
 }
 
+menu_basic(){
+    while :; do
+        load_platform >/dev/null 2>&1 || true
+        printf '\n=== GoshaCrash ===\n'
+        printf 'Mihomo: %s | TUN: %s | Profile: %s | Routing: %s\n\n' \
+            "$(menu_state_core)" "$(menu_state_tun)" "$(menu_profile_name)" "${ROUTING_MODE:-unknown}"
+        echo "  1) Status"
+        echo "  2) Restart"
+        echo "  3) Stop"
+        echo "  4) Logs"
+        echo "  5) Exit"
+        printf '\nВыбор [1-5]: '
+        IFS= read -r choice || return 0
+        case "$choice" in
+            1) status ;;
+            2) restart ;;
+            3) stop ;;
+            4) menu_logs ;;
+            5|q|Q) return 0 ;;
+            *) echo "Неверный выбор" ;;
+        esac
+        printf '\nНажми Enter, чтобы вернуться в меню...'
+        IFS= read -r _gc_menu_dummy || return 0
+    done
+}
+
 menu(){
     if ! menu_terminal_init; then
-        echo "Interactive terminal is unavailable." >&2
-        echo "Use: gc help" >&2
-        return 1
+        # Older ASUSWRT/BusyBox builds may have a perfectly usable SSH stdin
+        # but no compatible stty applet or no reliable test -t support.
+        # Fall back to a portable line-oriented menu instead of rejecting gc.
+        menu_basic
+        return $?
     fi
 
     items_count=5
