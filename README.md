@@ -162,3 +162,10 @@ Interactive menu terminal detection now falls back from `/dev/tty` to the curren
 
 - Исправлена установка `unzip` на старом ASUS Download Master / Optware: поддерживается бинарник `/opt/bin/unzip-unzip` и автоматически создаётся `/opt/bin/unzip`.
 - `nano` остаётся обязательной зависимостью и ставится автоматически вместе с остальными пакетами.
+
+### 3.7.3.2
+
+- Исправлена проверка Info-ZIP в старом ASUS Download Master / Optware.
+- `/opt/bin/unzip-unzip` теперь распознаётся напрямую как полноценный `unzip`; symlink `/opt/bin/unzip` больше не обязателен.
+- После установки пакетов alternatives нормализуются до повторной проверки зависимостей.
+- `nano` остаётся обязательной зависимостью и устанавливается автоматически.

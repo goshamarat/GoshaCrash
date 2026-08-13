@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.7.3.1"
+INSTALLER_VERSION="3.7.3.2"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -145,9 +145,14 @@ unzip_is_full(){
 }
 
 find_full_unzip(){
+    # Old ASUS Download Master / Optware may install Info-ZIP as
+    # "unzip-unzip" when the alternatives symlink is missing. Treat that
+    # binary as first-class; installation must not depend on the symlink.
     for p in \
-        /opt/bin/unzip /tmp/opt/bin/unzip \
-        "$DM_ROOT/bin/unzip" "$DM_ROOT/sbin/unzip"; do
+        /opt/bin/unzip /opt/bin/unzip-unzip \
+        /tmp/opt/bin/unzip /tmp/opt/bin/unzip-unzip \
+        "$DM_ROOT/bin/unzip" "$DM_ROOT/bin/unzip-unzip" \
+        "$DM_ROOT/sbin/unzip"; do
         unzip_is_full "$p" && { printf '%s\n' "$p"; return 0; }
     done
     return 1
@@ -264,6 +269,7 @@ prepare_packages(){
             say "Устанавливаю $name через $(basename "$PKG")"
             pkg_install_one "$name" || { fail "Пакет $name не установился"; return 1; }
             prepare_path
+            normalize_legacy_optware_unzip
             refresh_tools
         done
     else
@@ -271,6 +277,7 @@ prepare_packages(){
     fi
 
     prepare_path
+    normalize_legacy_optware_unzip
     refresh_tools
     full_unzip="$(find_full_unzip 2>/dev/null)"
     [ -n "$full_unzip" ] || { fail "Полноценный unzip не найден после установки через Download Master"; return 1; }
