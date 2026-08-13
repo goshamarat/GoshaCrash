@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.7.3"
+INSTALLER_VERSION="3.7.3.1"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -109,6 +109,17 @@ verify_asuswrt(){
 }
 
 tool_path(){
+    if [ "$1" = "unzip" ]; then
+        for p in /opt/bin/unzip /opt/bin/unzip-unzip; do
+            [ -x "$p" ] && { echo "$p"; return 0; }
+        done
+        if [ -n "$DM_ROOT" ]; then
+            for p in "$DM_ROOT/bin/unzip" "$DM_ROOT/bin/unzip-unzip"; do
+                [ -x "$p" ] && { echo "$p"; return 0; }
+            done
+        fi
+    fi
+
     name="$1"
     for p in \
         "/opt/bin/$name" "/opt/sbin/$name" \
@@ -234,6 +245,7 @@ prepare_packages(){
     say "Менеджер пакетов ASUS: $PKG"
 
     refresh_tools
+    normalize_legacy_optware_unzip
     missing=""
 
     # A BusyBox unzip is intentionally treated as insufficient here.
@@ -945,6 +957,22 @@ save_install_log(){
     if [ "$INSTALL_LOG" = "$TMP_LOG" ]; then
         cat "$TMP_LOG" >> "$BASE/logs/install.log" 2>/dev/null || true
         INSTALL_LOG="$BASE/logs/install.log"
+    fi
+}
+
+
+
+normalize_legacy_optware_unzip() {
+    # Old ASUS Download Master / Optware packages may install Info-ZIP as
+    # /opt/bin/unzip-unzip and rely on an alternatives symlink that is absent
+    # on some ASUSWRT builds. Create the compatibility symlink ourselves.
+    if [ ! -x /opt/bin/unzip ] && [ -x /opt/bin/unzip-unzip ]; then
+        ln -sf /opt/bin/unzip-unzip /opt/bin/unzip 2>/dev/null || true
+    fi
+
+    # Some installs expose /opt through the USB prefix only.
+    if [ -n "$DM_ROOT" ] && [ -x "$DM_ROOT/bin/unzip-unzip" ] && [ ! -x "$DM_ROOT/bin/unzip" ]; then
+        ln -sf "$DM_ROOT/bin/unzip-unzip" "$DM_ROOT/bin/unzip" 2>/dev/null || true
     fi
 }
 

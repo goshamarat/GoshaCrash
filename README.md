@@ -157,3 +157,8 @@ Interactive menu terminal detection now falls back from `/dev/tty` to the curren
 - Пункт `Logs` теперь позволяет смотреть последние 100 строк либо включать LIVE-поток Mihomo/GoshaCrash.
 - CLI: `gc logs live mihomo 100` и `gc logs live system 100`; старый alias `follow` сохранён.
 - `install.sh` автоматически устанавливает `openssh-sftp-server` через Download Master `ipkg/opkg`, если SFTP subsystem отсутствует.
+
+### 3.7.3.1
+
+- Исправлена установка `unzip` на старом ASUS Download Master / Optware: поддерживается бинарник `/opt/bin/unzip-unzip` и автоматически создаётся `/opt/bin/unzip`.
+- `nano` остаётся обязательной зависимостью и ставится автоматически вместе с остальными пакетами.
