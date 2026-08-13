@@ -243,6 +243,7 @@ prepare_packages(){
     [ -n "$full_unzip" ] || missing="$missing unzip"
     [ -x "$GZIP_BIN" ] || missing="$missing gzip"
     [ -n "$DOWNLOADER" ] || missing="$missing wget"
+    have nano || missing="$missing nano"
 
     if [ -n "$missing" ]; then
         say "Не хватает совместимых обязательных пакетов:$missing"
@@ -265,9 +266,9 @@ prepare_packages(){
     [ -x "$GZIP_BIN" ] || { fail "gzip не найден после установки через Download Master"; return 1; }
     [ -n "$DOWNLOADER" ] || { fail "Не найден wget или curl"; return 1; }
 
-    # nano и SFTP не нужны для запуска GoshaCrash. gc edit умеет поставить
-    # nano по требованию, а отсутствие SFTP не должно задерживать установку VPN.
-    have nano || warn "nano не установлен; команда gc edit предложит установить его при первом использовании"
+    # nano is a required GoshaCrash tool because `gc edit` depends on it.
+    # It is installed together with the other mandatory Download Master packages.
+    have nano || { fail "nano не найден после установки через Download Master"; return 1; }
     sftp_server="$(find_sftp_server 2>/dev/null)"
     if [ -n "$sftp_server" ]; then
         say "SFTP subsystem: $sftp_server"
