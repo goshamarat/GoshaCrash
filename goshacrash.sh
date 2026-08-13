@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.7.3"
-BUILD_ID="2026-08-12-release-r3"
+VERSION="3.7.4"
+BUILD_ID="2026-08-13-release-r4"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -1227,26 +1227,108 @@ menu(){
 }
 
 usage(){
-    cat <<USAGE
-GoshaCrash
+    cat <<'USAGE'
+GoshaCrash — словарь команд и кода
 
-  gc                    интерактивное меню
-  gc status              состояние
-  gc restart             проверить config.yaml и запустить/перезапустить
-  gc stop                остановить VPN и вернуть DIRECT
-  gc logs                логи
-  gc logs live           live-лог Mihomo
-  gc edit                редактировать config.yaml
-  gc dashboard           адрес Zashboard
-  gc routing status
-  gc routing manual
-  gc routing auto        недоступно на ARMv5
-  gc help
+Формат:
+  команда
+    вызов: какие функции реально вызываются
+    код:   ключевые строки из goshacrash.sh
+    итог:  что происходит
 
-Режим маршрутизации первоначально выбирается install.sh.
+gc
+  вызов: menu -> menu_terminal_init -> menu/menu_basic
+  код:   menu) menu;;
+  итог:  открывает интерактивное меню; на старом ASUSWRT используется line-mode fallback.
+
+gc status
+  вызов: status -> running_pid / route_status / dashboard_base_url
+  код:   status) status;;
+         if p="$(running_pid)"; then
+         if running_pid >/dev/null 2>&1 && route_status >/dev/null 2>&1; then
+         echo "Zashboard: $(dashboard_base_url)"
+  итог:  только читает состояние; ничего не перезапускает и не меняет.
+
+gc edit
+  вызов: edit_config -> find_editor -> backup_config -> nano -> check_config -> restart
+  код:   edit) edit_config;;
+         backup="$(backup_config)" || { fail "Не создана резервная копия config.yaml"; return 1; }
+         TERM="${TERM:-xterm}" "$editor" "$CONFIG" || { warn "Редактор завершился с ошибкой"; return 1; }
+         if ! check_config; then cp -f "$backup" "$CONFIG"; fail "Конфиг некорректен; восстановлена предыдущая версия"; return 1; fi
+         if ! restart; then cp -f "$backup" "$CONFIG"; warn "Новый конфиг не запустился; восстановлен старый"; restart || true; return 1; fi
+  итог:  backup -> nano -> проверка Mihomo -> restart; при ошибке возвращает старый config.yaml.
+
+gc restart
+  вызов: restart -> check_config -> backup_config -> watchdog_stop -> stop_runtime -> start_runtime -> watchdog_start
+  код:   restart) restart;;
+         check_config || return 1
+         backup_config >/dev/null 2>&1 || true
+         watchdog_stop
+         stop_runtime
+         with_start_lock start_runtime
+         [ "$rc" -eq 0 ] && watchdog_start
+  итог:  валидирует конфиг до остановки рабочего Mihomo, затем полностью пересобирает runtime.
+
+gc stop
+  вызов: stop -> watchdog_stop -> stop_runtime
+  код:   stop) stop;;
+         touch "$MANUAL_STOP"
+         watchdog_stop; stop_runtime
+         ok "Mihomo остановлен; обычный DIRECT восстановлен"
+  итог:  останавливает watchdog/Mihomo, снимает маршрутизацию и ставит manual-stop для автозапуска.
+
+gc logs [mihomo|system|install|boot|watchdog|packages] [N]
+  вызов: show_logs -> log_file_for_kind -> tail
+  код:   *) show_logs "${1:-mihomo}" "${2:-100}" ;;
+         tail -n "$lines" "$file" 2>/dev/null || true
+  итог:  показывает последние N строк выбранного журнала; по умолчанию Mihomo, 100 строк.
+
+gc logs live [kind] [N]
+  вызов: follow_logs -> log_file_for_kind -> tail -f
+  код:   follow_logs "${1:-mihomo}" "${2:-100}"
+         tail -n "$lines" -f "$file"
+  итог:  показывает хвост журнала и продолжает читать новые строки до Ctrl+C.
+
+gc dashboard
+  вызов: dashboard_url -> lan_ip / controller_port / yaml_top
+  код:   dashboard) dashboard_url;;
+         url="http://$ip:$port/ui/#/setup?hostname=$ip&port=$port"
+         [ -n "$secret" ] && url="$url&secret=$secret"
+         url="$url&disableUpgradeCore=1"   # legacy ARMv5
+  итог:  печатает setup URL Zashboard; на legacy ARMv5 скрывает native core-upgrade.
+
+gc routing status
+  вызов: routing_status
+  код:   status) routing_status;;
+         echo "Routing: $ROUTING_MODE"
+         echo "Mihomo target: $MIHOMO_TARGET"
+  итог:  только показывает режим и доступность automatic routing.
+
+gc routing manual
+  вызов: set_routing_mode manual -> rewrite_config_for_routing -> check_config -> start_runtime
+  код:   manual) set_routing_mode manual;;
+         yaml_set_section_key "$CONFIG" tun auto-route false
+         yaml_set_section_key "$CONFIG" tun auto-redirect false
+         yaml_set_top_key "$CONFIG" routing-mark "$OUTBOUND_MARK_DEC"
+  итог:  делает backup, переводит TUN на manual routing, проверяет и запускает; при ошибке откатывает.
+
+gc routing auto
+  вызов: set_routing_mode auto -> rewrite_config_for_routing -> check_config -> start_runtime
+  код:   auto) set_routing_mode auto;;
+         [ "$MIHOMO_TARGET" != armv5 ] || { fail "ARMv5: automatic routing недоступен"; return 1; }
+         yaml_set_section_key "$CONFIG" tun auto-route true
+         yaml_set_section_key "$CONFIG" tun auto-redirect true
+  итог:  включает native automatic routing Mihomo только на поддерживаемых платформах; ARMv5 запрещён.
+
+gc help
+  вызов: usage
+  код:   help|-h|--help) usage;;
+  итог:  показывает этот словарь.
+
+Внутренние команды install/autostart/watchdog намеренно не являются публичным CLI:
+  check, boot, firewall-reload, watchdog-loop, watchdog-check, version
 USAGE
 }
-
 ensure_dirs >/dev/null 2>&1 || true
 load_platform >/dev/null 2>&1 || true
 refresh_path >/dev/null 2>&1 || true
