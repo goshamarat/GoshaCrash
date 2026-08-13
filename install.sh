@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.7.3.2"
+INSTALLER_VERSION="3.7.3.3"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -140,18 +140,26 @@ have(){ tool_path "$1" >/dev/null 2>&1; }
 unzip_is_full(){
     u="$1"
     [ -n "$u" ] && [ -x "$u" ] || return 1
-    "$u" -h 2>&1 | grep -qi 'BusyBox' && return 1
-    "$u" -h 2>&1 | grep -Eq '(^|[[:space:]])-t([[:space:],]|$)|test archive'
+
+    # Do not probe Info-ZIP by parsing `unzip -h`: old Optware builds have
+    # different help text and were falsely rejected. BusyBox lives in the
+    # firmware paths; Download Master candidates below are the full package.
+    case "$u" in
+        /usr/bin/unzip|/bin/unzip|/usr/sbin/unzip|/sbin/unzip)
+            "$u" -h 2>&1 | grep -qi 'BusyBox' && return 1
+            ;;
+    esac
+    return 0
 }
 
 find_full_unzip(){
-    # Old ASUS Download Master / Optware may install Info-ZIP as
-    # "unzip-unzip" when the alternatives symlink is missing. Treat that
-    # binary as first-class; installation must not depend on the symlink.
+    # Old ASUS Download Master / Optware commonly installs the actual Info-ZIP
+    # executable as /opt/bin/unzip-unzip. The alternatives symlink
+    # /opt/bin/unzip is not reliably created on stock ASUSWRT.
     for p in \
-        /opt/bin/unzip /opt/bin/unzip-unzip \
-        /tmp/opt/bin/unzip /tmp/opt/bin/unzip-unzip \
-        "$DM_ROOT/bin/unzip" "$DM_ROOT/bin/unzip-unzip" \
+        /opt/bin/unzip-unzip /opt/bin/unzip \
+        /tmp/opt/bin/unzip-unzip /tmp/opt/bin/unzip \
+        "$DM_ROOT/bin/unzip-unzip" "$DM_ROOT/bin/unzip" \
         "$DM_ROOT/sbin/unzip"; do
         unzip_is_full "$p" && { printf '%s\n' "$p"; return 0; }
     done
@@ -232,6 +240,23 @@ pkg_install_one(){
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
 }
 
+repair_unzip_package(){
+    find_full_unzip >/dev/null 2>&1 && return 0
+
+    # Some old Optware installations keep package metadata while the actual
+    # alternatives target is missing. Force one clean reinstall in that case.
+    if "$PKG" list_installed 2>/dev/null | grep -q '^unzip[[:space:]]*-'; then
+        warn "Пакет unzip числится установленным, но бинарник не найден; переустанавливаю"
+        "$PKG" remove unzip >> "$BASE/logs/packages.log" 2>&1 || true
+        "$PKG" install unzip >> "$BASE/logs/packages.log" 2>&1 || return 1
+        prepare_path
+        normalize_legacy_optware_unzip
+        refresh_tools
+    fi
+
+    find_full_unzip >/dev/null 2>&1
+}
+
 find_sftp_server(){
     for p in \
         /opt/libexec/sftp-server \
@@ -280,7 +305,14 @@ prepare_packages(){
     normalize_legacy_optware_unzip
     refresh_tools
     full_unzip="$(find_full_unzip 2>/dev/null)"
-    [ -n "$full_unzip" ] || { fail "Полноценный unzip не найден после установки через Download Master"; return 1; }
+    if [ -z "$full_unzip" ]; then
+        repair_unzip_package || true
+        full_unzip="$(find_full_unzip 2>/dev/null)"
+    fi
+    [ -n "$full_unzip" ] || {
+        fail "Info-ZIP не найден после установки через Download Master; см. $BASE/logs/packages.log"
+        return 1
+    }
     UNZIP_BIN="$full_unzip"
     [ -x "$GZIP_BIN" ] || { fail "gzip не найден после установки через Download Master"; return 1; }
     [ -n "$DOWNLOADER" ] || { fail "Не найден wget или curl"; return 1; }
