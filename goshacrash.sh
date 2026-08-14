@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.7.5"
-BUILD_ID="2026-08-14-release-r5"
+VERSION="3.7.6"
+BUILD_ID="2026-08-14-release-r6"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -1228,7 +1228,10 @@ menu(){
 
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.7.5 — SSH-справочник
+GoshaCrash 3.7.6 — RT-AC68U SSH-справочник
+
+Этот help показывает ручные команды для установленного RT-AC68U.
+Полная установка с нуля руками расписана в README.md релиза.
 
 Сначала узнай каталог установки. Обычно это /tmp/mnt/SANDISK/goshacrash:
   BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"

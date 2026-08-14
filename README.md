@@ -1,195 +1,459 @@
-# GoshaCrash
+# GoshaCrash 3.7.6 — RT-AC68U: установка руками через SSH
 
-GoshaCrash — установщик и менеджер Mihomo для ASUSWRT.
+Этот README написан для конкретного проверенного роутера:
 
-Этот README — **SSH-шпаргалка администратора**. Здесь не описываются внутренние функции shell-скрипта. Здесь показано, **что GoshaCrash автоматизирует и как то же базовое действие выполнить вручную через SSH**.
+```text
+ASUS RT-AC68U
+CPU: armv7l
+Linux: 2.6.36.4brcmarm
+USB: /tmp/mnt/SANDISK
+Download Master: /tmp/mnt/SANDISK/asusware.arm
+package manager: ipkg
+Mihomo profile: legacy-armv5-gvisor
+routing: manual
+TUN stack: gvisor
+```
 
-Версия: **3.7.5**
+Цель документа — чтобы GoshaCrash не был «чёрным ящиком». Ниже сначала показано, как поставить и проверить всё штатным установщиком, а затем — как основные части сделать руками по SSH.
 
-## Установка
+> На этом RT-AC68U нельзя подменять legacy-профиль обычным новым ARMv7 core. Используется закреплённый Mihomo `v1.19.28` ARMv5 + gVisor.
 
-На роутере должны быть USB-накопитель, ASUS Download Master, SSH и интернет.
+## 1. Штатная установка целиком
 
 ```sh
-wget --no-check-certificate \
-  -O /tmp/install.sh \
-  'https://raw.githubusercontent.com/goshamarat/GoshaCrash/refs/heads/main/install.sh'
-
+cd /tmp
+rm -f /tmp/install.sh
+wget --no-check-certificate -O /tmp/install.sh \
+'https://raw.githubusercontent.com/goshamarat/GoshaCrash/refs/heads/main/install.sh'
+grep 'INSTALLER_VERSION' /tmp/install.sh | head
 sh /tmp/install.sh
 ```
 
-Для RT-AC68U установщик сам выбирает legacy ARMv5 + gVisor и manual routing.
-
-## Каталог GoshaCrash
-
-Во всех примерах ниже сначала можно определить каталог установки:
-
-```sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
-echo "$BASE"
-```
-
-На тестовом RT-AC68U это:
-
-```text
-/tmp/mnt/SANDISK/goshacrash
-```
-
-Основные файлы:
-
-```text
-$BASE/bin/mihomo
-$BASE/config.yaml
-$BASE/run/mihomo.pid
-$BASE/logs/mihomo.log
-$BASE/logs/goshacrash.log
-$BASE/logs/install.log
-$BASE/logs/boot.log
-$BASE/logs/watchdog.log
-$BASE/logs/packages.log
-```
-
----
-
-## Как проверить, работает ли Mihomo
-
-Через GoshaCrash:
+После установки:
 
 ```sh
 gc status
-```
-
-Вручную:
-
-```sh
-ps | grep '[m]ihomo'
-```
-
-Посмотреть сохранённый PID:
-
-```sh
-cat "$BASE/run/mihomo.pid"
-```
-
-Проверить, существует ли процесс с этим PID:
-
-```sh
-PID="$(cat "$BASE/run/mihomo.pid" 2>/dev/null)"
-[ -n "$PID" ] && kill -0 "$PID" && echo "Mihomo работает"
-```
-
-Проверить TUN:
-
-```sh
-ifconfig tun0
-```
-
-Проверить обычные маршруты:
-
-```sh
-route -n
+gc help
 ```
 
 ---
 
-## Как отредактировать config.yaml
+# 2. Полная ручная подготовка на RT-AC68U
 
-Через GoshaCrash:
+Все команды ниже выполняются по SSH от `admin`.
 
-```sh
-gc edit
-```
-
-`gc edit` удобнее, потому что делает backup, открывает nano, проверяет конфиг Mihomo и только после успешной проверки перезапускает VPN.
-
-### Вручную
-
-Сначала backup:
+## Переменные
 
 ```sh
-cp "$BASE/config.yaml" "$BASE/backups/config-manual.yaml"
+USB=/tmp/mnt/SANDISK
+OPT=/tmp/mnt/SANDISK/asusware.arm
+BASE=/tmp/mnt/SANDISK/goshacrash
+IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
+export PATH=/opt/bin:/opt/sbin:$OPT/bin:$OPT/sbin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
 ```
 
-Открыть:
+Проверка:
 
 ```sh
-/opt/bin/nano "$BASE/config.yaml"
+uname -a
+uname -m
+nvram get productid
+df -h
 ```
 
-Если `nano` доступен через PATH:
+Ожидаем RT-AC68U, `armv7l`, kernel 2.6.36 и USB `/tmp/mnt/SANDISK`.
+
+## Каталоги
 
 ```sh
-nano "$BASE/config.yaml"
+mkdir -p "$BASE/bin" "$BASE/logs" "$BASE/run" "$BASE/backups" "$BASE/ui"
 ```
 
-Сохранение в nano:
+## Пакеты Download Master
+
+```sh
+"$IPKG" update
+"$IPKG" install nano
+"$IPKG" install unzip
+```
+
+Проверить nano:
+
+```sh
+ls -l /opt/bin/nano
+/opt/bin/nano --version | head
+```
+
+На этом старом Optware Info-ZIP устанавливается как:
 
 ```text
-Ctrl+O
-Enter
-Ctrl+X
+/opt/bin/unzip-unzip
 ```
 
-После редактирования **до перезапуска** проверить конфиг:
+Проверить:
+
+```sh
+"$IPKG" files unzip
+ls -l /opt/bin/unzip-unzip
+/opt/bin/unzip-unzip -v | head
+```
+
+Встроенный `/usr/bin/unzip` — BusyBox. Для Zashboard используем `/opt/bin/unzip-unzip`.
+
+---
+
+# 3. Поставить legacy network helper вручную
+
+```sh
+wget --no-check-certificate \
+  -O "$BASE/bin/gcnet" \
+  'https://raw.githubusercontent.com/goshamarat/GoshaCrash/refs/heads/main/assets/gcnet-armv5'
+chmod 755 "$BASE/bin/gcnet"
+```
+
+Проверить, что бинарник запускается на этом kernel:
+
+```sh
+"$BASE/bin/gcnet" link-exists lo
+echo $?
+```
+
+`0` означает успех.
+
+---
+
+# 4. Поставить Mihomo ARMv5 + gVisor вручную
+
+Именно эта версия закреплена для legacy RT-AC68U:
+
+```sh
+cd /tmp
+rm -f /tmp/mihomo.gz
+wget --no-check-certificate \
+  -O /tmp/mihomo.gz \
+  'https://github.com/goshamarat/GoshaCrash/releases/download/mihomo-gvisor-armv5-v1.19.28/mihomo-linux-armv5-gvisor-v1.19.28.gz'
+gzip -dc /tmp/mihomo.gz > "$BASE/bin/mihomo"
+chmod 755 "$BASE/bin/mihomo"
+rm -f /tmp/mihomo.gz
+```
+
+Проверить:
+
+```sh
+"$BASE/bin/mihomo" -v
+```
+
+Если бинарник запускается — архитектура подходит.
+
+---
+
+# 5. Создать config.yaml руками
+
+Минимальный конфиг для проверки самого runtime:
+
+```sh
+cat > "$BASE/config.yaml" <<'YAML'
+mixed-port: 7890
+allow-lan: true
+mode: rule
+log-level: info
+ipv6: false
+
+external-controller: 0.0.0.0:9090
+secret: ""
+
+dns:
+  enable: true
+  listen: 0.0.0.0:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+
+tun:
+  enable: true
+  device: tun0
+  stack: gvisor
+  auto-route: false
+  auto-redirect: false
+  auto-detect-interface: false
+  routing-mark: 9012
+
+proxies: []
+proxy-groups: []
+rules:
+  - MATCH,DIRECT
+YAML
+```
+
+Это тестовый DIRECT-конфиг. Свои proxies/providers/rules добавляются позже.
+
+Проверить **до запуска**:
 
 ```sh
 "$BASE/bin/mihomo" -t -d "$BASE" -f "$BASE/config.yaml"
 ```
 
-Успешная проверка заканчивается сообщением о том, что configuration test successful.
-
-Если конфиг сломан, вернуть backup:
-
-```sh
-cp "$BASE/backups/config-manual.yaml" "$BASE/config.yaml"
-```
-
-После успешной проверки применить:
-
-```sh
-gc restart
-```
-
 ---
 
-## Как перезапустить Mihomo
-
-### Правильный способ
-
-```sh
-gc restart
-```
-
-Это перезапускает не только процесс. GoshaCrash также проверяет конфиг, останавливает watchdog, очищает старую маршрутизацию, запускает Mihomo, ждёт DNS и `tun0`, поднимает routing и снова запускает watchdog.
-
-### Только процесс Mihomo вручную
-
-Остановить текущий PID:
-
-```sh
-PID="$(cat "$BASE/run/mihomo.pid" 2>/dev/null)"
-[ -n "$PID" ] && kill "$PID"
-```
-
-Удалить старый PID-файл:
-
-```sh
-rm -f "$BASE/run/mihomo.pid"
-```
-
-Запустить Mihomo той же базовой командой, которую использует GoshaCrash:
+# 6. Запустить Mihomo руками
 
 ```sh
 GOGC=50 nohup "$BASE/bin/mihomo" \
   -d "$BASE" \
   -f "$BASE/config.yaml" \
   </dev/null >>"$BASE/logs/mihomo.log" 2>&1 &
+echo $! > "$BASE/run/mihomo.pid"
+sleep 3
 ```
 
-Записать новый PID:
+Проверки:
 
 ```sh
+ps | grep '[m]ihomo'
+cat "$BASE/run/mihomo.pid"
+ifconfig tun0
+netstat -ln | grep ':1053'
+tail -n 50 "$BASE/logs/mihomo.log"
+```
+
+На этом этапе Mihomo и TUN уже работают, но manual policy routing ещё надо поднять.
+
+---
+
+# 7. Manual policy routing руками на RT-AC68U
+
+Константы GoshaCrash:
+
+```sh
+GCNET="$BASE/bin/gcnet"
+TUN=tun0
+TABLE=2022
+PREF=10010
+MARK=0x2333
+OUTMARK=0x2334
+LAN=br0
+```
+
+Проверить LAN-интерфейс:
+
+```sh
+ifconfig br0
+```
+
+Разрешить forwarding и отключить reverse-path filtering:
+
+```sh
+echo 1 > /proc/sys/net/ipv4/ip_forward
+echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter
+echo 0 > /proc/sys/net/ipv4/conf/default/rp_filter
+[ -w /proc/sys/net/ipv4/conf/br0/rp_filter ] && echo 0 > /proc/sys/net/ipv4/conf/br0/rp_filter
+[ -w /proc/sys/net/ipv4/conf/tun0/rp_filter ] && echo 0 > /proc/sys/net/ipv4/conf/tun0/rp_filter
+```
+
+Создать таблицу и policy rule через legacy `gcnet`:
+
+```sh
+"$GCNET" route-add-default "$TUN" "$TABLE"
+"$GCNET" rule-add "$MARK" "$TABLE" "$PREF"
+```
+
+Проверить:
+
+```sh
+"$GCNET" route-default-exists "$TUN" "$TABLE"; echo $?
+"$GCNET" rule-exists "$MARK" "$TABLE"; echo $?
+```
+
+## LAN → TUN
+
+```sh
+iptables -t mangle -N GOSHACRASH_TUN_LAN 2>/dev/null
+iptables -t mangle -F GOSHACRASH_TUN_LAN
+
+iptables -t mangle -A GOSHACRASH_TUN_LAN -m mark --mark "$OUTMARK" -j RETURN
+iptables -t mangle -A GOSHACRASH_TUN_LAN -p udp --dport 53 -j RETURN
+iptables -t mangle -A GOSHACRASH_TUN_LAN -p tcp --dport 53 -j RETURN
+
+for NET in \
+  0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 \
+  169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 \
+  224.0.0.0/4 240.0.0.0/4 255.255.255.255/32
+do
+  iptables -t mangle -A GOSHACRASH_TUN_LAN -d "$NET" -j RETURN
+done
+
+iptables -t mangle -A GOSHACRASH_TUN_LAN -j MARK --set-mark "$MARK"
+iptables -t mangle -I PREROUTING 1 -i "$LAN" -j GOSHACRASH_TUN_LAN
+```
+
+## Трафик самого роутера → TUN
+
+```sh
+iptables -t mangle -N GOSHACRASH_TUN_ROUTER 2>/dev/null
+iptables -t mangle -F GOSHACRASH_TUN_ROUTER
+
+iptables -t mangle -A GOSHACRASH_TUN_ROUTER -m mark --mark "$OUTMARK" -j RETURN
+iptables -t mangle -A GOSHACRASH_TUN_ROUTER -p udp --dport 53 -j RETURN
+iptables -t mangle -A GOSHACRASH_TUN_ROUTER -p tcp --dport 53 -j RETURN
+
+for NET in \
+  0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 \
+  169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 \
+  224.0.0.0/4 240.0.0.0/4 255.255.255.255/32
+do
+  iptables -t mangle -A GOSHACRASH_TUN_ROUTER -d "$NET" -j RETURN
+done
+
+iptables -t mangle -A GOSHACRASH_TUN_ROUTER -j MARK --set-mark "$MARK"
+iptables -t mangle -I OUTPUT 1 -j GOSHACRASH_TUN_ROUTER
+```
+
+## DNS клиентов
+
+ASUS dnsmasq слушает порт 53. Клиентский DNS перенаправляется на локальный DNS роутера:
+
+```sh
+iptables -t nat -N GOSHACRASH_DNS_LAN 2>/dev/null
+iptables -t nat -F GOSHACRASH_DNS_LAN
+iptables -t nat -A GOSHACRASH_DNS_LAN -p udp -j REDIRECT --to-ports 53
+iptables -t nat -A GOSHACRASH_DNS_LAN -p tcp -j REDIRECT --to-ports 53
+iptables -t nat -I PREROUTING 1 -i "$LAN" -p udp --dport 53 -j GOSHACRASH_DNS_LAN
+iptables -t nat -I PREROUTING 1 -i "$LAN" -p tcp --dport 53 -j GOSHACRASH_DNS_LAN
+```
+
+## DNS самого роутера → Mihomo 1053
+
+```sh
+iptables -t nat -N GOSHACRASH_DNS_OUT 2>/dev/null
+iptables -t nat -F GOSHACRASH_DNS_OUT
+iptables -t nat -A GOSHACRASH_DNS_OUT -m mark --mark "$OUTMARK" -j RETURN
+iptables -t nat -A GOSHACRASH_DNS_OUT -d 127.0.0.0/8 -j RETURN
+iptables -t nat -A GOSHACRASH_DNS_OUT -p udp -j REDIRECT --to-ports 1053
+iptables -t nat -A GOSHACRASH_DNS_OUT -p tcp -j REDIRECT --to-ports 1053
+iptables -t nat -I OUTPUT 1 -p udp --dport 53 -j GOSHACRASH_DNS_OUT
+iptables -t nat -I OUTPUT 1 -p tcp --dport 53 -j GOSHACRASH_DNS_OUT
+```
+
+## FORWARD
+
+```sh
+iptables -t filter -N GOSHACRASH_TUN_FORWARD 2>/dev/null
+iptables -t filter -F GOSHACRASH_TUN_FORWARD
+iptables -t filter -A GOSHACRASH_TUN_FORWARD -i "$LAN" -o "$TUN" -j ACCEPT
+iptables -t filter -A GOSHACRASH_TUN_FORWARD -i "$TUN" -o "$LAN" -j ACCEPT
+iptables -t filter -I FORWARD 1 -j GOSHACRASH_TUN_FORWARD
+```
+
+Сбросить route cache:
+
+```sh
+echo -1 > /proc/sys/net/ipv4/route/flush
+```
+
+Проверить:
+
+```sh
+"$GCNET" rule-exists "$MARK" "$TABLE"; echo $?
+"$GCNET" route-default-exists "$TUN" "$TABLE"; echo $?
+iptables -t mangle -L GOSHACRASH_TUN_LAN -n -v
+iptables -t mangle -L GOSHACRASH_TUN_ROUTER -n -v
+iptables -t nat -L GOSHACRASH_DNS_OUT -n -v
+iptables -t filter -L GOSHACRASH_TUN_FORWARD -n -v
+```
+
+> Эти команды повторяют базовую схему текущего manual routing GoshaCrash для `br0`. Сам GoshaCrash дополнительно умеет находить несколько LAN bridge-интерфейсов, чистить старые правила, сохранять/возвращать sysctl и делать rollback.
+
+---
+
+# 8. Поставить Zashboard руками
+
+```sh
+cd /tmp
+rm -f /tmp/zashboard.zip
+wget --no-check-certificate \
+  -O /tmp/zashboard.zip \
+  'https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip'
+rm -rf "$BASE/ui"
+mkdir -p "$BASE/ui"
+/opt/bin/unzip-unzip -o /tmp/zashboard.zip -d "$BASE/ui"
+rm -f /tmp/zashboard.zip
+```
+
+Проверить:
+
+```sh
+find "$BASE/ui" -maxdepth 2 -type f | head
+```
+
+Mihomo controller:
+
+```text
+http://10.10.10.100:9090
+```
+
+UI:
+
+```text
+http://10.10.10.100:9090/ui/
+```
+
+Для legacy ARMv5 используй setup URL GoshaCrash с `disableUpgradeCore=1`, чтобы не предлагать несовместимое обновление core:
+
+```sh
+gc dashboard
+```
+
+---
+
+# 9. Как редактировать config.yaml руками
+
+Backup:
+
+```sh
+cp "$BASE/config.yaml" "$BASE/backups/config-manual.yaml"
+```
+
+Редактор:
+
+```sh
+/opt/bin/nano "$BASE/config.yaml"
+```
+
+Проверка:
+
+```sh
+"$BASE/bin/mihomo" -t -d "$BASE" -f "$BASE/config.yaml"
+```
+
+Если ошибка:
+
+```sh
+cp "$BASE/backups/config-manual.yaml" "$BASE/config.yaml"
+```
+
+Если всё нормально и GoshaCrash уже установлен:
+
+```sh
+gc restart
+```
+
+---
+
+# 10. Как перезапустить Mihomo руками
+
+Только процесс:
+
+```sh
+PID="$(cat "$BASE/run/mihomo.pid" 2>/dev/null)"
+[ -n "$PID" ] && kill "$PID"
+rm -f "$BASE/run/mihomo.pid"
+
+GOGC=50 nohup "$BASE/bin/mihomo" \
+  -d "$BASE" \
+  -f "$BASE/config.yaml" \
+  </dev/null >>"$BASE/logs/mihomo.log" 2>&1 &
 echo $! > "$BASE/run/mihomo.pid"
 ```
 
@@ -197,100 +461,35 @@ echo $! > "$BASE/run/mihomo.pid"
 
 ```sh
 ps | grep '[m]ihomo'
-```
-
-```sh
+ifconfig tun0
 tail -n 50 "$BASE/logs/mihomo.log"
 ```
 
-**Важно:** это перезапускает только процесс Mihomo. Manual policy routing, iptables и watchdog так полностью не восстанавливаются. После ручной диагностики для возврата системы в штатное состояние:
+Если GoshaCrash установлен, штатный полный перезапуск:
 
 ```sh
 gc restart
 ```
 
----
-
-## Как остановить VPN
-
-Штатно:
-
-```sh
-gc stop
-```
-
-Это правильная команда, потому что она:
-
-- останавливает watchdog;
-- убирает маршрутизацию GoshaCrash;
-- останавливает Mihomo;
-- возвращает обычный DIRECT;
-- ставит флаг ручной остановки.
-
-### Остановить только Mihomo вручную
-
-```sh
-PID="$(cat "$BASE/run/mihomo.pid" 2>/dev/null)"
-[ -n "$PID" ] && kill "$PID"
-```
-
-Проверить:
-
-```sh
-ps | grep '[m]ihomo'
-```
-
-Но watchdog может запустить процесс снова. Поэтому для настоящей остановки VPN используется:
-
-```sh
-gc stop
-```
+Он дополнительно восстанавливает routing и watchdog.
 
 ---
 
-## Как посмотреть лог Mihomo
+# 11. Логи руками
 
-Последние 100 строк вручную:
+Mihomo:
 
 ```sh
 tail -n 100 "$BASE/logs/mihomo.log"
 ```
 
-Последние 300:
-
-```sh
-tail -n 300 "$BASE/logs/mihomo.log"
-```
-
-Следить в реальном времени:
+Live:
 
 ```sh
 tail -f "$BASE/logs/mihomo.log"
 ```
 
-Выход:
-
-```text
-Ctrl+C
-```
-
-Через GoshaCrash:
-
-```sh
-gc logs mihomo 100
-```
-
-Live:
-
-```sh
-gc logs live mihomo 100
-```
-
----
-
-## Какие ещё есть логи
-
-Основной лог GoshaCrash:
+GoshaCrash:
 
 ```sh
 tail -n 100 "$BASE/logs/goshacrash.log"
@@ -302,7 +501,7 @@ tail -n 100 "$BASE/logs/goshacrash.log"
 tail -n 100 "$BASE/logs/install.log"
 ```
 
-Автозапуск:
+Boot:
 
 ```sh
 tail -n 100 "$BASE/logs/boot.log"
@@ -314,377 +513,94 @@ Watchdog:
 tail -n 100 "$BASE/logs/watchdog.log"
 ```
 
-Установка пакетов `ipkg` / `opkg`:
+Пакеты:
 
 ```sh
 tail -n 100 "$BASE/logs/packages.log"
 ```
 
-То же через `gc`:
-
-```sh
-gc logs system 100
-gc logs install 100
-gc logs boot 100
-gc logs watchdog 100
-gc logs packages 100
-```
-
 ---
 
-## Как проверить TUN
+# 12. Диагностика руками
 
-```sh
-ifconfig tun0
-```
-
-Если `tun0` существует и поднят, интерфейс будет показан.
-
-Проверить устройство TUN:
-
-```sh
-ls -l /dev/net/tun
-```
-
----
-
-## Как посмотреть маршруты
-
-Стандартная таблица:
-
-```sh
-route -n
-```
-
-Если в системе установлен полноценный `ip`:
-
-```sh
-ip route show
-```
-
-Policy rules:
-
-```sh
-ip rule show
-```
-
-Таблица GoshaCrash manual routing:
-
-```sh
-ip route show table 2022
-```
-
-На старом RT-AC68U `ip` может отсутствовать. GoshaCrash для этого использует свой legacy helper `gcnet`, поэтому отсутствие команды `ip` само по себе не означает неисправность VPN.
-
-Проверка средствами GoshaCrash:
-
-```sh
-gc routing status
-```
-
----
-
-## Как посмотреть iptables
-
-Mangle:
-
-```sh
-iptables -t mangle -L -n -v
-```
-
-NAT:
-
-```sh
-iptables -t nat -L -n -v
-```
-
-FORWARD:
-
-```sh
-iptables -t filter -L FORWARD -n -v
-```
-
-На manual routing GoshaCrash создаёт собственные цепочки. В выводе можно искать:
-
-```text
-GOSHACRASH_TUN_LAN
-GOSHACRASH_TUN_ROUTER
-GOSHACRASH_TUN_FORWARD
-GOSHACRASH_DNS_LAN
-GOSHACRASH_DNS_OUT
-```
-
-Например:
-
-```sh
-iptables -t mangle -L GOSHACRASH_TUN_LAN -n -v
-```
-
----
-
-## Как проверить DNS Mihomo
-
-GoshaCrash по умолчанию ждёт DNS Mihomo на порту `1053`.
-
-Посмотреть слушающие порты:
-
-```sh
-netstat -ln | grep ':1053'
-```
-
-Если ничего нет, посмотреть лог:
-
-```sh
-tail -n 100 "$BASE/logs/mihomo.log"
-```
-
----
-
-## Как проверить config.yaml без запуска
-
-```sh
-"$BASE/bin/mihomo" -t -d "$BASE" -f "$BASE/config.yaml"
-```
-
-Это одна из самых полезных команд при ручной диагностике.
-
-Она позволяет проверить YAML/Mihomo-конфигурацию **до** остановки работающего VPN.
-
----
-
-## Как сделать backup config.yaml
-
-Простой backup:
-
-```sh
-cp "$BASE/config.yaml" "$BASE/config.yaml.bak"
-```
-
-В каталог backups:
-
-```sh
-cp "$BASE/config.yaml" "$BASE/backups/config-manual.yaml"
-```
-
-Вернуть:
-
-```sh
-cp "$BASE/backups/config-manual.yaml" "$BASE/config.yaml"
-```
-
-Проверить после восстановления:
-
-```sh
-"$BASE/bin/mihomo" -t -d "$BASE" -f "$BASE/config.yaml"
-```
-
-Применить:
-
-```sh
-gc restart
-```
-
----
-
-## Как открыть Zashboard
-
-Самый надёжный вариант:
-
-```sh
-gc dashboard
-```
-
-Команда выведет готовый URL.
-
-Посмотреть controller вручную:
-
-```sh
-grep '^external-controller:' "$BASE/config.yaml"
-```
-
-Посмотреть secret:
-
-```sh
-grep '^secret:' "$BASE/config.yaml"
-```
-
-На legacy ARMv5 GoshaCrash добавляет в setup URL:
-
-```text
-disableUpgradeCore=1
-```
-
-потому что используемая legacy-сборка Mihomo закреплена для совместимости со старым kernel.
-
----
-
-## Routing: manual и auto
-
-Посмотреть режим:
-
-```sh
-gc routing status
-```
-
-Переключить на manual:
-
-```sh
-gc routing manual
-```
-
-Переключить на automatic:
-
-```sh
-gc routing auto
-```
-
-Для RT-AC68U / legacy ARMv5 доступен только:
-
-```text
-manual
-```
-
-`gc routing manual/auto` лучше не заменять набором ручных `ip rule`/`iptables` команд: GoshaCrash создаёт несколько связанных policy-routing, mangle, NAT, DNS и FORWARD правил и сохраняет состояние для корректной очистки/восстановления.
-
-Для изучения текущего результата используются диагностические команды:
-
-```sh
-route -n
-iptables -t mangle -L -n -v
-iptables -t nat -L -n -v
-```
-
-и, если есть `ip`:
-
-```sh
-ip rule show
-ip route show table 2022
-```
-
----
-
-## Watchdog
-
-Посмотреть:
-
-```sh
-cat "$BASE/run/watchdog.pid"
-```
-
-Проверить процесс:
-
-```sh
-PID="$(cat "$BASE/run/watchdog.pid" 2>/dev/null)"
-[ -n "$PID" ] && kill -0 "$PID" && echo "Watchdog работает"
-```
-
-Лог:
-
-```sh
-tail -n 100 "$BASE/logs/watchdog.log"
-```
-
-Watchdog проверяет Mihomo и routing. Поэтому простое ручное `kill` Mihomo не равно `gc stop`: watchdog может его восстановить.
-
----
-
-## Полезная последовательность после изменения конфига
-
-```sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
-cp "$BASE/config.yaml" "$BASE/backups/config-manual.yaml"
-nano "$BASE/config.yaml"
-"$BASE/bin/mihomo" -t -d "$BASE" -f "$BASE/config.yaml"
-gc restart
-gc status
-tail -n 50 "$BASE/logs/mihomo.log"
-```
-
----
-
-## Если VPN не работает
-
-Проверять по порядку:
-
-```sh
-gc status
-```
+Процесс:
 
 ```sh
 ps | grep '[m]ihomo'
 ```
 
+Конфиг:
+
+```sh
+"$BASE/bin/mihomo" -t -d "$BASE" -f "$BASE/config.yaml"
+```
+
+TUN:
+
 ```sh
 ifconfig tun0
 ```
+
+DNS Mihomo:
 
 ```sh
 netstat -ln | grep ':1053'
 ```
 
-```sh
-tail -n 100 "$BASE/logs/mihomo.log"
-```
-
-```sh
-tail -n 100 "$BASE/logs/goshacrash.log"
-```
-
-```sh
-gc routing status
-```
+Обычные маршруты:
 
 ```sh
 route -n
 ```
 
+Legacy policy routing:
+
 ```sh
-iptables -t mangle -L -n -v
+"$BASE/bin/gcnet" rule-exists 0x2333 2022; echo $?
+"$BASE/bin/gcnet" route-default-exists tun0 2022; echo $?
 ```
 
-Так видно, на каком уровне проблема: процесс → конфиг → DNS → TUN → routing → iptables.
+iptables:
+
+```sh
+iptables -t mangle -L -n -v
+iptables -t nat -L -n -v
+iptables -t filter -L FORWARD -n -v
+```
 
 ---
 
-## Краткий словарь `gc`
+# 13. Что автоматизирует `gc`
 
-| Команда | Что делает | Базовый ручной аналог |
+| Нужно сделать | Руками | GoshaCrash |
 |---|---|---|
-| `gc status` | Показывает Mihomo, TUN и routing | `ps`, `ifconfig tun0`, `route -n` |
-| `gc edit` | Backup, nano, проверка, restart/rollback | `cp`, `nano`, `mihomo -t`, `gc restart` |
-| `gc restart` | Безопасно пересобирает весь VPN runtime | `kill` + запуск Mihomo; routing/watchdog лучше вернуть через `gc restart` |
-| `gc stop` | Останавливает весь VPN и возвращает DIRECT | Одного `kill` недостаточно из-за routing/watchdog |
-| `gc logs` | Читает журналы | `tail -n` |
-| `gc logs live` | Live-журнал | `tail -f` |
-| `gc dashboard` | Выводит URL панели | `grep external-controller/secret` |
-| `gc routing status` | Проверяет routing | `route`, `ip rule`, `iptables` |
-| `gc routing manual` | Включает manual routing | Автоматизирует policy routing + iptables |
-| `gc routing auto` | Включает native auto routing | Изменяет TUN-конфиг и перезапускает runtime |
+| Проверить процесс/TUN/routing | `ps`, `ifconfig`, `gcnet`, `iptables` | `gc status` |
+| Изменить конфиг | `cp`, `nano`, `mihomo -t` | `gc edit` |
+| Перезапустить весь VPN | kill/start + policy routing + iptables | `gc restart` |
+| Полностью остановить VPN | очистить routing/iptables + kill | `gc stop` |
+| Читать лог | `tail -n` | `gc logs` |
+| Live лог | `tail -f` | `gc logs live` |
+| Проверить routing | `gcnet` + `iptables` | `gc routing status` |
+| Получить URL UI | читать controller/secret | `gc dashboard` |
 
 ## Главное
 
-GoshaCrash не заменяет SSH и стандартные Linux-команды. Он автоматизирует связанные операции, которые вручную нужно выполнять в правильном порядке.
+На RT-AC68U GoshaCrash автоматизирует не «VPN одной командой», а конкретные обычные действия Linux/ASUSWRT:
 
-Для диагностики полезно знать:
-
-```sh
-ps
-kill
-nano
-cp
-tail
-ifconfig
-route
-netstat
-iptables
+```text
+скачать бинарники
+создать config.yaml
+проверить mihomo -t
+запустить процесс
+дождаться tun0
+создать policy rule
+создать route table 2022
+поставить fwmark 0x2333
+создать iptables chains
+перехватить DNS
+разрешить FORWARD
+следить за процессом watchdog'ом
+восстановить всё после reboot/firewall restart
 ```
 
-Для штатного включения/выключения VPN лучше использовать:
-
-```sh
-gc restart
-gc stop
-```
-
-потому что кроме процесса Mihomo GoshaCrash управляет TUN, DNS, policy routing, iptables и watchdog.
+Любой отдельный слой можно проверить руками командами из этого README.
