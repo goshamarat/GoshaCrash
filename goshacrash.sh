@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.7.9"
-BUILD_ID="2026-08-17-stock-asus-r9"
+VERSION="3.7.10"
+BUILD_ID="2026-08-18-stock-asus-optware-sftp-r10"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -1274,6 +1274,22 @@ autostart_status(){
     return 0
 }
 
+
+sftp_status(){
+    echo "SFTP / Optware"
+    p="$(cat "$STATE/sftp-server.path" 2>/dev/null)"
+    if [ -n "$p" ] && [ -x "$p" ]; then
+        echo "  sftp-server: $p"
+        echo "  binary: OK"
+    else
+        for p in /opt/libexec/sftp-server /opt/lib/openssh/sftp-server; do
+            [ -x "$p" ] && { echo "  sftp-server: $p"; echo "  binary: OK"; return 0; }
+        done
+        echo "  sftp-server: НЕ НАЙДЕН"
+    fi
+    echo "  пакет: openssh-sftp-server (Optware/ipkg)"
+    echo "  SSH daemon: штатный ASUS/Dropbear не заменяется"
+}
 usage(){
 cat <<'USAGE'
 GoshaCrash 3.7.9 — RT-AC68U / stock ASUSWRT
@@ -1399,6 +1415,7 @@ ROUTING
   gc routing manual  включить manual routing
   gc routing auto    включить automatic routing (не ARMv5)
   gc autostart status проверить stock ASUS USB-mount hook и boot.log
+  gc sftp status      проверить Optware sftp-server
   gc help            этот SSH-справочник
 
 Правило:
@@ -1425,6 +1442,13 @@ case "${1:-menu}" in
         case "${1:-status}" in
             status) autostart_status;;
             *) echo 'Использование: gc autostart status'; exit 1;;
+        esac
+        ;;
+    sftp)
+        shift
+        case "${1:-status}" in
+            status) sftp_status;;
+            *) echo 'Использование: gc sftp status'; exit 1;;
         esac
         ;;
     routing)

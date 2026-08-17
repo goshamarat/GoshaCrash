@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.7.9"
+INSTALLER_VERSION="3.7.10"
 STOCK_USB_MOUNT_ZIP_URL="${STOCK_USB_MOUNT_ZIP_URL:-https://raw.githubusercontent.com/jacklul/asuswrt-scripts/master/asusware-usb-mount-script/asusware-usb-mount-script.zip}"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
@@ -390,6 +390,7 @@ prepare_packages(){
         warn "SFTP subsystem не найден; это не блокирует GoshaCrash"
     fi
     say "Инструменты: unzip=$UNZIP_BIN, gzip=$GZIP_BIN, downloader=$DOWNLOADER"
+    install_optware_sftp || return 1
 }
 
 wget_fetch(){
@@ -993,6 +994,35 @@ merge_ipkg_stanza(){
     cat "$src" >> "$dst" || return 1
 }
 
+
+find_sftp_server(){
+    for p in /opt/libexec/sftp-server /opt/lib/openssh/sftp-server "$DM_ROOT/libexec/sftp-server" "$DM_ROOT/lib/openssh/sftp-server"; do
+        [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+    done
+    return 1
+}
+install_optware_sftp(){
+    [ -x "$PKG_MGR" ] || { fail "Optware ipkg не найден; SFTP установить нельзя"; return 1; }
+    if sftp_bin="$(find_sftp_server 2>/dev/null)"; then
+        ok "SFTP server уже установлен: $sftp_bin"; return 0
+    fi
+    say "Обновляю список Optware для SFTP"
+    "$PKG_MGR" update >> "$INSTALL_LOG" 2>&1 || warn "ipkg update завершился с ошибкой; использую текущий package list"
+    "$PKG_MGR" list 2>/dev/null | grep -q '^openssh-sftp-server[[:space:]]' || {
+        fail "В текущем Optware feed нет openssh-sftp-server"; return 1
+    }
+    say "Устанавливаю openssh-sftp-server через Optware/ipkg"
+    "$PKG_MGR" install openssh-sftp-server >> "$INSTALL_LOG" 2>&1 || {
+        fail "Optware не смог установить openssh-sftp-server"; return 1
+    }
+    sftp_bin="$(find_sftp_server 2>/dev/null)" || {
+        fail "openssh-sftp-server установлен, но sftp-server не найден"; return 1
+    }
+    chmod 755 "$sftp_bin" 2>/dev/null || true
+    mkdir -p "$BASE/state" 2>/dev/null || true
+    printf '%s\n' "$sftp_bin" > "$BASE/state/sftp-server.path" 2>/dev/null || true
+    ok "SFTP subsystem установлен через Optware: $sftp_bin"
+}
 install_stock_usb_mount_bridge(){
     case "${DM_ROOT##*/}" in
         asusware.arm) : ;;
