@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.7.6"
+INSTALLER_VERSION="3.7.7"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -913,6 +913,10 @@ install_nvram_usb_hooks(){
       'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" stop >/dev/null 2>&1' || warn "Не удалось записать USB-unmount hook"
     [ "$(nvram_get jffs2_scripts)" = 1 ] || nvram_set jffs2_scripts 1 || true
     nvram_commit || true
+    case "$(nvram_get script_usbmount)" in
+      *GOSHACRASH_USBMOUNT_BEGIN*) : ;;
+      *) warn "ASUSWRT удалил script_usbmount из NVRAM; используется Download Master S99goshacrash.1" ;;
+    esac
 }
 
 install_hooks(){
@@ -922,10 +926,24 @@ install_hooks(){
 
     cat > "$JFFS_DIR/start.sh" <<'HOOK'
 #!/bin/sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -x "$BASE/goshacrash.sh" ] || exit 0
+# Stock ASUSWRT can call a boot hook before the USB volume is ready.
+# Do not exit immediately: wait for the configured installation to appear.
+BASE_FILE=/jffs/addons/goshacrash/base
+WAIT_MAX=300
+WAITED=0
+BASE="$(cat "$BASE_FILE" 2>/dev/null)"
+while [ -z "$BASE" ] || [ ! -x "$BASE/goshacrash.sh" ]; do
+  [ "$WAITED" -ge "$WAIT_MAX" ] && {
+    echo "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) GoshaCrash: USB/base not ready after ${WAIT_MAX}s" >> /tmp/goshacrash-autostart.log
+    exit 0
+  }
+  sleep 5
+  WAITED=$((WAITED + 5))
+  BASE="$(cat "$BASE_FILE" 2>/dev/null)"
+done
 mkdir -p "$BASE/logs" "$BASE/run" "$BASE/state" 2>/dev/null || true
 touch "$BASE/state/autostart-hook-ran" 2>/dev/null || true
+echo "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) start hook: BASE=$BASE waited=${WAITED}s" >> "$BASE/logs/boot.log"
 if command -v nohup >/dev/null 2>&1; then
   GOSHACRASH_BASE="$BASE" nohup "$BASE/goshacrash.sh" boot </dev/null >> "$BASE/logs/boot.log" 2>&1 &
 else
@@ -965,6 +983,21 @@ case "$1" in
 esac
 INIT
     chmod 755 "$DM_ROOT/etc/init.d/S99goshacrash" || return 1
+
+    # ASUS Download Master on stock ASUSWRT uses S*.1 scripts in the
+    # asusware root (the same place as S50downloadmaster.1).  This is the
+    # primary autostart path on the tested RT-AC68U.
+    cat > "$DM_ROOT/S99goshacrash.1" <<'INIT'
+#!/bin/sh
+case "$1" in
+  start) /jffs/addons/goshacrash/start.sh & ;;
+  stop) BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"; [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" stop ;;
+  restart) BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"; [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" restart ;;
+  firewall-start|firewall-restart) /jffs/addons/goshacrash/firewall.sh & ;;
+esac
+INIT
+    chmod 755 "$DM_ROOT/S99goshacrash.1" || return 1
+
     install_nvram_usb_hooks || true
     ok "Автозапуск и глобальные команды установлены из install.sh"
 }

@@ -1,4 +1,4 @@
-# GoshaCrash 3.7.6 — RT-AC68U: установка руками через SSH
+# GoshaCrash 3.7.7 — RT-AC68U: установка руками через SSH
 
 Это инструкция именно для того RT-AC68U, на котором всё это проверялось:
 
@@ -604,3 +604,4 @@ iptables -t filter -L FORWARD -n -v
 ```
 
 Если что-то не работает, не обязательно гадать, что делает скрипт: можно пройтись по этим командам и отдельно проверить Mihomo, TUN, DNS, routing и iptables.
+\n\n# Автозапуск на stock RT-AC68U\n\nНа официальном ASUSWRT не стоит рассчитывать только на `/jffs/scripts/services-start`: этот hook характерен для Merlin. Также новые официальные прошивки могут чистить `script_usbmount` из NVRAM. Поэтому GoshaCrash 3.7.7 ставит основной hook прямо туда, откуда запускается Download Master на этом роутере:\n\n```text\n/tmp/mnt/SANDISK/asusware.arm/S99goshacrash.1\n```\n\nПлюс остаются резервные hooks в JFFS и `etc/init.d`. `start.sh` теперь ждёт USB до 300 секунд, а не выходит, если `/tmp/mnt/SANDISK` ещё не успел смонтироваться.\n\nПроверить всё одной командой:\n\n```sh\ngc autostart status\n```\n\nЕсли там написано:\n\n```text\nmanual-stop: ДА\n```\n\nто автозапуск выключен намеренно после `gc stop`. Включить обратно:\n\n```sh\ngc restart\n```\n\nПроверить вручную после reboot:\n\n```sh\ncat /tmp/mnt/SANDISK/goshacrash/logs/boot.log\nls -l /tmp/mnt/SANDISK/asusware.arm/S99goshacrash.1\nps | grep '[m]ihomo'\n```\n
