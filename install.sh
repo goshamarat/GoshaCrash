@@ -3,7 +3,8 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.7.8"
+INSTALLER_VERSION="3.7.9"
+STOCK_USB_MOUNT_ZIP_URL="${STOCK_USB_MOUNT_ZIP_URL:-https://raw.githubusercontent.com/jacklul/asuswrt-scripts/master/asusware-usb-mount-script/asusware-usb-mount-script.zip}"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -981,6 +982,88 @@ install_nvram_usb_hooks(){
     esac
 }
 
+
+merge_ipkg_stanza(){
+    src="$1"; dst="$2"; package="$3"
+    [ -f "$src" ] || return 1
+    mkdir -p "$(dirname "$dst")" || return 1
+    [ -f "$dst" ] || : > "$dst"
+    grep -q "^Package: $package\$" "$dst" 2>/dev/null && return 0
+    printf '\n' >> "$dst"
+    cat "$src" >> "$dst" || return 1
+}
+
+install_stock_usb_mount_bridge(){
+    case "${DM_ROOT##*/}" in
+        asusware.arm) : ;;
+        *)
+            fail "Stock ASUSWRT autostart bridge ожидает asusware.arm, найдено: ${DM_ROOT##*/}"
+            return 1
+            ;;
+    esac
+
+    bridge_zip="$TMP_ROOT/stock-usb-mount-script.zip"
+    bridge_dir="$TMP_ROOT/stock-usb-mount-script"
+    rm -rf "$bridge_dir" "$bridge_zip" 2>/dev/null || true
+    mkdir -p "$bridge_dir" || return 1
+
+    say "Ставлю stock ASUSWRT USB-mount autostart bridge"
+    fetch "$STOCK_USB_MOUNT_ZIP_URL" "$bridge_zip" || {
+        fail "Не скачан stock ASUSWRT USB-mount bridge"
+        return 1
+    }
+    "$UNZIP_BIN" -o "$bridge_zip" -d "$bridge_dir" >> "$INSTALL_LOG" 2>&1 || {
+        fail "Не распакован stock ASUSWRT USB-mount bridge"
+        return 1
+    }
+
+    bridge_src="$bridge_dir/asusware.arm"
+    bridge_init="$bridge_src/etc/init.d/S50usb-mount-script"
+    [ -f "$bridge_init" ] || { fail "В bridge нет S50usb-mount-script"; return 1; }
+
+    mkdir -p "$DM_ROOT/etc/init.d" "$DM_ROOT/lib/ipkg/info" "$DM_ROOT/lib/ipkg/lists" || return 1
+    cp -f "$bridge_init" "$DM_ROOT/etc/init.d/S50usb-mount-script" || return 1
+    chmod 755 "$DM_ROOT/etc/init.d/S50usb-mount-script" || return 1
+
+    if [ -f "$bridge_src/lib/ipkg/status" ]; then
+        merge_ipkg_stanza "$bridge_src/lib/ipkg/status" "$DM_ROOT/lib/ipkg/status" "usb-mount-script" || return 1
+    fi
+    if [ -f "$bridge_src/lib/ipkg/info/usb-mount-script.control" ]; then
+        cp -f "$bridge_src/lib/ipkg/info/usb-mount-script.control" \
+              "$DM_ROOT/lib/ipkg/info/usb-mount-script.control" || return 1
+    fi
+    if [ -f "$bridge_src/lib/ipkg/lists/optware.asus" ]; then
+        cp -f "$bridge_src/lib/ipkg/lists/optware.asus" \
+              "$DM_ROOT/lib/ipkg/lists/goshacrash-usb-mount" 2>/dev/null || true
+    fi
+    [ -e "$DM_ROOT/.asusrouter" ] || : > "$DM_ROOT/.asusrouter"
+    ok "Stock ASUSWRT USB-mount bridge установлен"
+}
+
+remove_old_autostart_hooks(){
+    remove_legacy_hook_lines /jffs/scripts/services-start >/dev/null 2>&1 || true
+    remove_legacy_hook_lines /jffs/scripts/firewall-start >/dev/null 2>&1 || true
+    rm -f "$DM_ROOT/S99goshacrash.1" "$DM_ROOT/etc/init.d/S99goshacrash" 2>/dev/null || true
+
+    if find_nvram >/dev/null 2>&1; then
+        for key in script_usbmount script_usbumount; do
+            old="$(nvram_get "$key")"
+            tmp="$TMP_ROOT/remove-$key.$$"
+            printf '%s\n' "$old" | awk '
+              /# GOSHACRASH_USBMOUNT_BEGIN/ {skip=1; next}
+              /# GOSHACRASH_USBMOUNT_END/ {skip=0; next}
+              /# GOSHACRASH_USBUMOUNT_BEGIN/ {skip=1; next}
+              /# GOSHACRASH_USBUMOUNT_END/ {skip=0; next}
+              !skip {print}
+            ' > "$tmp" 2>/dev/null || true
+            cleaned="$(cat "$tmp" 2>/dev/null)"
+            [ "$cleaned" = "$old" ] || nvram_set "$key" "$cleaned" >/dev/null 2>&1 || true
+            rm -f "$tmp"
+        done
+        nvram_commit >/dev/null 2>&1 || true
+    fi
+}
+
 install_hooks(){
     JFFS_DIR="/jffs/addons/goshacrash"
     mkdir -p "$JFFS_DIR" /jffs/scripts /jffs/configs "$DM_ROOT/bin" "$DM_ROOT/etc/init.d" || return 1
@@ -988,24 +1071,27 @@ install_hooks(){
 
     cat > "$JFFS_DIR/start.sh" <<'HOOK'
 #!/bin/sh
-# Stock ASUSWRT can call a boot hook before the USB volume is ready.
-# Do not exit immediately: wait for the configured installation to appear.
 BASE_FILE=/jffs/addons/goshacrash/base
 WAIT_MAX=300
 WAITED=0
 BASE="$(cat "$BASE_FILE" 2>/dev/null)"
+
 while [ -z "$BASE" ] || [ ! -x "$BASE/goshacrash.sh" ]; do
-  [ "$WAITED" -ge "$WAIT_MAX" ] && {
+  if [ "$WAITED" -ge "$WAIT_MAX" ]; then
     echo "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) GoshaCrash: USB/base not ready after ${WAIT_MAX}s" >> /tmp/goshacrash-autostart.log
     exit 0
-  }
+  fi
   sleep 5
   WAITED=$((WAITED + 5))
   BASE="$(cat "$BASE_FILE" 2>/dev/null)"
 done
+
 mkdir -p "$BASE/logs" "$BASE/run" "$BASE/state" 2>/dev/null || true
-touch "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-echo "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null) start hook: BASE=$BASE waited=${WAITED}s" >> "$BASE/logs/boot.log"
+STAMP="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+[ -n "$STAMP" ] || STAMP="unknown-time"
+printf '%s\n' "$STAMP" > "$BASE/state/autostart-hook-ran" 2>/dev/null || true
+echo "$STAMP stock usb-mount start hook: BASE=$BASE waited=${WAITED}s" >> "$BASE/logs/boot.log"
+
 if command -v nohup >/dev/null 2>&1; then
   GOSHACRASH_BASE="$BASE" nohup "$BASE/goshacrash.sh" boot </dev/null >> "$BASE/logs/boot.log" 2>&1 &
 else
@@ -1014,18 +1100,38 @@ fi
 HOOK
     chmod 755 "$JFFS_DIR/start.sh" || return 1
 
-    cat > "$JFFS_DIR/firewall.sh" <<'HOOK'
+    cat > /jffs/scripts/usb-mount-script <<'HOOK'
 #!/bin/sh
+DEVICE="$1"
+MOUNT_POINT="$2"
 BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" firewall-reload >/dev/null 2>&1
+[ -n "$BASE" ] || exit 0
+case "$BASE" in
+  "$MOUNT_POINT"/*)
+    logger -t goshacrash "USB mounted: $DEVICE -> $MOUNT_POINT"
+    /jffs/addons/goshacrash/start.sh &
+    ;;
+esac
+exit 0
 HOOK
-    chmod 755 "$JFFS_DIR/firewall.sh" || return 1
+    chmod 755 /jffs/scripts/usb-mount-script || return 1
 
-    remove_legacy_hook_lines /jffs/scripts/services-start || return 1
-    remove_legacy_hook_lines /jffs/scripts/firewall-start || return 1
-    rm -f /jffs/scripts/goshacrash-start /jffs/scripts/goshacrash-firewall /jffs/scripts/goshacrash-autostart /jffs/scripts/goshacrash-route 2>/dev/null || true
-    add_once /jffs/scripts/services-start "$JFFS_DIR/start.sh &"
-    add_once /jffs/scripts/firewall-start "$JFFS_DIR/firewall.sh &"
+    cat > /jffs/scripts/usb-umount-script <<'HOOK'
+#!/bin/sh
+MOUNT_POINT="$2"
+BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+[ -n "$BASE" ] || exit 0
+case "$BASE" in
+  "$MOUNT_POINT"/*)
+    if [ -x "$BASE/goshacrash.sh" ]; then
+      GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" service-stop >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+exit 0
+HOOK
+    chmod 755 /jffs/scripts/usb-umount-script || return 1
+
     rm -f /jffs/scripts/goshacrash /opt/bin/goshacrash "$DM_ROOT/bin/goshacrash" \
           /jffs/scripts/crash /opt/bin/gc "$DM_ROOT/bin/crash" \
           /jffs/scripts/gc /opt/bin/gc "$DM_ROOT/bin/gc" 2>/dev/null || true
@@ -1035,33 +1141,9 @@ HOOK
     if [ -d /opt/bin ] && [ -w /opt/bin ]; then write_command_wrapper /opt/bin/gc 2>/dev/null || true; fi
     add_once /jffs/configs/profile.add 'export PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"'
 
-    cat > "$DM_ROOT/etc/init.d/S99goshacrash" <<'INIT'
-#!/bin/sh
-case "$1" in
-  start) /jffs/addons/goshacrash/start.sh & ;;
-  stop) BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"; [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" service-stop ;;
-  restart) /jffs/scripts/gc restart ;;
-  firewall-start|firewall-restart) /jffs/addons/goshacrash/firewall.sh & ;;
-esac
-INIT
-    chmod 755 "$DM_ROOT/etc/init.d/S99goshacrash" || return 1
-
-    # ASUS Download Master on stock ASUSWRT uses S*.1 scripts in the
-    # asusware root (the same place as S50downloadmaster.1).  This is the
-    # primary autostart path on the tested RT-AC68U.
-    cat > "$DM_ROOT/S99goshacrash.1" <<'INIT'
-#!/bin/sh
-case "$1" in
-  start) /jffs/addons/goshacrash/start.sh & ;;
-  stop) BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"; [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" service-stop ;;
-  restart) BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"; [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" restart ;;
-  firewall-start|firewall-restart) /jffs/addons/goshacrash/firewall.sh & ;;
-esac
-INIT
-    chmod 755 "$DM_ROOT/S99goshacrash.1" || return 1
-
-    install_nvram_usb_hooks || true
-    ok "Автозапуск и глобальные команды установлены из install.sh"
+    remove_old_autostart_hooks
+    install_stock_usb_mount_bridge || return 1
+    ok "Автозапуск установлен через stock ASUSWRT USB-mount bridge"
 }
 
 write_platform_state(){

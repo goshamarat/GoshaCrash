@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.7.8"
-BUILD_ID="2026-08-17-release-r7"
+VERSION="3.7.9"
+BUILD_ID="2026-08-17-stock-asus-r9"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -1242,16 +1242,33 @@ menu(){
 autostart_status(){
     ensure_dirs >/dev/null 2>&1 || true
     load_platform >/dev/null 2>&1 || true
-    echo "Autostart GoshaCrash"
+    echo "Autostart GoshaCrash (stock ASUSWRT)"
     echo "  BASE: $BASE"
-    if [ -x /jffs/addons/goshacrash/start.sh ]; then echo "  JFFS start.sh: OK"; else echo "  JFFS start.sh: НЕТ"; fi
-    if [ -n "$DM_ROOT" ] && [ -x "$DM_ROOT/S99goshacrash.1" ]; then echo "  Download Master S99goshacrash.1: OK"; else echo "  Download Master S99goshacrash.1: НЕТ"; fi
-    if [ -n "$DM_ROOT" ] && [ -x "$DM_ROOT/etc/init.d/S99goshacrash" ]; then echo "  Download Master etc/init.d: OK"; else echo "  Download Master etc/init.d: НЕТ"; fi
-    if [ -f "$MANUAL_STOP" ]; then echo "  manual-stop: ДА (только после ручного gc stop; включить: gc restart)"; else echo "  manual-stop: нет"; fi
-    if [ -f "$STATE/autostart-hook-ran" ]; then echo "  hook уже запускался: ДА"; else echo "  hook уже запускался: нет"; fi
-    if command -v nvram >/dev/null 2>&1; then
-        case "$(nvram get script_usbmount 2>/dev/null)" in *GOSHACRASH_USBMOUNT_BEGIN*) echo "  NVRAM usbmount hook: OK";; *) echo "  NVRAM usbmount hook: отсутствует/заблокирован firmware";; esac
+    [ -x /jffs/addons/goshacrash/start.sh ] && echo "  start.sh: OK" || echo "  start.sh: НЕТ"
+    [ -x /jffs/scripts/usb-mount-script ] && echo "  /jffs/scripts/usb-mount-script: OK" || echo "  /jffs/scripts/usb-mount-script: НЕТ"
+
+    if [ -n "$DM_ROOT" ] && [ -x "$DM_ROOT/etc/init.d/S50usb-mount-script" ]; then
+        echo "  ASUS app S50usb-mount-script: OK"
+    else
+        echo "  ASUS app S50usb-mount-script: НЕТ"
     fi
+
+    if [ -n "$DM_ROOT" ] && grep -q '^Package: usb-mount-script$' "$DM_ROOT/lib/ipkg/status" 2>/dev/null; then
+        echo "  ASUS app package metadata: OK"
+    else
+        echo "  ASUS app package metadata: НЕТ"
+    fi
+
+    [ -f "$MANUAL_STOP" ] && echo "  manual-stop: ДА (включить: gc restart)" || echo "  manual-stop: нет"
+
+    if [ -f "$STATE/autostart-hook-ran" ]; then
+        echo "  последний вызов hook: $(cat "$STATE/autostart-hook-ran" 2>/dev/null)"
+    else
+        echo "  последний вызов hook: ещё не было"
+    fi
+
+    echo "  NVRAM script_usbmount: не используется"
+    echo "  Merlin services-start: не используется"
     echo "  boot log: $BOOT_LOG"
     [ -f "$BOOT_LOG" ] && tail -n 20 "$BOOT_LOG"
     return 0
@@ -1259,7 +1276,7 @@ autostart_status(){
 
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.7.8 — RT-AC68U SSH-справочник
+GoshaCrash 3.7.9 — RT-AC68U / stock ASUSWRT
 
 Этот help показывает ручные команды для установленного RT-AC68U.
 Полная установка с нуля руками расписана в README.md релиза.
@@ -1381,7 +1398,7 @@ ROUTING
   gc routing status  показать routing
   gc routing manual  включить manual routing
   gc routing auto    включить automatic routing (не ARMv5)
-  gc autostart status проверить hooks и boot.log
+  gc autostart status проверить stock ASUS USB-mount hook и boot.log
   gc help            этот SSH-справочник
 
 Правило:
