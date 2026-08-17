@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.7.10"
-BUILD_ID="2026-08-18-stock-asus-optware-sftp-r10"
+VERSION="3.7.11"
+BUILD_ID="2026-08-18-stock-asus-optware-sftp-r11"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -1277,19 +1277,28 @@ autostart_status(){
 
 sftp_status(){
     echo "SFTP / Optware"
+
     p="$(cat "$STATE/sftp-server.path" 2>/dev/null)"
+    v="$(cat "$STATE/sftp-server.version" 2>/dev/null)"
+
     if [ -n "$p" ] && [ -x "$p" ]; then
         echo "  sftp-server: $p"
+        [ -n "$v" ] && echo "  version: $v"
         echo "  binary: OK"
     else
-        for p in /opt/libexec/sftp-server /opt/lib/openssh/sftp-server; do
-            [ -x "$p" ] && { echo "  sftp-server: $p"; echo "  binary: OK"; return 0; }
+        found=""
+        for x in /opt/libexec/sftp-server /opt/lib/openssh/sftp-server; do
+            [ -x "$x" ] && { found="$x"; break; }
         done
-        echo "  sftp-server: НЕ НАЙДЕН"
+        [ -n "$found" ] && echo "  sftp-server: $found" || echo "  sftp-server: НЕ НАЙДЕН"
+        [ -n "$v" ] && echo "  version: $v"
     fi
-    echo "  пакет: openssh-sftp-server (Optware/ipkg)"
+
+    echo "  package: openssh-sftp-server (Optware/ipkg)"
     echo "  SSH daemon: штатный ASUS/Dropbear не заменяется"
+    echo "  test from PC: sftp admin@<IP-роутера>"
 }
+
 usage(){
 cat <<'USAGE'
 GoshaCrash 3.7.9 — RT-AC68U / stock ASUSWRT

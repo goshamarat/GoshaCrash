@@ -1,4 +1,4 @@
-# GoshaCrash 3.7.10 — RT-AC68U: установка руками через SSH
+# GoshaCrash 3.7.11 — RT-AC68U: установка руками через SSH
 
 Это инструкция именно для того RT-AC68U, на котором всё это проверялось:
 
@@ -604,7 +604,7 @@ iptables -t filter -L FORWARD -n -v
 ```
 
 Если что-то не работает, не обязательно гадать, что делает скрипт: можно пройтись по этим командам и отдельно проверить Mihomo, TUN, DNS, routing и iptables.
-\n\n# Автозапуск на stock RT-AC68U\n\nНа официальном ASUSWRT не стоит рассчитывать только на `/jffs/scripts/services-start`: этот hook характерен для Merlin. Также новые официальные прошивки могут чистить `script_usbmount` из NVRAM. Поэтому GoshaCrash 3.7.10 ставит основной hook прямо туда, откуда запускается Download Master на этом роутере:\n\n```text\n/tmp/mnt/SANDISK/asusware.arm/S99goshacrash.1\n```\n\nПлюс остаются резервные hooks в JFFS и `etc/init.d`. `start.sh` теперь ждёт USB до 300 секунд, а не выходит, если `/tmp/mnt/SANDISK` ещё не успел смонтироваться.\n\nПроверить всё одной командой:\n\n```sh\ngc autostart status\n```\n\nЕсли там написано:\n\n```text\nmanual-stop: ДА\n```\n\nто автозапуск выключен намеренно после `gc stop`. Включить обратно:\n\n```sh\ngc restart\n```\n\nПроверить вручную после reboot:\n\n```sh\ncat /tmp/mnt/SANDISK/goshacrash/logs/boot.log\nls -l /tmp/mnt/SANDISK/asusware.arm/S99goshacrash.1\nps | grep '[m]ihomo'\n```\n
+\n\n# Автозапуск на stock RT-AC68U\n\nНа официальном ASUSWRT не стоит рассчитывать только на `/jffs/scripts/services-start`: этот hook характерен для Merlin. Также новые официальные прошивки могут чистить `script_usbmount` из NVRAM. Поэтому GoshaCrash 3.7.11 ставит основной hook прямо туда, откуда запускается Download Master на этом роутере:\n\n```text\n/tmp/mnt/SANDISK/asusware.arm/S99goshacrash.1\n```\n\nПлюс остаются резервные hooks в JFFS и `etc/init.d`. `start.sh` теперь ждёт USB до 300 секунд, а не выходит, если `/tmp/mnt/SANDISK` ещё не успел смонтироваться.\n\nПроверить всё одной командой:\n\n```sh\ngc autostart status\n```\n\nЕсли там написано:\n\n```text\nmanual-stop: ДА\n```\n\nто автозапуск выключен намеренно после `gc stop`. Включить обратно:\n\n```sh\ngc restart\n```\n\nПроверить вручную после reboot:\n\n```sh\ncat /tmp/mnt/SANDISK/goshacrash/logs/boot.log\nls -l /tmp/mnt/SANDISK/asusware.arm/S99goshacrash.1\nps | grep '[m]ihomo'\n```\n
 
 # Что исправлено в 3.7.8
 
@@ -698,3 +698,33 @@ sftp admin@10.10.10.100
 ```
 
 Если Windows отвечает `subsystem request failed`, пакет и бинарник могут быть установлены, но конкретный штатный Dropbear ASUS не вызывает SFTP subsystem. В таком случае требуется отдельная настройка SSH-сервера; установщик намеренно не заменяет его вслепую.
+
+
+# Что изменилось в 3.7.11
+
+Перед установкой SFTP GoshaCrash теперь показывает пакет и версию, реально найденные в текущем Optware feed:
+
+```text
+Optware SFTP package: openssh-sftp-server 5.9p1-1
+```
+
+После установки выполняется:
+
+```sh
+ipkg files openssh-sftp-server
+```
+
+Из package manifest берётся фактический путь к `sftp-server`. Путь и версия сохраняются:
+
+```text
+$BASE/state/sftp-server.path
+$BASE/state/sftp-server.version
+```
+
+Проверка:
+
+```sh
+gc sftp status
+```
+
+Для нашего RT-AC68U feed уже проверен вручную: `openssh-sftp-server 5.9p1-1` доступен через штатный Optware/Download Master. Entware не используется.
