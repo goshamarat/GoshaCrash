@@ -3,7 +3,7 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.7.7"
+VERSION="3.7.8"
 BUILD_ID="2026-08-17-release-r7"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
@@ -198,7 +198,7 @@ repair_opt(){
     if find_pkg; then ok "Download Master и пакетный менеджер готовы: $PKG"; return 0; fi
 
     say "Пробую штатно перезапустить окружение Download Master"
-    for script in /tmp/opt/S50downloadmaster.1 "$DM_ROOT/etc/init.d/S50downloadmaster" "$DM_ROOT/etc/init.d/S50downloadmaster.1"; do
+    for script in "$DM_ROOT/S50downloadmaster.1" /tmp/opt/S50downloadmaster.1 "$DM_ROOT/etc/init.d/S50downloadmaster" "$DM_ROOT/etc/init.d/S50downloadmaster.1"; do
         [ -x "$script" ] || continue
         "$script" restart >> "$PACKAGES_LOG" 2>&1 || "$script" start >> "$PACKAGES_LOG" 2>&1 || true
         sleep 3
@@ -652,6 +652,19 @@ start(){
 stop(){
     ensure_dirs || return 1; load_platform || true; touch "$MANUAL_STOP"; mkdir "$CONTROL_LOCK" 2>/dev/null || true
     watchdog_stop; stop_runtime; rmdir "$CONTROL_LOCK" 2>/dev/null || true; ok "Mihomo остановлен; обычный DIRECT восстановлен"
+}
+
+service_stop(){
+    # Internal stop for Download Master shutdown / USB unmount / reboot.
+    # Unlike public `gc stop`, this MUST NOT create state/manual-stop,
+    # otherwise the next boot would intentionally skip autostart.
+    ensure_dirs || return 1
+    load_platform || true
+    mkdir "$CONTROL_LOCK" 2>/dev/null || true
+    watchdog_stop
+    stop_runtime
+    rmdir "$CONTROL_LOCK" 2>/dev/null || true
+    return 0
 }
 restart(){
     ensure_dirs || return 1
@@ -1234,7 +1247,7 @@ autostart_status(){
     if [ -x /jffs/addons/goshacrash/start.sh ]; then echo "  JFFS start.sh: OK"; else echo "  JFFS start.sh: НЕТ"; fi
     if [ -n "$DM_ROOT" ] && [ -x "$DM_ROOT/S99goshacrash.1" ]; then echo "  Download Master S99goshacrash.1: OK"; else echo "  Download Master S99goshacrash.1: НЕТ"; fi
     if [ -n "$DM_ROOT" ] && [ -x "$DM_ROOT/etc/init.d/S99goshacrash" ]; then echo "  Download Master etc/init.d: OK"; else echo "  Download Master etc/init.d: НЕТ"; fi
-    if [ -f "$MANUAL_STOP" ]; then echo "  manual-stop: ДА (автозапуск намеренно выключен до gc restart)"; else echo "  manual-stop: нет"; fi
+    if [ -f "$MANUAL_STOP" ]; then echo "  manual-stop: ДА (только после ручного gc stop; включить: gc restart)"; else echo "  manual-stop: нет"; fi
     if [ -f "$STATE/autostart-hook-ran" ]; then echo "  hook уже запускался: ДА"; else echo "  hook уже запускался: нет"; fi
     if command -v nvram >/dev/null 2>&1; then
         case "$(nvram get script_usbmount 2>/dev/null)" in *GOSHACRASH_USBMOUNT_BEGIN*) echo "  NVRAM usbmount hook: OK";; *) echo "  NVRAM usbmount hook: отсутствует/заблокирован firmware";; esac
@@ -1246,7 +1259,7 @@ autostart_status(){
 
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.7.6 — RT-AC68U SSH-справочник
+GoshaCrash 3.7.8 — RT-AC68U SSH-справочник
 
 Этот help показывает ручные команды для установленного RT-AC68U.
 Полная установка с нуля руками расписана в README.md релиза.
@@ -1385,6 +1398,7 @@ case "${1:-menu}" in
     menu) menu;;
     help|-h|--help) usage;;
     stop) stop;;
+    service-stop) service_stop;;
     restart) restart;;
     status) status;;
     edit) edit_config;;

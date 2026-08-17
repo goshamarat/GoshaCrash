@@ -1,4 +1,4 @@
-# GoshaCrash 3.7.7 — RT-AC68U: установка руками через SSH
+# GoshaCrash 3.7.8 — RT-AC68U: установка руками через SSH
 
 Это инструкция именно для того RT-AC68U, на котором всё это проверялось:
 
@@ -604,4 +604,49 @@ iptables -t filter -L FORWARD -n -v
 ```
 
 Если что-то не работает, не обязательно гадать, что делает скрипт: можно пройтись по этим командам и отдельно проверить Mihomo, TUN, DNS, routing и iptables.
-\n\n# Автозапуск на stock RT-AC68U\n\nНа официальном ASUSWRT не стоит рассчитывать только на `/jffs/scripts/services-start`: этот hook характерен для Merlin. Также новые официальные прошивки могут чистить `script_usbmount` из NVRAM. Поэтому GoshaCrash 3.7.7 ставит основной hook прямо туда, откуда запускается Download Master на этом роутере:\n\n```text\n/tmp/mnt/SANDISK/asusware.arm/S99goshacrash.1\n```\n\nПлюс остаются резервные hooks в JFFS и `etc/init.d`. `start.sh` теперь ждёт USB до 300 секунд, а не выходит, если `/tmp/mnt/SANDISK` ещё не успел смонтироваться.\n\nПроверить всё одной командой:\n\n```sh\ngc autostart status\n```\n\nЕсли там написано:\n\n```text\nmanual-stop: ДА\n```\n\nто автозапуск выключен намеренно после `gc stop`. Включить обратно:\n\n```sh\ngc restart\n```\n\nПроверить вручную после reboot:\n\n```sh\ncat /tmp/mnt/SANDISK/goshacrash/logs/boot.log\nls -l /tmp/mnt/SANDISK/asusware.arm/S99goshacrash.1\nps | grep '[m]ihomo'\n```\n
+\n\n# Автозапуск на stock RT-AC68U\n\nНа официальном ASUSWRT не стоит рассчитывать только на `/jffs/scripts/services-start`: этот hook характерен для Merlin. Также новые официальные прошивки могут чистить `script_usbmount` из NVRAM. Поэтому GoshaCrash 3.7.8 ставит основной hook прямо туда, откуда запускается Download Master на этом роутере:\n\n```text\n/tmp/mnt/SANDISK/asusware.arm/S99goshacrash.1\n```\n\nПлюс остаются резервные hooks в JFFS и `etc/init.d`. `start.sh` теперь ждёт USB до 300 секунд, а не выходит, если `/tmp/mnt/SANDISK` ещё не успел смонтироваться.\n\nПроверить всё одной командой:\n\n```sh\ngc autostart status\n```\n\nЕсли там написано:\n\n```text\nmanual-stop: ДА\n```\n\nто автозапуск выключен намеренно после `gc stop`. Включить обратно:\n\n```sh\ngc restart\n```\n\nПроверить вручную после reboot:\n\n```sh\ncat /tmp/mnt/SANDISK/goshacrash/logs/boot.log\nls -l /tmp/mnt/SANDISK/asusware.arm/S99goshacrash.1\nps | grep '[m]ihomo'\n```\n
+
+# Что исправлено в 3.7.8
+
+На чистой флешке старый Download Master иногда оставляет `ipkg` рабочим, а `/opt` ещё не до конца готов. Из-за этого `nano` мог числиться установленным, но `install.sh` его не находил. Теперь установщик:
+
+```text
+проверяет nano
+→ пробует восстановить окружение Download Master
+→ проверяет пакетную базу
+→ при необходимости переустанавливает nano
+→ только потом продолжает установку
+```
+
+При восстановлении Download Master учитывается реальный startup-файл stock RT-AC68U:
+
+```text
+/tmp/mnt/SANDISK/asusware.arm/S50downloadmaster.1
+```
+
+Ещё исправлен важный момент автозапуска. Раньше USB-unmount и остановка Download Master могли вызвать обычный:
+
+```sh
+gc stop
+```
+
+а он создаёт:
+
+```text
+state/manual-stop
+```
+
+Из-за этого после reboot Mihomo мог не запуститься. Теперь системные stop/unmount hooks вызывают внутренний `service-stop`: он останавливает Mihomo, routing и watchdog, но **не выключает следующий автозапуск**.
+
+`manual-stop` создаётся только когда пользователь сам выполняет:
+
+```sh
+gc stop
+```
+
+Проверить автозапуск:
+
+```sh
+gc autostart status
+```
+

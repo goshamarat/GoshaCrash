@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.7.7"
+INSTALLER_VERSION="3.7.8"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -257,6 +257,61 @@ repair_unzip_package(){
     find_full_unzip >/dev/null 2>&1
 }
 
+find_nano(){
+    for p in \
+        /opt/bin/nano \
+        /tmp/opt/bin/nano \
+        "$DM_ROOT/bin/nano" \
+        "$DM_ROOT/sbin/nano"; do
+        [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+    done
+    command -v nano 2>/dev/null || return 1
+}
+
+restart_download_master_env(){
+    # Stock RT-AC68U keeps its main Download Master startup script in the
+    # asusware root as S50downloadmaster.1. Older layouts may use etc/init.d.
+    for script in \
+        "$DM_ROOT/S50downloadmaster.1" \
+        /tmp/opt/S50downloadmaster.1 \
+        "$DM_ROOT/etc/init.d/S50downloadmaster" \
+        "$DM_ROOT/etc/init.d/S50downloadmaster.1"; do
+        [ -x "$script" ] || continue
+        pkg_log "RUN: $script restart"
+        "$script" restart >> "$BASE/logs/packages.log" 2>&1 || \
+            "$script" start >> "$BASE/logs/packages.log" 2>&1 || true
+        sleep 2
+        prepare_path
+        refresh_tools
+        find_nano >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+repair_nano_package(){
+    find_nano >/dev/null 2>&1 && return 0
+
+    # First try to restore /opt / Download Master environment. This matters
+    # after a clean USB install where ipkg may exist before all Optware links
+    # are fully ready.
+    restart_download_master_env >/dev/null 2>&1 || true
+    find_nano >/dev/null 2>&1 && return 0
+
+    # ipkg can keep package metadata even when the binary is missing.
+    if "$PKG" list_installed 2>/dev/null | grep -q '^nano[[:space:]]*-'; then
+        warn "Пакет nano числится установленным, но бинарник не найден; переустанавливаю"
+        pkg_log "RUN: $PKG remove nano"
+        "$PKG" remove nano >> "$BASE/logs/packages.log" 2>&1 || true
+        pkg_log "RUN: $PKG install nano"
+        "$PKG" install nano >> "$BASE/logs/packages.log" 2>&1 || return 1
+        prepare_path
+        refresh_tools
+        restart_download_master_env >/dev/null 2>&1 || true
+    fi
+
+    find_nano >/dev/null 2>&1
+}
+
 find_sftp_server(){
     for p in \
         /opt/libexec/sftp-server \
@@ -285,7 +340,7 @@ prepare_packages(){
     [ -n "$full_unzip" ] || missing="$missing unzip"
     [ -x "$GZIP_BIN" ] || missing="$missing gzip"
     [ -n "$DOWNLOADER" ] || missing="$missing wget"
-    have nano || missing="$missing nano"
+    find_nano >/dev/null 2>&1 || missing="$missing nano"
 
     if [ -n "$missing" ]; then
         say "Не хватает совместимых обязательных пакетов:$missing"
@@ -317,9 +372,16 @@ prepare_packages(){
     [ -x "$GZIP_BIN" ] || { fail "gzip не найден после установки через Download Master"; return 1; }
     [ -n "$DOWNLOADER" ] || { fail "Не найден wget или curl"; return 1; }
 
-    # nano is a required GoshaCrash tool because `gc edit` depends on it.
-    # It is installed together with the other mandatory Download Master packages.
-    have nano || { fail "nano не найден после установки через Download Master"; return 1; }
+    # nano is required by gc edit. On old Optware, package metadata and
+    # the /opt runtime can get out of sync after a clean USB installation.
+    if ! find_nano >/dev/null 2>&1; then
+        repair_nano_package || true
+    fi
+    NANO_BIN="$(find_nano 2>/dev/null)"
+    [ -n "$NANO_BIN" ] || {
+        fail "nano не найден после установки/восстановления Download Master; см. $BASE/logs/packages.log"
+        return 1
+    }
     sftp_server="$(find_sftp_server 2>/dev/null)"
     if [ -n "$sftp_server" ]; then
         say "SFTP subsystem: $sftp_server"
@@ -875,7 +937,7 @@ write_nano_wrapper(){
 BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
 DM_ROOT=""
 [ -f "$BASE/state/platform.env" ] && . "$BASE/state/platform.env"
-for p in /opt/bin/nano /tmp/opt/bin/nano "$DM_ROOT/bin/nano"; do
+for p in /opt/bin/nano /tmp/opt/bin/nano "$DM_ROOT/bin/nano" "$DM_ROOT/sbin/nano"; do
   [ -x "$p" ] && exec "$p" "$@"
 done
 echo "nano не найден. Установи nano через пакетный менеджер Download Master" >&2
@@ -910,7 +972,7 @@ install_nvram_usb_hooks(){
     rewrite_nvram_hook script_usbmount '# GOSHACRASH_USBMOUNT_BEGIN' '# GOSHACRASH_USBMOUNT_END' \
       'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); [ -x "$BASE/goshacrash.sh" ] && /jffs/addons/goshacrash/start.sh &' || warn "Не удалось записать USB-mount hook"
     rewrite_nvram_hook script_usbumount '# GOSHACRASH_USBUMOUNT_BEGIN' '# GOSHACRASH_USBUMOUNT_END' \
-      'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" stop >/dev/null 2>&1' || warn "Не удалось записать USB-unmount hook"
+      'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" service-stop >/dev/null 2>&1' || warn "Не удалось записать USB-unmount hook"
     [ "$(nvram_get jffs2_scripts)" = 1 ] || nvram_set jffs2_scripts 1 || true
     nvram_commit || true
     case "$(nvram_get script_usbmount)" in
@@ -977,7 +1039,7 @@ HOOK
 #!/bin/sh
 case "$1" in
   start) /jffs/addons/goshacrash/start.sh & ;;
-  stop) /jffs/scripts/gc stop ;;
+  stop) BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"; [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" service-stop ;;
   restart) /jffs/scripts/gc restart ;;
   firewall-start|firewall-restart) /jffs/addons/goshacrash/firewall.sh & ;;
 esac
@@ -991,7 +1053,7 @@ INIT
 #!/bin/sh
 case "$1" in
   start) /jffs/addons/goshacrash/start.sh & ;;
-  stop) BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"; [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" stop ;;
+  stop) BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"; [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" service-stop ;;
   restart) BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"; [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" restart ;;
   firewall-start|firewall-restart) /jffs/addons/goshacrash/firewall.sh & ;;
 esac
