@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.8.8"
+INSTALLER_VERSION="3.8.9"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -28,6 +28,24 @@ LOCK_HELD="0"
 
 PATH="/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 export PATH
+
+# Old stock ASUSWRT can ship BusyBox applets without /bin/test and /bin/[ links.
+# Bootstrap private wrappers before the installer executes its first condition.
+GC_BOOTSTRAP_BIN="/tmp/goshacrash-bootstrap"
+mkdir -p "$GC_BOOTSTRAP_BIN" 2>/dev/null
+cat > "$GC_BOOTSTRAP_BIN/test" <<'GC_TEST'
+#!/bin/sh
+exec /bin/busybox test "$@"
+GC_TEST
+cat > "$GC_BOOTSTRAP_BIN/[" <<'GC_BRACKET'
+#!/bin/sh
+exec /bin/busybox '[' "$@"
+GC_BRACKET
+chmod 755 "$GC_BOOTSTRAP_BIN/test" "$GC_BOOTSTRAP_BIN/[" 2>/dev/null
+PATH="$GC_BOOTSTRAP_BIN:$PATH"
+export PATH
+hash -r 2>/dev/null || true
+
 
 PLATFORM=""
 LEGACY="0"
@@ -1086,6 +1104,16 @@ WRAP
     chmod 755 "$dst"
 }
 
+write_test_wrapper(){
+    target="$1"
+    mkdir -p "$(dirname "$target")" || return 1
+    cat > "$target" <<'WRAP'
+#!/bin/sh
+exec /bin/busybox test "$@"
+WRAP
+    chmod 755 "$target" || return 1
+}
+
 write_bracket_wrapper(){
     target="$1"
     mkdir -p "$(dirname "$target")" || return 1
@@ -1324,6 +1352,7 @@ HOOK
     chmod 755 /jffs/scripts/usb-umount-script || return 1
 
     rm -f /jffs/scripts/gc "$DM_ROOT/bin/gc" /opt/bin/gc 2>/dev/null || true
+    write_test_wrapper /jffs/scripts/test || return 1
     write_bracket_wrapper /jffs/scripts/'[' || return 1
     write_command_wrapper /jffs/scripts/gc
     write_nano_wrapper /jffs/scripts/nano
@@ -1338,30 +1367,42 @@ HOOK
 }
 
 verify_shell_compat(){
-    wrapper="/jffs/scripts/["
     busybox="/bin/busybox"
+    test_wrapper="/jffs/scripts/test"
+    bracket_wrapper="/jffs/scripts/["
 
-    test -x "$busybox" || {
-        fail "Shell compatibility: /bin/busybox не найден"
-        return 1
-    }
-    test -x "$wrapper" || {
-        fail "Shell compatibility: wrapper $wrapper не создан"
-        ls -la /jffs/scripts >> "$INSTALL_LOG" 2>&1 || true
+    "$busybox" test -x "$busybox" >/dev/null 2>&1 || {
+        fail "Shell compatibility: /bin/busybox недоступен"
         return 1
     }
 
+    "$busybox" test -x "$test_wrapper" >/dev/null 2>&1 || {
+        fail "Shell compatibility: $test_wrapper не создан"
+        return 1
+    }
+    "$busybox" test -x "$bracket_wrapper" >/dev/null 2>&1 || {
+        fail "Shell compatibility: $bracket_wrapper не создан"
+        return 1
+    }
+
+    "$busybox" test -n "goshacrash" >/dev/null 2>&1 || {
+        fail "Shell compatibility: BusyBox test applet не работает"
+        return 1
+    }
     "$busybox" '[' -n "goshacrash" ']' >/dev/null 2>&1 || {
-        fail "Shell compatibility: BusyBox applet [ не работает"
+        fail "Shell compatibility: BusyBox [ applet не работает"
         return 1
     }
-    "$wrapper" -n "goshacrash" ']' >/dev/null 2>&1 || {
-        fail "Shell compatibility: $wrapper не работает"
+    "$test_wrapper" -n "goshacrash" >/dev/null 2>&1 || {
+        fail "Shell compatibility: $test_wrapper не работает"
+        return 1
+    }
+    "$bracket_wrapper" -n "goshacrash" ']' >/dev/null 2>&1 || {
+        fail "Shell compatibility: $bracket_wrapper не работает"
         return 1
     }
 
-    say "Shell compatibility: OK ($wrapper -> /bin/busybox [)"
-    ls -l "$wrapper" >> "$INSTALL_LOG" 2>&1 || true
+    say "Shell compatibility: test + [ OK"
     return 0
 }
 

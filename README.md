@@ -1,4 +1,4 @@
-# GoshaCrash 3.8.8
+# GoshaCrash 3.8.9
 
 Здесь нет описания shell-функций. Ниже — команды, которые можно **буквально вставлять в SSH**.
 
@@ -634,3 +634,33 @@ ls -l /tmp/mnt/SANDISK/asusware.arm/libexec/sftp-server
 ```
 
 Переустановка пакета выполняется только если его реальный файл на USB отсутствует.
+
+
+## 3.8.9 — BusyBox `test` bootstrap
+
+На части старых stock ASUSWRT отсутствуют не только `/bin/[`, но и команда
+`test`, хотя оба applet присутствуют внутри `/bin/busybox`.
+
+Installer теперь до первой условной проверки создаёт временные команды:
+
+```text
+/tmp/goshacrash-bootstrap/test
+/tmp/goshacrash-bootstrap/[
+```
+
+Они напрямую вызывают:
+
+```sh
+/bin/busybox test "$@"
+/bin/busybox '[' "$@"
+```
+
+После установки постоянные wrappers находятся в:
+
+```text
+/jffs/scripts/test
+/jffs/scripts/[
+```
+
+Это происходит до установки и проверки Optware, поэтому `nano`, `unzip` и SFTP
+больше не зависят от отсутствующих symlink-команд stock ASUSWRT.

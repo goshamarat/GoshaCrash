@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.8.8"
-BUILD_ID="2026-08-19-persistent-optware-r1"
+VERSION="3.8.9"
+BUILD_ID="2026-08-19-busybox-test-bootstrap-r1"
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.
@@ -15,11 +15,15 @@ export PATH
 # Do this unconditionally: it is tiny and /tmp is recreated on every boot.
 GC_COMPAT_BIN="/tmp/goshacrash-compat"
 mkdir -p "$GC_COMPAT_BIN" 2>/dev/null
+cat > "$GC_COMPAT_BIN/test" <<'GC_TEST'
+#!/bin/sh
+exec /bin/busybox test "$@"
+GC_TEST
 cat > "$GC_COMPAT_BIN/[" <<'GC_BRACKET'
 #!/bin/sh
 exec /bin/busybox '[' "$@"
 GC_BRACKET
-chmod 755 "$GC_COMPAT_BIN/[" 2>/dev/null
+chmod 755 "$GC_COMPAT_BIN/test" "$GC_COMPAT_BIN/[" 2>/dev/null
 PATH="$GC_COMPAT_BIN:$PATH"
 export PATH
 hash -r 2>/dev/null || true
