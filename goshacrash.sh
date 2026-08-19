@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.9.0"
-BUILD_ID="2026-08-19-optware-abi-stable-r1"
+VERSION="3.10.0"
+BUILD_ID="2026-08-19-fat-optware-overlay-r1"
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.
@@ -259,36 +259,75 @@ runtime_first_versioned(){
     return 1
 }
 
-repair_optware_abi_runtime(){
+OPTWARE_OVERLAY="/tmp/goshacrash-opt"
+OPTWARE_OVERLAY_LIB="$OPTWARE_OVERLAY/lib"
+
+build_optware_overlay_runtime(){
     test -n "$DM_ROOT" && test -d "$DM_ROOT/lib" || return 1
+    rm -rf "$OPTWARE_OVERLAY" 2>/dev/null || true
+    mkdir -p "$OPTWARE_OVERLAY_LIB" || return 1
 
-    if test ! -f "$DM_ROOT/lib/libipkg.so.0"; then
-        src="$(runtime_first_versioned "$DM_ROOT/lib/libipkg.so.0.*")"
-        test -n "$src" && runtime_copy_alias "$src" "$DM_ROOT/lib/libipkg.so.0"
-    fi
-
-    if test ! -f "$DM_ROOT/lib/libc.so.0"; then
-        src="$(runtime_first_versioned "$DM_ROOT/lib/libuClibc-*.so")"
-        test -n "$src" && runtime_copy_alias "$src" "$DM_ROOT/lib/libc.so.0"
-    fi
-
-    if test ! -f "$DM_ROOT/lib/ld-uClibc.so.0"; then
-        src="$(runtime_first_versioned "$DM_ROOT/lib/ld-uClibc-*.so")"
-        test -n "$src" && runtime_copy_alias "$src" "$DM_ROOT/lib/ld-uClibc.so.0"
-    fi
-
-    for base in libcrypt libdl libm libnsl libpthread libresolv librt libutil; do
-        dst="$DM_ROOT/lib/$base.so.0"
-        test -f "$dst" && continue
-        src="$(runtime_first_versioned "$DM_ROOT/lib/$base-*.so")"
-        test -n "$src" && runtime_copy_alias "$src" "$dst"
+    for src in "$DM_ROOT"/lib/lib*.so.[0-9]*.[0-9]*; do
+        test -f "$src" || continue
+        base="${src##*/}"
+        prefix="${base%%.so.*}"
+        ver="${base#*.so.}"
+        major="${ver%%.*}"
+        case "$major" in ''|*[!0-9]*) continue ;; esac
+        ln -sf "$src" "$OPTWARE_OVERLAY_LIB/$prefix.so.$major" 2>/dev/null || true
     done
 
-    if test ! -f "$DM_ROOT/lib/libstdc++.so.6"; then
-        src="$(runtime_first_versioned "$DM_ROOT/lib/libstdc++.so.6.*")"
-        test -n "$src" && runtime_copy_alias "$src" "$DM_ROOT/lib/libstdc++.so.6"
-    fi
+    for src in "$DM_ROOT"/lib/libuClibc-*.so; do
+        test -f "$src" && ln -sf "$src" "$OPTWARE_OVERLAY_LIB/libc.so.0" 2>/dev/null
+    done
+    for src in "$DM_ROOT"/lib/ld-uClibc-*.so; do
+        test -f "$src" && ln -sf "$src" "$OPTWARE_OVERLAY_LIB/ld-uClibc.so.0" 2>/dev/null
+    done
+    for base in libcrypt libdl libm libnsl libpthread libresolv librt libutil; do
+        for src in "$DM_ROOT"/lib/"$base"-*.so; do
+            test -f "$src" && {
+                ln -sf "$src" "$OPTWARE_OVERLAY_LIB/$base.so.0" 2>/dev/null
+                break
+            }
+        done
+    done
+    for src in "$DM_ROOT"/lib/lib*.so.[0-9]; do
+        test -f "$src" || continue
+        ln -sf "$src" "$OPTWARE_OVERLAY_LIB/${src##*/}" 2>/dev/null || true
+    done
     return 0
+}
+
+optware_env_runtime(){
+    build_optware_overlay_runtime || return 1
+    LD_LIBRARY_PATH="$OPTWARE_OVERLAY_LIB:$DM_ROOT/lib:/lib:/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_LIBRARY_PATH
+}
+
+repair_generic_sonames_runtime(){
+    test -n "$DM_ROOT" && test -d "$DM_ROOT/lib" || return 1
+
+    for src in "$DM_ROOT"/lib/lib*.so.[0-9]*.[0-9]*; do
+        test -f "$src" || continue
+
+        base="${src##*/}"
+        prefix="${base%%.so.*}"
+        ver="${base#*.so.}"
+        major="${ver%%.*}"
+
+        case "$major" in
+            ''|*[!0-9]*) continue ;;
+        esac
+
+        dst="$DM_ROOT/lib/$prefix.so.$major"
+        test -f "$dst" && continue
+        runtime_copy_alias "$src" "$dst" || return 1
+    done
+    return 0
+}
+
+repair_optware_abi_runtime(){
+    build_optware_overlay_runtime
 }
 
 repair_opt(){
@@ -309,6 +348,7 @@ repair_opt(){
     fi
 
     repair_optware_abi_runtime >/dev/null 2>&1 || true
+    optware_env_runtime >/dev/null 2>&1 || true
     refresh_path
     return 0
 }
@@ -1045,15 +1085,14 @@ backup_config(){
 
 find_editor(){
     repair_opt >/dev/null 2>&1 || true
+    optware_env_runtime >/dev/null 2>&1 || true
     refresh_path
 
-    test -n "$DM_ROOT" && test -x "$DM_ROOT/bin/nano" && {
-        printf '%s\n' "$DM_ROOT/bin/nano"
+    for e in "$DM_ROOT/bin/nano" /opt/bin/nano /tmp/opt/bin/nano; do
+        test -x "$e" || continue
+        "$e" --version >/dev/null 2>&1 || continue
+        printf '%s\n' "$e"
         return 0
-    }
-
-    for e in /opt/bin/nano /tmp/opt/bin/nano; do
-        test -x "$e" && { printf '%s\n' "$e"; return 0; }
     done
     return 1
 }
@@ -1623,27 +1662,22 @@ sftp_status(){
 }
 
 packages_repair(){
-    repair_opt || { fail "Не удалось восстановить /opt"; return 1; }
-    find_pkg || { fail "ipkg/opkg не найден"; return 1; }
+    repair_opt || { fail "Не удалось восстановить /tmp/opt"; return 1; }
+    optware_env_runtime || { fail "Не удалось построить Optware RAM overlay"; return 1; }
 
-    repair_optware_abi_runtime || {
-        fail "Не удалось восстановить ABI Optware"
-        return 1
-    }
-
-    "$PKG" list_installed >/dev/null 2>&1 || {
-        fail "ipkg не запускается даже после ABI repair"
-        return 1
-    }
-
-    echo "Optware runtime: OK"
-    test -x "$DM_ROOT/bin/nano" && echo "nano: OK" || echo "nano: MISSING"
-    if test -x "$DM_ROOT/bin/unzip" || test -x "$DM_ROOT/bin/unzip-unzip"; then
-        echo "unzip: OK"
+    echo "Optware overlay: $OPTWARE_OVERLAY_LIB"
+    if test -n "$PKG" || find_pkg; then
+        "$PKG" list_installed >/dev/null 2>&1 && echo "ipkg: OK" || echo "ipkg: BROKEN"
     else
-        echo "unzip: MISSING"
+        echo "ipkg: MISSING"
     fi
-    test -x "$DM_ROOT/libexec/sftp-server" && echo "sftp-server: OK" || echo "sftp-server: MISSING"
+
+    if test -x "$DM_ROOT/bin/nano" && "$DM_ROOT/bin/nano" --version >/dev/null 2>&1; then
+        echo "nano: OK"
+    else
+        echo "nano: BROKEN/MISSING"
+    fi
+    test -x "$DM_ROOT/libexec/sftp-server" && echo "sftp-server payload: OK" || echo "sftp-server payload: MISSING"
     return 0
 }
 
@@ -1662,6 +1696,7 @@ doctor(){
         test -f "$DM_ROOT/lib/libipkg.so.0" && echo "  libipkg.so.0: OK" || echo "  libipkg.so.0: MISSING"
         test -f "$DM_ROOT/lib/libc.so.0" && echo "  libc.so.0: OK" || echo "  libc.so.0: MISSING"
         test -f "$DM_ROOT/lib/ld-uClibc.so.0" && echo "  ld-uClibc.so.0: OK" || echo "  ld-uClibc.so.0: MISSING"
+        test -f "$DM_ROOT/lib/libncurses.so.5" && echo "  libncurses.so.5: OK" || echo "  libncurses.so.5: MISSING"
     fi
     if test -n "$DM_ROOT"; then
         test -x "$DM_ROOT/bin/nano" && echo "  USB nano: OK" || echo "  USB nano: MISSING"

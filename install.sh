@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.9.0"
+INSTALLER_VERSION="3.10.0"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -274,75 +274,109 @@ find_first_versioned(){
     return 1
 }
 
-repair_optware_abi(){
+OPTWARE_OVERLAY="/tmp/goshacrash-opt"
+OPTWARE_OVERLAY_LIB="$OPTWARE_OVERLAY/lib"
+
+build_optware_overlay(){
     test -n "$DM_ROOT" && test -d "$DM_ROOT/lib" || return 1
 
-    # TFAT does not reliably preserve the symlink layout expected by old Optware.
-    # Recreate required SONAME aliases as regular files on persistent USB storage.
-    #
-    # libipkg
-    if test ! -f "$DM_ROOT/lib/libipkg.so.0"; then
-        src="$(find_first_versioned "$DM_ROOT/lib/libipkg.so.0.*")"
-        test -n "$src" && {
-            say "Optware ABI: восстанавливаю libipkg.so.0"
-            copy_alias_if_missing "$src" "$DM_ROOT/lib/libipkg.so.0" || return 1
-        }
-    fi
+    rm -rf "$OPTWARE_OVERLAY" 2>/dev/null || true
+    mkdir -p "$OPTWARE_OVERLAY_LIB" || return 1
 
-    # uClibc loader/runtime aliases. The exact version suffix differs by feed.
-    if test ! -f "$DM_ROOT/lib/libc.so.0"; then
-        src="$(find_first_versioned "$DM_ROOT/lib/libuClibc-*.so")"
-        test -n "$src" && {
-            say "Optware ABI: восстанавливаю libc.so.0"
-            copy_alias_if_missing "$src" "$DM_ROOT/lib/libc.so.0" || return 1
-        }
-    fi
-
-    if test ! -f "$DM_ROOT/lib/ld-uClibc.so.0"; then
-        src="$(find_first_versioned "$DM_ROOT/lib/ld-uClibc-*.so")"
-        test -n "$src" && {
-            say "Optware ABI: восстанавливаю ld-uClibc.so.0"
-            copy_alias_if_missing "$src" "$DM_ROOT/lib/ld-uClibc.so.0" || return 1
-        }
-    fi
-
-    for base in libcrypt libdl libm libnsl libpthread libresolv librt libutil; do
-        dst="$DM_ROOT/lib/$base.so.0"
-        test -f "$dst" && continue
-        src="$(find_first_versioned "$DM_ROOT/lib/$base-*.so")"
-        test -n "$src" || continue
-        say "Optware ABI: восстанавливаю $base.so.0"
-        copy_alias_if_missing "$src" "$dst" || return 1
+    # FAT/TFAT keeps the real versioned library files.  Recreate only the
+    # Unix SONAME links in tmpfs.  Nothing is installed/downloaded here.
+    for src in "$DM_ROOT"/lib/lib*.so.[0-9]*.[0-9]*; do
+        test -f "$src" || continue
+        base="${src##*/}"
+        prefix="${base%%.so.*}"
+        ver="${base#*.so.}"
+        major="${ver%%.*}"
+        case "$major" in ''|*[!0-9]*) continue ;; esac
+        ln -sf "$src" "$OPTWARE_OVERLAY_LIB/$prefix.so.$major" 2>/dev/null || true
     done
 
-    # libstdc++ SONAME alias if only a fully versioned file survived.
-    if test ! -f "$DM_ROOT/lib/libstdc++.so.6"; then
-        src="$(find_first_versioned "$DM_ROOT/lib/libstdc++.so.6.*")"
-        test -n "$src" && {
-            say "Optware ABI: восстанавливаю libstdc++.so.6"
-            copy_alias_if_missing "$src" "$DM_ROOT/lib/libstdc++.so.6" || return 1
-        }
-    fi
+    # uClibc has historical filenames that do not follow libfoo.so.X.Y.
+    for src in "$DM_ROOT"/lib/libuClibc-*.so; do
+        test -f "$src" && ln -sf "$src" "$OPTWARE_OVERLAY_LIB/libc.so.0" 2>/dev/null
+    done
+    for src in "$DM_ROOT"/lib/ld-uClibc-*.so; do
+        test -f "$src" && ln -sf "$src" "$OPTWARE_OVERLAY_LIB/ld-uClibc.so.0" 2>/dev/null
+    done
+    for base in libcrypt libdl libm libnsl libpthread libresolv librt libutil; do
+        for src in "$DM_ROOT"/lib/"$base"-*.so; do
+            test -f "$src" && {
+                ln -sf "$src" "$OPTWARE_OVERLAY_LIB/$base.so.0" 2>/dev/null
+                break
+            }
+        done
+    done
+
+    # If a required SONAME already exists physically on USB, expose it too.
+    for src in "$DM_ROOT"/lib/lib*.so.[0-9]; do
+        test -f "$src" || continue
+        ln -sf "$src" "$OPTWARE_OVERLAY_LIB/${src##*/}" 2>/dev/null || true
+    done
+    return 0
+}
+
+optware_env(){
+    build_optware_overlay || return 1
+    LD_LIBRARY_PATH="$OPTWARE_OVERLAY_LIB:$DM_ROOT/lib:/lib:/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export LD_LIBRARY_PATH
+    return 0
+}
+
+repair_generic_sonames(){
+    test -n "$DM_ROOT" && test -d "$DM_ROOT/lib" || return 1
+
+    # Recover major SONAME aliases lost on TFAT:
+    #   libncurses.so.5.7   -> libncurses.so.5
+    #   libstdc++.so.6.0.2  -> libstdc++.so.6
+    #   libipkg.so.0.0.0    -> libipkg.so.0
+    #
+    # Keep the original versioned file and copy only when the major alias
+    # is missing. Regular files are used deliberately instead of symlinks.
+    for src in "$DM_ROOT"/lib/lib*.so.[0-9]*.[0-9]*; do
+        test -f "$src" || continue
+
+        base="${src##*/}"
+        prefix="${base%%.so.*}"
+        ver="${base#*.so.}"
+        major="${ver%%.*}"
+
+        case "$major" in
+            ''|*[!0-9]*) continue ;;
+        esac
+
+        dst="$DM_ROOT/lib/$prefix.so.$major"
+        test -f "$dst" && continue
+
+        say "Optware ABI: ${base} -> ${prefix}.so.${major}"
+        copy_alias_if_missing "$src" "$dst" || return 1
+    done
 
     return 0
 }
 
+repair_optware_abi(){
+    test -n "$DM_ROOT" && test -d "$DM_ROOT/lib" || return 1
+    build_optware_overlay
+}
+
 verify_ipkg_runtime(){
     ensure_optware_link >/dev/null 2>&1 || return 1
-    repair_optware_abi || true
+    repair_optware_abi || return 1
     prepare_path
-
     test -n "$PKG" || find_pkg || return 1
 
-    # Do not pipe this command: we need the real ipkg return code.
+    optware_env || return 1
     "$PKG" list_installed >/dev/null 2>"$BASE/logs/ipkg-runtime.err"
     rc=$?
     if test "$rc" -eq 0; then
         rm -f "$BASE/logs/ipkg-runtime.err" 2>/dev/null || true
-        say "Optware runtime: ipkg OK"
+        say "Optware runtime: OK (RAM overlay)"
         return 0
     fi
-
     fail "Optware runtime повреждён; ipkg rc=$rc"
     cat "$BASE/logs/ipkg-runtime.err" >> "$BASE/logs/packages.log" 2>/dev/null || true
     return 1
@@ -386,6 +420,7 @@ pkg_install_one(){
     test -n "$PKG" || return 1
 
     verify_ipkg_runtime || return 1
+    optware_env || return 1
     pkg_progress "install $name (локальный индекс)"
     pkg_log "RUN: $PKG install $name"
 
@@ -412,6 +447,7 @@ pkg_reinstall_one(){
     test -n "$PKG" || return 1
 
     verify_ipkg_runtime || return 1
+    optware_env || return 1
 
     pkg_progress "remove $name"
     pkg_log "REINSTALL: $name"
@@ -484,17 +520,29 @@ restart_download_master_env(){
 
 repair_nano_package(){
     ensure_optware_link >/dev/null 2>&1 || true
-    find_nano >/dev/null 2>&1 && return 0
+    repair_optware_abi >/dev/null 2>&1 || true
+    prepare_path
+
+    if find_nano >/dev/null 2>&1; then
+        nano_bin="$(find_nano 2>/dev/null)"
+        "$nano_bin" --version >/dev/null 2>&1 && return 0
+        warn "nano существует, но не запускается; восстанавливаю Optware ABI"
+        repair_optware_abi || return 1
+        "$nano_bin" --version >/dev/null 2>&1 && return 0
+    fi
 
     if pkg_is_installed nano; then
-        warn "nano числится установленным, но бинарник на USB не найден; переустанавливаю"
+        warn "nano отсутствует/не запускается; переустанавливаю пакет"
         pkg_reinstall_one nano || return 1
     else
         pkg_install_one nano || return 1
     fi
 
+    repair_optware_abi || return 1
     prepare_path
-    find_nano >/dev/null 2>&1
+    nano_bin="$(find_nano 2>/dev/null)"
+    test -n "$nano_bin" || return 1
+    "$nano_bin" --version >/dev/null 2>&1
 }
 
 
@@ -655,8 +703,37 @@ install_optware_sftp(){
     return 0
 }
 
+detect_usb_fstype(){
+    usb_mount="${USB_ROOT:-$DM_ROOT}"
+    test -n "$usb_mount" || return 1
+    mount 2>/dev/null | awk -v p="$usb_mount" '
+        index(p,$3)==1 || index($3,p)==1 { print $5; exit }
+    '
+}
+
+check_usb_filesystem(){
+    USB_FSTYPE="$(detect_usb_fstype 2>/dev/null)"
+    case "$USB_FSTYPE" in
+        ext2|ext3|ext4)
+            say "USB filesystem: $USB_FSTYPE (Linux filesystem, рекомендовано)"
+            return 0
+            ;;
+        tfat|vfat|fat|fat32|msdos|exfat)
+            warn "USB filesystem: ${USB_FSTYPE:-unknown}. Для Download Master/Optware рекомендуется EXT3."
+            warn "FAT/TFAT может терять Unix symlink/SONAME layout; включён compatibility ABI repair."
+            return 0
+            ;;
+        *)
+            warn "USB filesystem не определена или не Linux: ${USB_FSTYPE:-unknown}"
+            warn "Для старого stock ASUSWRT + Download Master рекомендуется EXT3."
+            return 0
+            ;;
+    esac
+}
+
 prepare_packages(){
     prepare_path
+    check_usb_filesystem
     find_pkg || { fail "В Download Master не найден ipkg/opkg"; return 1; }
     say "Менеджер пакетов ASUS: $PKG"
 

@@ -1,4 +1,4 @@
-# GoshaCrash 3.9.0
+# GoshaCrash 3.9.2
 
 Здесь нет описания shell-функций. Ниже — команды, которые можно **буквально вставлять в SSH**.
 
@@ -804,4 +804,155 @@ ls -l "$DM/lib/libc.so.0"
 ls -l "$DM/lib/ld-uClibc.so.0"
 ls -l "$DM/bin/nano"
 ls -l "$DM/libexec/sftp-server"
+```
+
+
+## 3.9.1 — универсальное восстановление SONAME
+
+3.9.0 восстанавливал только заранее перечисленные библиотеки. Этого оказалось
+недостаточно: `nano` требует `libncurses.so.5`, а на TFAT мог сохраниться только
+versioned-файл, например:
+
+```text
+libncurses.so.5.7
+```
+
+3.9.1 проходит все библиотеки вида:
+
+```text
+lib*.so.X.Y...
+```
+
+и при отсутствии major SONAME создаёт обычную копию:
+
+```text
+libncurses.so.5.7  -> libncurses.so.5
+libstdc++.so.6.0.2 -> libstdc++.so.6
+libipkg.so.0.0.0   -> libipkg.so.0
+```
+
+Это делается и при установке, и после reboot.
+
+`nano` теперь считается исправным только если реально выполняется:
+
+```sh
+nano --version
+```
+
+а не просто если файл `/opt/bin/nano` существует.
+
+
+## USB-флешка: какой формат использовать
+
+Для GoshaCrash вместе со старым ASUS Download Master / Optware рекомендуется
+**EXT3**.
+
+Почему EXT3:
+
+- это Linux-файловая система с нормальной поддержкой Unix permissions и symbolic links;
+- старый Optware использует SONAME-ссылки библиотек (`libncurses.so.5`,
+  `libipkg.so.0` и другие);
+- на FAT/TFAT такие структуры могут сохраняться некорректно;
+- EXT3 консервативнее для старых stock ASUSWRT и старого ядра, чем выбор более
+  новой файловой системы только ради новизны.
+
+RT-AC68U официально поддерживает USB-файловые системы EXT2, EXT3 и EXT4.
+Для этого проекта рекомендуется именно **один раздел EXT3**.
+
+### Чистая установка
+
+1. Сохранить нужные файлы с флешки, особенно `goshacrash/config.yaml`.
+2. Удалить Download Master с флешки через ASUSWRT, если это необходимо перед форматированием.
+3. Отформатировать флешку на компьютере как **EXT3**, один основной раздел.
+4. Подключить флешку к роутеру.
+5. Проверить:
+
+```sh
+mount | grep '/tmp/mnt/'
+```
+
+Ожидается `type ext3`, а не `type tfat`.
+
+6. Через ASUSWRT установить Download Master на эту флешку.
+7. Запустить установщик GoshaCrash.
+8. Проверить:
+
+```sh
+gc doctor
+gc status
+nano --version
+gc edit
+```
+
+После перезагрузки:
+
+```sh
+mount | grep '/tmp/mnt/'
+gc status
+nano --version
+gc edit
+```
+
+### FAT/TFAT
+
+GoshaCrash не запрещает установку на FAT/TFAT, но выводит предупреждение и
+использует compatibility ABI repair. Для постоянной установки с Download Master
+это резервный режим, а не рекомендуемый вариант.
+
+
+# GoshaCrash 3.10.0 — FAT/TFAT + постоянный Optware
+
+Форматировать USB в EXT3 **не требуется**. FAT/TFAT поддерживается как основной
+вариант для stock ASUSWRT + Download Master.
+
+Пакеты `nano`, `unzip` и `openssh-sftp-server` устанавливаются через Optware
+**один раз** и физически остаются в `asusware.arm` на USB.
+
+Проблема FAT/TFAT состоит не в удалении пакетов, а в Unix SONAME symlink'ах
+динамических библиотек. Поэтому GoshaCrash больше не пытается копировать
+SONAME-файлы на FAT и не переустанавливает пакеты после reboot.
+
+После каждой загрузки выполняются только локальные операции:
+
+```text
+USB / asusware.arm
+        |
+        +--> восстановить /tmp/opt
+        |
+        +--> создать /tmp/goshacrash-opt/lib
+                |
+                +--> временные Unix symlink'и на библиотеки USB
+```
+
+Никакого `ipkg update`, скачивания или повторной установки пакетов на boot нет.
+
+Проверка:
+
+```sh
+gc packages-repair
+gc doctor
+nano --version
+gc edit
+```
+
+RAM overlay можно посмотреть:
+
+```sh
+ls -la /tmp/goshacrash-opt/lib
+```
+
+После reboot:
+
+```sh
+gc status
+gc packages-repair
+nano --version
+gc edit
+```
+
+Настоящие пакеты при этом продолжают храниться на USB:
+
+```sh
+ls -l /tmp/mnt/SANDISK/asusware.arm/bin/nano
+ls -l /tmp/mnt/SANDISK/asusware.arm/libexec/sftp-server
 ```
