@@ -1,4 +1,4 @@
-# GoshaCrash 3.8.1
+# GoshaCrash 3.8.2
 
 Здесь нет описания shell-функций. Ниже — команды, которые можно **буквально вставлять в SSH**.
 
@@ -411,3 +411,22 @@ gc autostart status
 gc sftp status
 gc help
 ```
+
+
+## Проверка internet probe
+
+Если GoshaCrash пишет, что интернета нет:
+
+```sh
+gc internet-probe
+```
+
+Ручная проверка:
+
+```sh
+ping -c 2 -W 2 1.1.1.1
+ping -c 2 -W 2 8.8.8.8
+route -n
+```
+
+В 3.8.2 исправлен legacy-баг: наличие старого Optware `ip` больше не может само по себе объявить WAN offline. Сначала выполняются реальные внешние probes.

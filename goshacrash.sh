@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.8.1"
-BUILD_ID="2026-08-19-terminal-guide-r1"
+VERSION="3.8.2"
+BUILD_ID="2026-08-19-wan-probe-fix-r1"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -557,15 +557,27 @@ manual_counter_get(){ n="$(cat "$1" 2>/dev/null)"; case "$n" in ''|*[!0-9]*) n=0
 counter_set(){ printf '%s\n' "$2" > "$1" 2>/dev/null || true; }
 set_wan_state(){ printf '%s\n' "$1" > "$WAN_STATE" 2>/dev/null || true; }
 internet_probe_once(){
-    main_default_route || return 1
+    # Do NOT reject the probe just because an old Optware `ip` cannot display
+    # the ASUS firmware default route. A successful external probe is the
+    # authoritative test of Internet connectivity.
+
     ping_bin="$(command -v ping 2>/dev/null)"
     if [ -n "$ping_bin" ]; then
-      for ip in $WAN_PROBE_IPS; do
-        "$ping_bin" -c 1 -W "$WAN_PROBE_TIMEOUT" "$ip" >/dev/null 2>&1 && return 0
-      done
+        for ip in $WAN_PROBE_IPS; do
+            "$ping_bin" -c 1 -W "$WAN_PROBE_TIMEOUT" "$ip" >/dev/null 2>&1 && return 0
+        done
     fi
+
+    # ICMP can be filtered upstream, so keep a HTTP fallback that does not
+    # require DNS.
     wget_bin="$(command -v wget 2>/dev/null)"
-    [ -n "$wget_bin" ] && "$wget_bin" -q -T "$WAN_PROBE_TIMEOUT" -O /dev/null http://1.1.1.1/cdn-cgi/trace >/dev/null 2>&1 && return 0
+    if [ -n "$wget_bin" ]; then
+        "$wget_bin" -q -T "$WAN_PROBE_TIMEOUT" -O /dev/null \
+            http://1.1.1.1/cdn-cgi/trace >/dev/null 2>&1 && return 0
+    fi
+
+    # WAN NVRAM/default-route state is diagnostic only. It must not override
+    # failed external probes, otherwise a dead upstream link could look online.
     return 1
 }
 wan_mark_offline(){ touch "$WAN_OFFLINE" 2>/dev/null || true; counter_set "$WAN_OK_COUNT" 0; set_wan_state offline; }
@@ -784,7 +796,22 @@ restart(){
 
 main_default_route(){
     refresh_path
-    if [ -n "$IP_BIN" ]; then "$IP_BIN" route show default 2>/dev/null | grep -q '^default '; else route -n 2>/dev/null | awk '$1=="0.0.0.0" {ok=1} END{exit !ok}'; fi
+
+    # On old ASUSWRT/Optware an installed `ip` binary can exist but fail to
+    # report the firmware's main routing table correctly. The kernel route
+    # table shown by BusyBox `route -n` is the reliable source on legacy.
+    if command -v route >/dev/null 2>&1; then
+        route -n 2>/dev/null | awk '
+          $1=="0.0.0.0" && $4 ~ /G/ {ok=1}
+          END {exit !ok}
+        ' && return 0
+    fi
+
+    if [ -n "$IP_BIN" ]; then
+        "$IP_BIN" route show default 2>/dev/null | grep -q '^default ' && return 0
+    fi
+
+    return 1
 }
 boot(){
     ensure_dirs || return 1; load_platform || return 1
@@ -1427,6 +1454,9 @@ GoshaCrash 3.8.1 — что буквально вводить в SSH
 ПОЛНАЯ ДИАГНОСТИКА
   gc doctor
 
+ПРОВЕРИТЬ ТОЛЬКО INTERNET PROBE
+  gc internet-probe
+
 ИЗМЕНИТЬ CONFIG
   gc edit
 
@@ -1667,6 +1697,15 @@ case "${1:-menu}" in
             status) sftp_status;;
             *) echo 'Использование: gc sftp status'; exit 1;;
         esac
+        ;;
+    internet-probe)
+        if internet_probe_once; then
+            echo "Internet probe: OK"
+            exit 0
+        else
+            echo "Internet probe: FAIL"
+            exit 1
+        fi
         ;;
     doctor) doctor;;
     routing)
