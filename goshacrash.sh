@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.8.11"
-BUILD_ID="2026-08-19-fast-optware-r1"
+VERSION="3.8.12"
+BUILD_ID="2026-08-19-fast-optware-clean-r2"
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.

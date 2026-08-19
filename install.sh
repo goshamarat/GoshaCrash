@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.8.11"
+INSTALLER_VERSION="3.8.12"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -292,12 +292,12 @@ pkg_install_one(){
     test -n "$PKG" || return 1
 
     ensure_optware_link >/dev/null 2>&1 || true
-    pkg_progress "install $name (текущий индекс)"
+    pkg_progress "install $name (локальный индекс)"
     pkg_log "RUN: $PKG install $name"
 
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && return 0
 
-    warn "Не удалось установить $name с текущим индексом"
+    warn "install $name не удался с текущим индексом"
     pkg_update_index_once || true
     pkg_progress "повторный install $name"
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
@@ -316,10 +316,10 @@ pkg_reinstall_one(){
     "$PKG" remove "$name" >> "$BASE/logs/packages.log" 2>&1 || true
 
     ensure_optware_link >/dev/null 2>&1 || true
-    pkg_progress "install $name (текущий индекс)"
+    pkg_progress "install $name (локальный индекс)"
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && return 0
 
-    warn "Не удалось переустановить $name с текущим индексом"
+    warn "reinstall $name не удался с текущим индексом"
     pkg_update_index_once || true
     pkg_progress "повторный install $name"
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
@@ -375,15 +375,14 @@ restart_download_master_env(){
 repair_nano_package(){
     ensure_optware_link >/dev/null 2>&1 || true
     find_nano >/dev/null 2>&1 && return 0
-    restart_download_master_env >/dev/null 2>&1 || true
-    ensure_optware_link >/dev/null 2>&1 || true
-    find_nano >/dev/null 2>&1 && return 0
+
     if pkg_is_installed nano; then
-        warn "nano числится установленным, но бинарник не найден; переустанавливаю"
+        warn "nano числится установленным, но бинарник на USB не найден; переустанавливаю"
         pkg_reinstall_one nano || return 1
     else
         pkg_install_one nano || return 1
     fi
+
     prepare_path
     find_nano >/dev/null 2>&1
 }
@@ -508,11 +507,7 @@ install_optware_sftp(){
 
     pkg_line="$(optware_sftp_package_line)"
     if test -z "$pkg_line"; then
-        pkg_update_index >/dev/null 2>&1 || true
-        pkg_line="$(optware_sftp_package_line)"
-    fi
-    if test -z "$pkg_line"; then
-        warn "openssh-sftp-server отсутствует в текущем Optware feed; продолжаю без SFTP"
+        warn "openssh-sftp-server отсутствует в локальном индексе Optware; пропускаю SFTP без ipkg update"
         return 0
     fi
 
@@ -520,9 +515,9 @@ install_optware_sftp(){
     say "Optware SFTP: openssh-sftp-server ${pkg_ver:-unknown}"
 
     if pkg_is_installed openssh-sftp-server; then
-        warn "openssh-sftp-server числится установленным, но /opt/libexec/sftp-server отсутствует; переустанавливаю"
+        warn "openssh-sftp-server числится установленным, но payload отсутствует; переустанавливаю"
         pkg_reinstall_one openssh-sftp-server || {
-            warn "SFTP не удалось переустановить; VPN продолжит работать"
+            warn "SFTP не удалось восстановить; VPN продолжит работать"
             return 0
         }
     else
@@ -535,6 +530,7 @@ install_optware_sftp(){
     ensure_optware_link >/dev/null 2>&1 || true
     prepare_path
     sftp_bin="$(find_sftp_server 2>/dev/null)"
+
     if test -n "$sftp_bin"; then
         mkdir -p "$BASE/state" 2>/dev/null || true
         printf '%s\n' "$sftp_bin" > "$BASE/state/sftp-server.path" 2>/dev/null || true
@@ -543,13 +539,6 @@ install_optware_sftp(){
     else
         warn "openssh-sftp-server зарегистрирован, но payload всё ещё отсутствует"
     fi
-
-    # A successful ipkg registration is not enough: require the file on USB.
-    ensure_persistent_optware_link >/dev/null 2>&1 || true
-    if ! test -x "$DM_ROOT/libexec/sftp-server"; then
-        install_or_repair_persistent_package openssh-sftp-server libexec/sftp-server || true
-    fi
-
     return 0
 }
 
@@ -557,31 +546,35 @@ prepare_packages(){
     prepare_path
     find_pkg || { fail "В Download Master не найден ipkg/opkg"; return 1; }
     say "Менеджер пакетов ASUS: $PKG"
+
     ensure_optware_link >/dev/null 2>&1 || true
     refresh_tools
     normalize_legacy_optware_unzip
 
-    need_index=0
-    find_full_unzip >/dev/null 2>&1 || need_index=1
-    find_nano >/dev/null 2>&1 || need_index=1
-    test -x "$GZIP_BIN" || need_index=1
-    test -n "$DOWNLOADER" || need_index=1
-    test "$need_index" = 1 && pkg_update_index || true
-
     if ! find_full_unzip >/dev/null 2>&1; then
-        say "Готовлю Info-ZIP"; say "Проверяю физический payload unzip на USB"
+        say "Готовлю Info-ZIP"
+        say "Проверяю unzip на USB: $DM_ROOT/bin/unzip*"
         repair_unzip_package || { fail "Не удалось получить полноценный unzip"; return 1; }
+    else
+        say "Info-ZIP уже есть на USB — пропускаю"
     fi
+
     if ! find_nano >/dev/null 2>&1; then
-        say "Готовлю nano"; say "Проверяю физический payload nano на USB"
+        say "Готовлю nano"
+        say "Проверяю nano на USB: $DM_ROOT/bin/nano"
         repair_nano_package || { fail "Не удалось получить nano"; return 1; }
+    else
+        say "nano уже есть на USB — пропускаю"
     fi
+
     refresh_tools
+
     if test ! -x "$GZIP_BIN"; then
         say "Устанавливаю gzip"
         pkg_install_one gzip || { fail "Не удалось установить gzip"; return 1; }
         refresh_tools
     fi
+
     if test -z "$DOWNLOADER"; then
         say "Устанавливаю wget"
         pkg_install_one wget || { fail "Не удалось установить wget/curl"; return 1; }
@@ -590,6 +583,7 @@ prepare_packages(){
 
     UNZIP_BIN="$(find_full_unzip 2>/dev/null)"
     NANO_BIN="$(find_nano 2>/dev/null)"
+
     test -n "$UNZIP_BIN" || { fail "Полноценный unzip не найден"; return 1; }
     test -n "$NANO_BIN" || { fail "nano не найден"; return 1; }
     test -x "$GZIP_BIN" || { fail "gzip не найден"; return 1; }

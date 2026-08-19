@@ -1,4 +1,4 @@
-# GoshaCrash 3.8.11
+# GoshaCrash 3.8.12
 
 Здесь нет описания shell-функций. Ниже — команды, которые можно **буквально вставлять в SSH**.
 
@@ -726,3 +726,23 @@ install не удался
 /tmp/mnt/SANDISK/asusware.arm/bin/ipkg update
 /tmp/mnt/SANDISK/asusware.arm/bin/ipkg upgrade
 ```
+
+
+## 3.8.12 — убраны лишние задержки Optware
+
+Удалены два старых медленных шага:
+
+```text
+restart_download_master_env
+ранний ipkg update перед проверкой пакетов
+```
+
+Теперь:
+
+```text
+файл есть на USB -> мгновенно пропустить
+файла нет -> install/reinstall по локальному индексу
+только реальный failure -> один ipkg update -> повторить
+```
+
+SFTP тоже больше не инициирует `ipkg update` только ради поиска пакета в feed.
