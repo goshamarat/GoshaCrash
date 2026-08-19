@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.8.2"
-BUILD_ID="2026-08-19-wan-probe-fix-r1"
+VERSION="3.8.3"
+BUILD_ID="2026-08-19-stable-r3"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -127,13 +127,20 @@ find_dm_root(){
 
 refresh_path(){
     find_dm_root >/dev/null 2>&1 || true
-    PATH="$BASE/bin:$DM_ROOT/bin:$DM_ROOT/sbin:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:/jffs/scripts:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+    # Build PATH from scratch. Do not inherit a broken/empty shell PATH.
+    PATH="/jffs/scripts"
+    [ -n "$DM_ROOT" ] && PATH="$DM_ROOT/bin:$DM_ROOT/sbin:$PATH"
+    PATH="/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"
+    PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
     export PATH
     hash -r 2>/dev/null || true
+
     IP_BIN=""
     for p in /opt/sbin/ip /opt/bin/ip /tmp/opt/sbin/ip /tmp/opt/bin/ip /usr/sbin/ip /sbin/ip /usr/bin/ip /bin/ip; do
         [ -x "$p" ] && { IP_BIN="$p"; break; }
     done
+
     IPTABLES=""
     for p in /usr/sbin/iptables /sbin/iptables /usr/bin/iptables /bin/iptables; do
         [ -x "$p" ] && { IPTABLES="$p"; break; }
@@ -553,31 +560,55 @@ build_forward(){
     ipt -t filter -I FORWARD 1 -j "$FORWARD_CHAIN" || return 1
 }
 
-manual_counter_get(){ n="$(cat "$1" 2>/dev/null)"; case "$n" in ''|*[!0-9]*) n=0;; esac; printf '%s\n' "$n"; }
+wan_nvram_up(){
+    state="$(nvram_get wan0_state_t)"
+    aux="$(nvram_get wan0_auxstate_t)"
+    ip="$(nvram_get wan0_ipaddr)"
+    gateway="$(nvram_get wan0_gateway)"
+
+    [ "$state" = "2" ] || return 1
+    [ "$aux" = "0" ] || return 1
+    [ -n "$ip" ] && [ "$ip" != "0.0.0.0" ] || return 1
+    [ -n "$gateway" ] && [ "$gateway" != "0.0.0.0" ] || return 1
+    main_default_route
+}
+
+counter_get(){ n="$(cat "$1" 2>/dev/null)"; case "$n" in ''|*[!0-9]*) n=0;; esac; printf '%s\n' "$n"; }
 counter_set(){ printf '%s\n' "$2" > "$1" 2>/dev/null || true; }
 set_wan_state(){ printf '%s\n' "$1" > "$WAN_STATE" 2>/dev/null || true; }
 internet_probe_once(){
-    # Do NOT reject the probe just because an old Optware `ip` cannot display
-    # the ASUS firmware default route. A successful external probe is the
-    # authoritative test of Internet connectivity.
+    # WAN probing must never depend on Optware PATH.
+    ping_bin=""
+    for p in /bin/ping /usr/bin/ping /sbin/ping /usr/sbin/ping; do
+        [ -x "$p" ] && { ping_bin="$p"; break; }
+    done
 
-    ping_bin="$(command -v ping 2>/dev/null)"
     if [ -n "$ping_bin" ]; then
         for ip in $WAN_PROBE_IPS; do
             "$ping_bin" -c 1 -W "$WAN_PROBE_TIMEOUT" "$ip" >/dev/null 2>&1 && return 0
         done
     fi
 
-    # ICMP can be filtered upstream, so keep a HTTP fallback that does not
-    # require DNS.
-    wget_bin="$(command -v wget 2>/dev/null)"
+    # Some providers block ICMP. Try a direct HTTP request without DNS.
+    wget_bin=""
+    for p in /usr/sbin/wget /usr/bin/wget /bin/wget; do
+        [ -x "$p" ] && { wget_bin="$p"; break; }
+    done
     if [ -n "$wget_bin" ]; then
         "$wget_bin" -q -T "$WAN_PROBE_TIMEOUT" -O /dev/null \
             http://1.1.1.1/cdn-cgi/trace >/dev/null 2>&1 && return 0
     fi
 
-    # WAN NVRAM/default-route state is diagnostic only. It must not override
-    # failed external probes, otherwise a dead upstream link could look online.
+    curl_bin=""
+    for p in /usr/sbin/curl /usr/bin/curl /bin/curl; do
+        [ -x "$p" ] && { curl_bin="$p"; break; }
+    done
+    if [ -n "$curl_bin" ]; then
+        "$curl_bin" -fsS --connect-timeout "$WAN_PROBE_TIMEOUT" \
+            --max-time "$WAN_PROBE_TIMEOUT" \
+            http://1.1.1.1/cdn-cgi/trace >/dev/null 2>&1 && return 0
+    fi
+
     return 1
 }
 wan_mark_offline(){ touch "$WAN_OFFLINE" 2>/dev/null || true; counter_set "$WAN_OK_COUNT" 0; set_wan_state offline; }
@@ -590,22 +621,36 @@ runtime_health_ok(){
 }
 watchdog_connectivity_step(){
     if internet_probe_once; then
-      counter_set "$WAN_FAIL_COUNT" 0
-      n="$(counter_get "$WAN_OK_COUNT")"; n=$((n+1)); counter_set "$WAN_OK_COUNT" "$n"
-      if [ -f "$WAN_OFFLINE" ]; then
-        [ "$n" -ge "$WAN_RECOVER_LIMIT" ] || return 1
-        wan_mark_online
-      else
-        set_wan_state online
-      fi
-      return 0
+        counter_set "$WAN_FAIL_COUNT" 0
+
+        n="$(counter_get "$WAN_OK_COUNT")"
+        n=$((n + 1))
+        counter_set "$WAN_OK_COUNT" "$n"
+
+        if [ -f "$WAN_OFFLINE" ]; then
+            [ "$n" -ge "$WAN_RECOVER_LIMIT" ] || return 1
+            wan_mark_online
+        else
+            set_wan_state online
+        fi
+        return 0
     fi
+
     counter_set "$WAN_OK_COUNT" 0
-    n="$(counter_get "$WAN_FAIL_COUNT")"; n=$((n+1)); counter_set "$WAN_FAIL_COUNT" "$n"
-    if [ "$n" -ge "$WAN_FAIL_LIMIT" ] && [ ! -f "$WAN_OFFLINE" ]; then
-      wan_mark_offline
-      stop_runtime
+
+    n="$(counter_get "$WAN_FAIL_COUNT")"
+    n=$((n + 1))
+    counter_set "$WAN_FAIL_COUNT" "$n"
+
+    [ "$n" -ge "$WAN_FAIL_LIMIT" ] || return 1
+
+    if [ ! -f "$WAN_OFFLINE" ]; then
+        wan_mark_offline
+        stop_runtime
+    else
+        set_wan_state offline
     fi
+
     return 1
 }
 
@@ -742,14 +787,32 @@ watchdog_loop(){
 }
 
 start(){
-    ensure_dirs || return 1; load_platform || return 1
-    rm -f "$MANUAL_STOP"; mkdir "$CONTROL_LOCK" 2>/dev/null || true
+    ensure_dirs || return 1
+    load_platform || return 1
+    refresh_path
+
+    rm -f "$MANUAL_STOP"
+    mkdir "$CONTROL_LOCK" 2>/dev/null || true
+
     if internet_probe_once; then
-      wan_mark_online; with_start_lock start_runtime; rc=$?
+        wan_mark_online
+        with_start_lock start_runtime
+        rc=$?
+    elif wan_nvram_up; then
+        # ASUS reports a live WAN and a default route. One lost probe is not
+        # enough reason to keep VPN down; watchdog will verify continuously.
+        rm -f "$WAN_OFFLINE" 2>/dev/null || true
+        set_wan_state checking
+        with_start_lock start_runtime
+        rc=$?
+        warn "Внешний probe не ответил, но WAN ASUS активен; runtime запущен, watchdog перепроверит связь"
     else
-      wan_mark_offline; stop_runtime; rc=0
-      warn "Интернет недоступен: Mihomo остановлен, watchdog ждёт восстановления"
+        wan_mark_offline
+        stop_runtime
+        rc=0
+        warn "WAN действительно недоступен: Mihomo остановлен, watchdog ждёт восстановления"
     fi
+
     rmdir "$CONTROL_LOCK" 2>/dev/null || true
     watchdog_start
     return "$rc"
@@ -772,55 +835,102 @@ service_stop(){
     return 0
 }
 restart(){
-    ensure_dirs || return 1; load_platform || return 1; refresh_path
+    ensure_dirs || return 1
+    load_platform || return 1
+    refresh_path
+
     check_config || return 1
     backup_config >/dev/null 2>&1 || true
-    rm -f "$MANUAL_STOP"; mkdir "$CONTROL_LOCK" 2>/dev/null || true
-    watchdog_stop; stop_runtime
+
+    rm -f "$MANUAL_STOP"
+    mkdir "$CONTROL_LOCK" 2>/dev/null || true
+    watchdog_stop
+    stop_runtime
+
     if internet_probe_once; then
-      wan_mark_online; with_start_lock start_runtime; rc=$?
+        wan_mark_online
+        with_start_lock start_runtime
+        rc=$?
+    elif wan_nvram_up; then
+        rm -f "$WAN_OFFLINE" 2>/dev/null || true
+        set_wan_state checking
+        with_start_lock start_runtime
+        rc=$?
+        warn "Внешний probe не ответил, но WAN ASUS активен; Mihomo запущен, watchdog перепроверит связь"
     else
-      wan_mark_offline; rc=0
-      warn "Интернет недоступен: Mihomo оставлен остановленным; watchdog запустит его после восстановления"
+        wan_mark_offline
+        rc=0
+        warn "WAN действительно недоступен: Mihomo оставлен остановленным; watchdog запустит его после восстановления"
     fi
+
     rmdir "$CONTROL_LOCK" 2>/dev/null || true
     watchdog_start
+
     [ "$rc" -eq 0 ] && return 0
+
     if [ -f "$BACKUPS/config.last-good.yaml" ]; then
-      warn "Новый config.yaml не запустился; возвращаю последний рабочий"
-      cp -f "$BACKUPS/config.last-good.yaml" "$CONFIG" || return 1
-      if internet_probe_once; then with_start_lock start_runtime >/dev/null 2>&1 || true; fi
+        warn "Новый config.yaml не запустился; возвращаю последний рабочий"
+        cp -f "$BACKUPS/config.last-good.yaml" "$CONFIG" || return 1
+        if internet_probe_once || wan_nvram_up; then
+            with_start_lock start_runtime >/dev/null 2>&1 || true
+        fi
     fi
     return 1
 }
 
 main_default_route(){
-    refresh_path
+    route_bin=""
+    for p in /sbin/route /bin/route /usr/sbin/route /usr/bin/route; do
+        [ -x "$p" ] && { route_bin="$p"; break; }
+    done
 
-    # On old ASUSWRT/Optware an installed `ip` binary can exist but fail to
-    # report the firmware's main routing table correctly. The kernel route
-    # table shown by BusyBox `route -n` is the reliable source on legacy.
-    if command -v route >/dev/null 2>&1; then
-        route -n 2>/dev/null | awk '
-          $1=="0.0.0.0" && $4 ~ /G/ {ok=1}
-          END {exit !ok}
+    if [ -n "$route_bin" ]; then
+        "$route_bin" -n 2>/dev/null | awk '
+          $1=="0.0.0.0" && $4 ~ /G/ {found=1}
+          END {exit !found}
         ' && return 0
     fi
 
-    if [ -n "$IP_BIN" ]; then
-        "$IP_BIN" route show default 2>/dev/null | grep -q '^default ' && return 0
-    fi
-
+    refresh_path
+    [ -n "$IP_BIN" ] && "$IP_BIN" route show default 2>/dev/null | grep -q '^default ' && return 0
     return 1
 }
 boot(){
-    ensure_dirs || return 1; load_platform || return 1
+    ensure_dirs || return 1
+    load_platform || return 1
+    refresh_path
+
     [ -f "$MANUAL_STOP" ] && return 0
-    if [ -f "$BOOT_PIDFILE" ]; then old="$(cat "$BOOT_PIDFILE" 2>/dev/null)"; case "$old" in ''|*[!0-9]*) old="";; esac; [ -n "$old" ] && kill -0 "$old" 2>/dev/null && return 0; fi
+
+    if [ -f "$BOOT_PIDFILE" ]; then
+        old="$(cat "$BOOT_PIDFILE" 2>/dev/null)"
+        case "$old" in ''|*[!0-9]*) old="";; esac
+        [ -n "$old" ] && kill -0 "$old" 2>/dev/null && return 0
+    fi
+
     echo "$$" > "$BOOT_PIDFILE"
     repair_opt >/dev/null 2>&1 || true
+    refresh_path
+
+    waited=0
+    while ! main_default_route; do
+        [ "$waited" -ge "$BOOT_WAIT" ] && break
+        sleep 5
+        waited=$((waited + 5))
+    done
+
     rm -f "$BOOT_PIDFILE"
-    if internet_probe_once; then wan_mark_online; start; else wan_mark_offline; stop_runtime; watchdog_start; return 0; fi
+
+    if internet_probe_once || wan_nvram_up; then
+        rm -f "$WAN_OFFLINE" 2>/dev/null || true
+        set_wan_state checking
+        start
+    else
+        wan_mark_offline
+        stop_runtime
+        watchdog_start
+        return 0
+    fi
 }
 firewall_reload(){
     load_platform || return 0
@@ -1415,25 +1525,41 @@ sftp_status(){
 }
 
 doctor(){
-    load_platform >/dev/null 2>&1 || true; refresh_path
+    load_platform >/dev/null 2>&1 || true
+    refresh_path
+
     echo "GoshaCrash doctor"
     echo "  version: $VERSION"
     echo "  model: $(nvram_get productid)"
     echo "  kernel: $(uname -r 2>/dev/null)"
     echo "  arch: $(uname -m 2>/dev/null)"
-    internet_probe_once && echo "  internet: OK" || echo "  internet: FAIL"
+    echo "  PATH: $PATH"
+
+    [ -x /bin/ping ] && echo "  firmware ping: /bin/ping" || echo "  firmware ping: NOT FOUND"
+    wan_nvram_up && echo "  ASUS WAN: UP" || echo "  ASUS WAN: DOWN"
+    internet_probe_once && echo "  external probe: OK" || echo "  external probe: FAIL"
+
     running_pid >/dev/null 2>&1 && echo "  Mihomo: OK" || echo "  Mihomo: FAIL"
-    netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" && echo "  DNS: OK" || echo "  DNS: FAIL"
+    netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" \
+        && echo "  DNS: OK" || echo "  DNS: FAIL"
     net_link_exists "$TUN_DEVICE" && echo "  TUN: OK" || echo "  TUN: FAIL"
     route_status >/dev/null 2>&1 && echo "  routing: OK" || echo "  routing: FAIL"
     watchdog_pid >/dev/null 2>&1 && echo "  watchdog: OK" || echo "  watchdog: FAIL"
+
     find_dm_root >/dev/null 2>&1 && echo "  Download Master: $DM_ROOT" || echo "  Download Master: FAIL"
     ensure_optware_link >/dev/null 2>&1 && echo "  /tmp/opt: OK" || echo "  /tmp/opt: FAIL"
     find_pkg >/dev/null 2>&1 && echo "  package manager: $PKG" || echo "  package manager: FAIL"
-    e="$(find_editor 2>/dev/null)"; [ -n "$e" ] && echo "  nano: $e" || echo "  nano: NOT FOUND"
-    s="$(cat "$STATE/sftp-server.path" 2>/dev/null)"; [ -n "$s" ] && [ -x "$s" ] && echo "  sftp-server: $s" || echo "  sftp-server: optional/not found"
+
+    editor="$(find_editor 2>/dev/null)"
+    [ -n "$editor" ] && echo "  nano: $editor" || echo "  nano: NOT FOUND"
+
     [ -x /jffs/scripts/usb-mount-script ] && echo "  stock USB hook: OK" || echo "  stock USB hook: FAIL"
-    [ -x "$DM_ROOT/etc/init.d/S50usb-mount-script" ] && echo "  ASUS app bridge: OK" || echo "  ASUS app bridge: FAIL"
+    [ -n "$DM_ROOT" ] && [ -x "$DM_ROOT/etc/init.d/S50usb-mount-script" ] \
+        && echo "  ASUS app bridge: OK" || echo "  ASUS app bridge: FAIL"
+
+    state="$(cat "$WAN_STATE" 2>/dev/null)"
+    [ -n "$state" ] || state="unknown"
+    echo "  Internet state: $state"
     return 0
 }
 usage(){
@@ -1456,6 +1582,18 @@ GoshaCrash 3.8.1 — что буквально вводить в SSH
 
 ПРОВЕРИТЬ ТОЛЬКО INTERNET PROBE
   gc internet-probe
+
+ПРОВЕРИТЬ СИСТЕМНЫЙ PING
+  /bin/ping -c 2 -W 2 1.1.1.1
+  echo "PING_RC=$?"
+
+СБРОСИТЬ ЛОЖНЫЙ OFFLINE
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  rm -f "$BASE/state/wan-offline" "$BASE/state/wan-fail-count" "$BASE/state/wan-ok-count"
+  echo online > "$BASE/state/internet.state"
+  gc restart
+
 
 ИЗМЕНИТЬ CONFIG
   gc edit

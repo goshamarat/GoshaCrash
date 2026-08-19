@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.8.2"
+INSTALLER_VERSION="3.8.3"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -226,7 +226,10 @@ ensure_optware_link(){
 
 prepare_path(){
     ensure_optware_link >/dev/null 2>&1 || true
-    PATH="$DM_ROOT/bin:$DM_ROOT/sbin:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:/jffs/scripts:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+    PATH="/jffs/scripts"
+    [ -n "$DM_ROOT" ] && PATH="$DM_ROOT/bin:$DM_ROOT/sbin:$PATH"
+    PATH="/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"
+    PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
     export PATH
     hash -r 2>/dev/null || true
 }
@@ -1046,10 +1049,13 @@ merge_ipkg_package_stanza(){
 }
 
 install_stock_usb_mount_bridge(){
-    [ "${DM_ROOT##*/}" = "asusware.arm" ] || {
-        fail "Для stock RT-AC68U ожидается asusware.arm, найдено: ${DM_ROOT##*/}"
-        return 1
-    }
+    case "${DM_ROOT##*/}" in
+        asusware.arm|asusware.arm64|asusware) ;;
+        *)
+            fail "Неизвестный layout Download Master: ${DM_ROOT##*/}"
+            return 1
+            ;;
+    esac
     mkdir -p "$DM_ROOT/etc/init.d" "$DM_ROOT/lib/ipkg/info" || return 1
     cat > "$DM_ROOT/etc/init.d/S50usb-mount-script" <<'HOOK'
 #!/bin/sh
@@ -1084,14 +1090,14 @@ HOOK
 Package: usb-mount-script
 Version: 1.0.0.0
 Status: install user installed
-Architecture: arm
+Architecture: all
 Installed-Time: 0
 
 EOF
     fi
     cat > "$DM_ROOT/lib/ipkg/info/usb-mount-script.control" <<'EOF'
 Package: usb-mount-script
-Architecture: arm
+Architecture: all
 Priority: optional
 Section: libs
 Version: 1.0.0.0
@@ -1164,8 +1170,11 @@ BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
 [ -n "$BASE" ] || exit 0
 case "$BASE" in
   "$MOUNT_POINT"/*)
-    DM="$MOUNT_POINT/asusware.arm"
-    if [ -d "$DM" ]; then
+    DM=""
+    for d in "$MOUNT_POINT/asusware.arm" "$MOUNT_POINT/asusware.arm64" "$MOUNT_POINT/asusware"; do
+      [ -d "$d" ] && { DM="$d"; break; }
+    done
+    if [ -n "$DM" ] && [ -d "$DM" ]; then
       if [ -L /tmp/opt ]; then
         ln -snf "$DM" /tmp/opt 2>/dev/null || true
       elif [ -d /tmp/opt ]; then

@@ -1,4 +1,4 @@
-# GoshaCrash 3.8.2
+# GoshaCrash 3.8.3
 
 Здесь нет описания shell-функций. Ниже — команды, которые можно **буквально вставлять в SSH**.
 
@@ -430,3 +430,44 @@ route -n
 ```
 
 В 3.8.2 исправлен legacy-баг: наличие старого Optware `ip` больше не может само по себе объявить WAN offline. Сначала выполняются реальные внешние probes.
+
+
+## 3.8.3 — исправление ложного OFFLINE
+
+WAN probe больше не зависит от Optware PATH. Используется системный BusyBox:
+
+```sh
+/bin/ping -c 2 -W 2 1.1.1.1
+```
+
+Проверка GoshaCrash:
+
+```sh
+gc internet-probe
+```
+
+`gc restart` теперь не оставляет Mihomo выключенным после одного неудачного внешнего probe, если stock ASUSWRT одновременно сообщает:
+
+```text
+wan0_state_t = 2
+wan0_auxstate_t = 0
+WAN IP есть
+gateway есть
+default route есть
+```
+
+Решение об остановке работающего runtime принимает watchdog только после нескольких последовательных неудачных probes.
+
+Если от старой версии остался ложный offline:
+
+```sh
+BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+[ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+
+rm -f "$BASE/state/wan-offline"
+rm -f "$BASE/state/wan-fail-count"
+rm -f "$BASE/state/wan-ok-count"
+echo online > "$BASE/state/internet.state"
+
+gc restart
+```
