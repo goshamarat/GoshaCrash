@@ -1,4 +1,4 @@
-# GoshaCrash 3.8.6
+# GoshaCrash 3.8.8
 
 Здесь нет описания shell-функций. Ниже — команды, которые можно **буквально вставлять в SSH**.
 
@@ -573,3 +573,64 @@ gc version
 gc doctor
 gc status
 ```
+
+
+## 3.8.7 — восстановление payload Optware
+
+`ipkg list_installed` больше не считается доказательством, что программа реально
+существует. После reboot Download Master может оставить запись о пакете, но потерять
+файл под `/opt`.
+
+Для `nano`, `unzip` и `openssh-sftp-server` используется правило:
+
+```text
+бинарник есть -> OK
+пакет зарегистрирован, бинарника нет -> remove -> update -> install -> повторная проверка файла
+пакета нет -> install -> проверка файла
+```
+
+Проверяемые файлы:
+
+```text
+/opt/bin/nano
+/opt/bin/unzip или /opt/bin/unzip-unzip
+/opt/libexec/sftp-server
+```
+
+`gc edit` теперь сам восстанавливает физический `nano`, если база ipkg говорит, что
+пакет установлен, а `/opt/bin/nano` отсутствует.
+
+
+## 3.8.8 — Optware хранится на USB
+
+Пакеты Download Master не должны жить в `/tmp`. `/tmp` используется только для
+временной ссылки `/tmp/opt`.
+
+Постоянное хранилище:
+
+```text
+/tmp/mnt/<USB>/asusware.*
+```
+
+На RT-AC68U с флешкой SANDISK это:
+
+```text
+/tmp/mnt/SANDISK/asusware.arm
+```
+
+После установки физически проверяются:
+
+```sh
+ls -l /tmp/mnt/SANDISK/asusware.arm/bin/nano
+ls -l /tmp/mnt/SANDISK/asusware.arm/bin/unzip-unzip
+ls -l /tmp/mnt/SANDISK/asusware.arm/libexec/sftp-server
+```
+
+После reboot GoshaCrash не должен скачивать эти пакеты заново. Он ждёт USB и
+восстанавливает только:
+
+```text
+/opt -> /tmp/opt -> /tmp/mnt/SANDISK/asusware.arm
+```
+
+Переустановка пакета выполняется только если его реальный файл на USB отсутствует.

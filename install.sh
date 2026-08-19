@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.8.6"
+INSTALLER_VERSION="3.8.8"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -361,12 +361,99 @@ optware_sftp_package_line(){
     "$PKG" list 2>/dev/null | awk '$1=="openssh-sftp-server" {print; exit}'
 }
 
+persistent_opt_path(){
+    rel="$1"
+    printf '%s/%s\n' "$DM_ROOT" "$rel"
+}
+
+ensure_persistent_optware_link(){
+    test -n "$DM_ROOT" && test -d "$DM_ROOT" || return 1
+
+    # /opt -> /tmp/opt is firmware-owned. /tmp is volatile.
+    # Only /tmp/opt is recreated; the package files remain under DM_ROOT on USB.
+    if test -L /tmp/opt; then
+        current="$(readlink /tmp/opt 2>/dev/null)"
+        test "$current" = "$DM_ROOT" && return 0
+        rm -f /tmp/opt || return 1
+    elif test -e /tmp/opt; then
+        # Never delete a real directory blindly. Move it aside for diagnostics.
+        mv /tmp/opt "/tmp/opt.goshacrash.$$.stale" 2>/dev/null || return 1
+    fi
+
+    ln -s "$DM_ROOT" /tmp/opt || return 1
+    test -d /opt || return 1
+    return 0
+}
+
+persistent_payload_exists(){
+    for rel in "$@"; do
+        test -x "$DM_ROOT/$rel" && return 0
+    done
+    return 1
+}
+
+install_or_repair_persistent_package(){
+    package="$1"
+    shift
+
+    ensure_persistent_optware_link || return 1
+    persistent_payload_exists "$@" && return 0
+
+    # If ipkg metadata survived but USB payload did not, plain install can be a no-op.
+    if pkg_is_installed "$package"; then
+        warn "$package зарегистрирован, но payload на USB отсутствует; переустанавливаю"
+        pkg_reinstall_one "$package" || return 1
+    else
+        pkg_install_one "$package" || return 1
+    fi
+
+    ensure_persistent_optware_link || return 1
+    persistent_payload_exists "$@"
+}
+
+verify_persistent_optware(){
+    ensure_persistent_optware_link || {
+        fail "Не удалось связать /tmp/opt с USB Download Master: $DM_ROOT"
+        return 1
+    }
+
+    install_or_repair_persistent_package nano bin/nano || {
+        fail "nano не сохранён на USB: $DM_ROOT/bin/nano"
+        return 1
+    }
+
+    if ! persistent_payload_exists bin/unzip bin/unzip-unzip; then
+        install_or_repair_persistent_package unzip bin/unzip bin/unzip-unzip || {
+            fail "unzip не сохранён на USB"
+            return 1
+        }
+    fi
+
+    # SFTP is optional for VPN, but when available it must also be persistent.
+    if pkg_is_installed openssh-sftp-server || test -n "$(optware_sftp_package_line)"; then
+        install_or_repair_persistent_package openssh-sftp-server libexec/sftp-server || {
+            warn "SFTP не удалось сохранить на USB; VPN продолжит работать"
+        }
+    fi
+
+    say "Persistent Optware root: $DM_ROOT"
+    test -x "$DM_ROOT/bin/nano" && say "USB payload: nano OK"
+    if test -x "$DM_ROOT/bin/unzip" || test -x "$DM_ROOT/bin/unzip-unzip"; then
+        say "USB payload: unzip OK"
+    fi
+    test -x "$DM_ROOT/libexec/sftp-server" && say "USB payload: SFTP OK"
+    return 0
+}
+
 install_optware_sftp(){
     test -n "$PKG" && test -x "$PKG" || return 0
+    ensure_optware_link >/dev/null 2>&1 || true
+
     if sftp_bin="$(find_sftp_server 2>/dev/null)"; then
         say "SFTP binary: $sftp_bin"
         return 0
     fi
+
     pkg_line="$(optware_sftp_package_line)"
     if test -z "$pkg_line"; then
         pkg_update_index >/dev/null 2>&1 || true
@@ -376,13 +463,25 @@ install_optware_sftp(){
         warn "openssh-sftp-server отсутствует в текущем Optware feed; продолжаю без SFTP"
         return 0
     fi
+
     pkg_ver="$(printf '%s\n' "$pkg_line" | awk '{print $3}')"
     say "Optware SFTP: openssh-sftp-server ${pkg_ver:-unknown}"
-    pkg_install_one openssh-sftp-server || {
-        warn "SFTP не установился; это не блокирует VPN"
-        return 0
-    }
+
+    if pkg_is_installed openssh-sftp-server; then
+        warn "openssh-sftp-server числится установленным, но /opt/libexec/sftp-server отсутствует; переустанавливаю"
+        pkg_reinstall_one openssh-sftp-server || {
+            warn "SFTP не удалось переустановить; VPN продолжит работать"
+            return 0
+        }
+    else
+        pkg_install_one openssh-sftp-server || {
+            warn "SFTP не установился; VPN продолжит работать"
+            return 0
+        }
+    fi
+
     ensure_optware_link >/dev/null 2>&1 || true
+    prepare_path
     sftp_bin="$(find_sftp_server 2>/dev/null)"
     if test -n "$sftp_bin"; then
         mkdir -p "$BASE/state" 2>/dev/null || true
@@ -390,8 +489,15 @@ install_optware_sftp(){
         printf '%s\n' "${pkg_ver:-unknown}" > "$BASE/state/sftp-server.version" 2>/dev/null || true
         ok "SFTP binary установлен: $sftp_bin"
     else
-        warn "Пакет SFTP установлен, но бинарник не найден; продолжаю без SFTP"
+        warn "openssh-sftp-server зарегистрирован, но payload всё ещё отсутствует"
     fi
+
+    # A successful ipkg registration is not enough: require the file on USB.
+    ensure_persistent_optware_link >/dev/null 2>&1 || true
+    if ! test -x "$DM_ROOT/libexec/sftp-server"; then
+        install_or_repair_persistent_package openssh-sftp-server libexec/sftp-server || true
+    fi
+
     return 0
 }
 
@@ -1340,6 +1446,7 @@ main(){
     install_zashboard || return 1
     write_platform_state || return 1
 
+    verify_persistent_optware || return 1
     install_hooks || return 1
     verify_shell_compat || return 1
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" check || return 1

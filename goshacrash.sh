@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.8.6"
-BUILD_ID="2026-08-19-shell-compat-r2"
+VERSION="3.8.8"
+BUILD_ID="2026-08-19-persistent-optware-r1"
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.
@@ -239,20 +239,24 @@ optware_runtime_ready(){
     [ -x /tmp/opt/bin/ipkg ] || [ -x /tmp/opt/bin/opkg ] || [ -x /opt/bin/ipkg ] || [ -x /opt/bin/opkg ] || [ -x "$DM_ROOT/bin/ipkg" ] || [ -x "$DM_ROOT/bin/opkg" ]
 }
 repair_opt(){
-    find_dm_root || return 1
-    ensure_optware_link >/dev/null 2>&1 || true
+    find_dm_root >/dev/null 2>&1 || return 1
+    test -n "$DM_ROOT" && test -d "$DM_ROOT" || return 1
+
+    if test -L /tmp/opt; then
+        current="$(readlink /tmp/opt 2>/dev/null)"
+        if test "$current" != "$DM_ROOT"; then
+            rm -f /tmp/opt 2>/dev/null || return 1
+            ln -s "$DM_ROOT" /tmp/opt 2>/dev/null || return 1
+        fi
+    elif test -e /tmp/opt; then
+        mv /tmp/opt "/tmp/opt.goshacrash.$$.stale" 2>/dev/null || return 1
+        ln -s "$DM_ROOT" /tmp/opt 2>/dev/null || return 1
+    else
+        ln -s "$DM_ROOT" /tmp/opt 2>/dev/null || return 1
+    fi
+
     refresh_path
-    find_pkg || return 1
-    optware_runtime_ready && return 0
-    for script in "$DM_ROOT/S50downloadmaster.1" "$DM_ROOT/etc/init.d/S50downloadmaster" "$DM_ROOT/etc/init.d/S50downloadmaster.1"; do
-      [ -x "$script" ] || continue
-      "$script" start >> "$PACKAGES_LOG" 2>&1 || true
-      sleep 2
-      ensure_optware_link >/dev/null 2>&1 || true
-      refresh_path
-      optware_runtime_ready && return 0
-    done
-    [ -x "$DM_ROOT/bin/ipkg" ] || [ -x "$DM_ROOT/bin/opkg" ]
+    return 0
 }
 
 pkg_update_index(){
@@ -263,6 +267,28 @@ pkg_update_index(){
     printf '[%s] RUN: %s update\n' "$(now)" "$PKG" >> "$PACKAGES_LOG"
     "$PKG" update >> "$PACKAGES_LOG" 2>&1 || { fail "Не удалось обновить индекс пакетов. См. $PACKAGES_LOG"; return 1; }
     ok "Индекс пакетов обновлён; установленные пакеты не обновлялись"
+}
+
+pkg_is_installed_runtime(){
+    name="$1"
+    find_pkg >/dev/null 2>&1 || return 1
+    "$PKG" list_installed 2>/dev/null | grep -q "^$name "
+}
+
+pkg_reinstall_runtime(){
+    name="$1"
+    repair_opt >/dev/null 2>&1 || return 1
+    find_pkg || return 1
+    rotate_log "$PACKAGES_LOG" 1048576
+    printf '[%s] RUN: %s remove %s\n' "$(now)" "$PKG" "$name" >> "$PACKAGES_LOG"
+    "$PKG" remove "$name" >> "$PACKAGES_LOG" 2>&1 || true
+    printf '[%s] RUN: %s update\n' "$(now)" "$PKG" >> "$PACKAGES_LOG"
+    "$PKG" update >> "$PACKAGES_LOG" 2>&1 || true
+    printf '[%s] RUN: %s install %s\n' "$(now)" "$PKG" "$name" >> "$PACKAGES_LOG"
+    "$PKG" install "$name" >> "$PACKAGES_LOG" 2>&1 || return 1
+    ensure_optware_link >/dev/null 2>&1 || true
+    refresh_path
+    return 0
 }
 
 pkg_install(){
@@ -964,17 +990,30 @@ backup_config(){
 }
 
 find_editor(){
+    repair_opt >/dev/null 2>&1 || true
     refresh_path
 
-    for e in \
-        /opt/bin/nano \
-        /tmp/opt/bin/nano \
-        "$DM_ROOT/bin/nano" \
-        "$DM_ROOT/sbin/nano"
-    do
-        [ -x "$e" ] && { printf '%s\n' "$e"; return 0; }
+    # Persistent USB location is authoritative.
+    test -n "$DM_ROOT" && test -x "$DM_ROOT/bin/nano" && {
+        printf '%s\n' "$DM_ROOT/bin/nano"
+        return 0
+    }
+
+    for e in /opt/bin/nano /tmp/opt/bin/nano; do
+        test -x "$e" && { printf '%s\n' "$e"; return 0; }
     done
 
+    # Only repair when the physical USB payload is genuinely absent.
+    find_pkg >/dev/null 2>&1 || return 1
+    if pkg_is_installed_runtime nano; then
+        warn "nano зарегистрирован, но $DM_ROOT/bin/nano отсутствует; восстанавливаю пакет" >&2
+        pkg_reinstall_runtime nano >/dev/null 2>&1 || return 1
+    else
+        pkg_install nano >/dev/null 2>&1 || return 1
+    fi
+
+    repair_opt >/dev/null 2>&1 || true
+    test -x "$DM_ROOT/bin/nano" && { printf '%s\n' "$DM_ROOT/bin/nano"; return 0; }
     return 1
 }
 
@@ -1552,6 +1591,16 @@ doctor(){
     echo "  kernel: $(uname -r 2>/dev/null)"
     echo "  arch: $(uname -m 2>/dev/null)"
     echo "  PATH: $PATH"
+    echo "  Persistent Optware: ${DM_ROOT:-not-found}"
+    if test -n "$DM_ROOT"; then
+        test -x "$DM_ROOT/bin/nano" && echo "  USB nano: OK" || echo "  USB nano: MISSING"
+        if test -x "$DM_ROOT/bin/unzip" || test -x "$DM_ROOT/bin/unzip-unzip"; then
+            echo "  USB unzip: OK"
+        else
+            echo "  USB unzip: MISSING"
+        fi
+        test -x "$DM_ROOT/libexec/sftp-server" && echo "  USB SFTP: OK" || echo "  USB SFTP: MISSING"
+    fi
     if /bin/busybox '[' -n "ok" ']' >/dev/null 2>&1; then
         if test -x /jffs/scripts/'[' && /jffs/scripts/'[' -n "ok" ']' >/dev/null 2>&1; then
             echo "  shell [: OK (/jffs/scripts/[)"
