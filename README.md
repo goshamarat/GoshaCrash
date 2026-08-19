@@ -1,4 +1,4 @@
-# GoshaCrash 3.8.10
+# GoshaCrash 3.8.11
 
 Здесь нет описания shell-функций. Ниже — команды, которые можно **буквально вставлять в SSH**.
 
@@ -697,3 +697,32 @@ Optware: повторный install nano
 ```
 
 То есть во время старого `ipkg update` больше не выглядит так, будто installer завис.
+
+
+## 3.8.11 — быстрая установка Optware
+
+Installer больше не выполняет `ipkg update` для каждого пакета.
+
+Алгоритм:
+
+```text
+payload уже есть на USB
+  -> ничего не скачивать
+
+payload отсутствует
+  -> попробовать install/reinstall с текущим локальным индексом
+
+install не удался
+  -> один ipkg update за весь запуск installer
+  -> повторить только неудавшийся пакет
+```
+
+Поэтому при повторной установке исправные `nano`, `unzip` и
+`openssh-sftp-server` проходят без сетевых операций Optware.
+
+Полное обновление всех пакетов Optware по-прежнему выполняется вручную:
+
+```sh
+/tmp/mnt/SANDISK/asusware.arm/bin/ipkg update
+/tmp/mnt/SANDISK/asusware.arm/bin/ipkg upgrade
+```

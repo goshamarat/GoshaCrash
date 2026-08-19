@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.8.10"
+INSTALLER_VERSION="3.8.11"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -268,15 +268,23 @@ pkg_log(){
     printf '[%s] %s\n' "$(now)" "$*" >> "$BASE/logs/packages.log" 2>/dev/null || true
 }
 
+PKG_INDEX_REFRESHED=0
+
+pkg_update_index_once(){
+    test "$PKG_INDEX_REFRESHED" = "1" && return 0
+    pkg_progress "обновляю индекс пакетов (один раз)"
+    pkg_log "RUN: $PKG update"
+    "$PKG" update >> "$BASE/logs/packages.log" 2>&1 || return 1
+    PKG_INDEX_REFRESHED=1
+    return 0
+}
+
 pkg_progress(){
     say "Optware: $*"
 }
 
 pkg_update_index(){
-    test -n "$PKG" || return 1
-    pkg_progress "обновляю индекс пакетов"
-    pkg_log "RUN: $PKG update"
-    "$PKG" update >> "$BASE/logs/packages.log" 2>&1
+    pkg_update_index_once
 }
 
 pkg_install_one(){
@@ -284,13 +292,13 @@ pkg_install_one(){
     test -n "$PKG" || return 1
 
     ensure_optware_link >/dev/null 2>&1 || true
-    pkg_progress "install $name"
+    pkg_progress "install $name (текущий индекс)"
     pkg_log "RUN: $PKG install $name"
 
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && return 0
 
-    warn "Установка $name не удалась; обновляю индекс и повторяю"
-    pkg_update_index >/dev/null 2>&1 || true
+    warn "Не удалось установить $name с текущим индексом"
+    pkg_update_index_once || true
     pkg_progress "повторный install $name"
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
 }
@@ -302,15 +310,17 @@ pkg_is_installed(){
 pkg_reinstall_one(){
     name="$1"
     test -n "$PKG" || return 1
+
     pkg_progress "remove $name"
     pkg_log "REINSTALL: $name"
     "$PKG" remove "$name" >> "$BASE/logs/packages.log" 2>&1 || true
 
     ensure_optware_link >/dev/null 2>&1 || true
-    pkg_progress "install $name"
+    pkg_progress "install $name (текущий индекс)"
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && return 0
 
-    pkg_update_index >/dev/null 2>&1 || true
+    warn "Не удалось переустановить $name с текущим индексом"
+    pkg_update_index_once || true
     pkg_progress "повторный install $name"
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
 }
@@ -435,9 +445,13 @@ install_or_repair_persistent_package(){
     shift
 
     ensure_persistent_optware_link || return 1
-    persistent_payload_exists "$@" && return 0
 
-    # If ipkg metadata survived but USB payload did not, plain install can be a no-op.
+    # Fast path: the physical USB payload is authoritative. No ipkg network work.
+    if persistent_payload_exists "$@"; then
+        pkg_progress "$package уже есть на USB — пропускаю"
+        return 0
+    fi
+
     if pkg_is_installed "$package"; then
         warn "$package зарегистрирован, но payload на USB отсутствует; переустанавливаю"
         pkg_reinstall_one "$package" || return 1
