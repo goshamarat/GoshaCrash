@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.8.5"
-BUILD_ID="2026-08-19-busybox-bracket-r1"
+VERSION="3.8.6"
+BUILD_ID="2026-08-19-shell-compat-r2"
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.
@@ -22,6 +22,7 @@ GC_BRACKET
 chmod 755 "$GC_COMPAT_BIN/[" 2>/dev/null
 PATH="$GC_COMPAT_BIN:$PATH"
 export PATH
+hash -r 2>/dev/null || true
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -1551,8 +1552,14 @@ doctor(){
     echo "  kernel: $(uname -r 2>/dev/null)"
     echo "  arch: $(uname -m 2>/dev/null)"
     echo "  PATH: $PATH"
-    if command -v '[' >/dev/null 2>&1 && [ -n "ok" ]; then
-        echo "  shell [: OK ($(command -v '[' 2>/dev/null))"
+    if /bin/busybox '[' -n "ok" ']' >/dev/null 2>&1; then
+        if test -x /jffs/scripts/'[' && /jffs/scripts/'[' -n "ok" ']' >/dev/null 2>&1; then
+            echo "  shell [: OK (/jffs/scripts/[)"
+        elif test -x "$GC_COMPAT_BIN/[" && "$GC_COMPAT_BIN/[" -n "ok" ']' >/dev/null 2>&1; then
+            echo "  shell [: OK ($GC_COMPAT_BIN/[)"
+        else
+            echo "  shell [: BusyBox OK, wrapper FAIL"
+        fi
     else
         echo "  shell [: FAIL"
     fi

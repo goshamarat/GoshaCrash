@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.8.5"
+INSTALLER_VERSION="3.8.6"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -50,7 +50,7 @@ fail(){ _emit ERROR "$@" >&2; return 1; }
 
 cleanup(){
     rm -rf "$TMP_ROOT" 2>/dev/null || true
-    [ "$LOCK_HELD" = 1 ] && rm -rf "$LOCK_DIR" 2>/dev/null || true
+    test "$LOCK_HELD" = 1 && rm -rf "$LOCK_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -62,7 +62,7 @@ acquire_lock(){
     fi
 
     oldpid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
-    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+    if test -n "$oldpid" && kill -0 "$oldpid" 2>/dev/null; then
         fail "Установщик уже запущен, PID=$oldpid. Не запускай несколько установок одновременно"
         return 1
     fi
@@ -75,12 +75,12 @@ acquire_lock(){
 
 
 find_nvram(){
-    [ -n "$NVRAM_BIN" ] && [ -x "$NVRAM_BIN" ] && return 0
+    test -n "$NVRAM_BIN" && test -x "$NVRAM_BIN" && return 0
     for p in /usr/sbin/nvram /sbin/nvram /usr/bin/nvram /bin/nvram; do
-        [ -x "$p" ] && { NVRAM_BIN="$p"; return 0; }
+        test -x "$p" && { NVRAM_BIN="$p"; return 0; }
     done
     p="$(command -v nvram 2>/dev/null)"
-    [ -n "$p" ] && [ -x "$p" ] && { NVRAM_BIN="$p"; return 0; }
+    test -n "$p" && test -x "$p" && { NVRAM_BIN="$p"; return 0; }
     return 1
 }
 
@@ -102,20 +102,20 @@ nvram_commit(){
 }
 
 verify_asuswrt(){
-    [ -d /jffs ] || { fail "/jffs не найден: это не поддерживаемая ASUSWRT-среда"; return 1; }
-    [ -d /tmp/mnt ] || { fail "/tmp/mnt не найден: USB-подсистема ASUSWRT не готова"; return 1; }
-    [ -r /proc/version ] || { fail "/proc/version не найден: среда Linux не готова"; return 1; }
+    test -d /jffs || { fail "/jffs не найден: это не поддерживаемая ASUSWRT-среда"; return 1; }
+    test -d /tmp/mnt || { fail "/tmp/mnt не найден: USB-подсистема ASUSWRT не готова"; return 1; }
+    test -r /proc/version || { fail "/proc/version не найден: среда Linux не готова"; return 1; }
     find_nvram || warn "Утилита nvram не найдена; модель роутера будет определена по архитектуре и ядру"
 }
 
 tool_path(){
-    if [ "$1" = "unzip" ]; then
+    if test "$1" = "unzip"; then
         for p in /opt/bin/unzip /opt/bin/unzip-unzip; do
-            [ -x "$p" ] && { echo "$p"; return 0; }
+            test -x "$p" && { echo "$p"; return 0; }
         done
-        if [ -n "$DM_ROOT" ]; then
+        if test -n "$DM_ROOT"; then
             for p in "$DM_ROOT/bin/unzip" "$DM_ROOT/bin/unzip-unzip"; do
-                [ -x "$p" ] && { echo "$p"; return 0; }
+                test -x "$p" && { echo "$p"; return 0; }
             done
         fi
     fi
@@ -126,7 +126,7 @@ tool_path(){
         "/tmp/opt/bin/$name" "/tmp/opt/sbin/$name" \
         "$DM_ROOT/bin/$name" "$DM_ROOT/sbin/$name" \
         "/usr/sbin/$name" "/usr/bin/$name" "/sbin/$name" "/bin/$name"; do
-        [ -n "$p" ] && [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+        test -n "$p" && test -x "$p" && { printf '%s\n' "$p"; return 0; }
     done
     command -v "$name" 2>/dev/null || return 1
 }
@@ -139,7 +139,7 @@ have(){ tool_path "$1" >/dev/null 2>&1; }
 # Download Master when available and install it automatically when needed.
 unzip_is_full(){
     u="$1"
-    [ -n "$u" ] && [ -x "$u" ] || return 1
+    test -n "$u" && test -x "$u" || return 1
 
     # Do not probe Info-ZIP by parsing `unzip -h`: old Optware builds have
     # different help text and were falsely rejected. BusyBox lives in the
@@ -169,17 +169,17 @@ find_full_unzip(){
 refresh_tools(){
     hash -r 2>/dev/null || true
     UNZIP_BIN="$(find_full_unzip 2>/dev/null)"
-    [ -n "$UNZIP_BIN" ] || UNZIP_BIN="$(tool_path unzip 2>/dev/null)"
+    test -n "$UNZIP_BIN" || UNZIP_BIN="$(tool_path unzip 2>/dev/null)"
     GZIP_BIN="$(tool_path gzip 2>/dev/null)"
     if have wget; then DOWNLOADER="wget"; elif have curl; then DOWNLOADER="curl"; else DOWNLOADER=""; fi
 }
 
 find_download_master(){
-    if [ -n "${INSTALL_ROOT:-}" ]; then
+    if test -n "${INSTALL_ROOT:-}"; then
         USB_MOUNT="$INSTALL_ROOT"
-        [ -d "$USB_MOUNT" ] || { fail "INSTALL_ROOT не существует: $USB_MOUNT"; return 1; }
+        test -d "$USB_MOUNT" || { fail "INSTALL_ROOT не существует: $USB_MOUNT"; return 1; }
         for d in "$USB_MOUNT/asusware.arm" "$USB_MOUNT/asusware.arm64" "$USB_MOUNT/asusware"; do
-            [ -d "$d" ] && { DM_ROOT="$d"; return 0; }
+            test -d "$d" && { DM_ROOT="$d"; return 0; }
         done
         fail "На $USB_MOUNT не найден Download Master (asusware.arm/asusware.arm64/asusware)"
         return 1
@@ -187,10 +187,10 @@ find_download_master(){
 
     count=0
     for mount in /tmp/mnt/*; do
-        [ -d "$mount" ] || continue
-        [ -w "$mount" ] || continue
+        test -d "$mount" || continue
+        test -w "$mount" || continue
         for d in "$mount/asusware.arm" "$mount/asusware.arm64" "$mount/asusware"; do
-            [ -d "$d" ] || continue
+            test -d "$d" || continue
             count=$((count + 1))
             USB_MOUNT="$mount"
             DM_ROOT="$d"
@@ -198,8 +198,8 @@ find_download_master(){
         done
     done
 
-    [ "$count" -eq 1 ] && return 0
-    if [ "$count" -gt 1 ]; then
+    test "$count" -eq 1 && return 0
+    if test "$count" -gt 1; then
         fail "Найдено несколько флешек с Download Master. Укажи INSTALL_ROOT=/tmp/mnt/МЕТКА"
     else
         fail "Download Master не найден. Установи его через веб-интерфейс ASUS на USB-флешку"
@@ -208,17 +208,17 @@ find_download_master(){
 }
 
 ensure_optware_link(){
-    [ -n "$DM_ROOT" ] && [ -d "$DM_ROOT" ] || return 1
+    test -n "$DM_ROOT" && test -d "$DM_ROOT" || return 1
     touch "$DM_ROOT/.asusrouter" 2>/dev/null || true
 
-    if [ -L /tmp/opt ]; then
+    if test -L /tmp/opt; then
         target="$(readlink /tmp/opt 2>/dev/null)"
-        [ "$target" = "$DM_ROOT" ] || ln -snf "$DM_ROOT" /tmp/opt 2>/dev/null || return 1
-    elif [ -d /tmp/opt ]; then
-        if [ ! -x /tmp/opt/bin/ipkg ] && [ ! -x /tmp/opt/bin/opkg ]; then
+        test "$target" = "$DM_ROOT" || ln -snf "$DM_ROOT" /tmp/opt 2>/dev/null || return 1
+    elif test -d /tmp/opt; then
+        if test ! -x /tmp/opt/bin/ipkg && test ! -x /tmp/opt/bin/opkg; then
             rmdir /tmp/opt 2>/dev/null && ln -s "$DM_ROOT" /tmp/opt 2>/dev/null || true
         fi
-    elif [ ! -e /tmp/opt ]; then
+    elif test ! -e /tmp/opt; then
         ln -s "$DM_ROOT" /tmp/opt 2>/dev/null || return 1
     fi
     return 0
@@ -227,7 +227,7 @@ ensure_optware_link(){
 prepare_path(){
     ensure_optware_link >/dev/null 2>&1 || true
     PATH="/jffs/scripts"
-    [ -n "$DM_ROOT" ] && PATH="$DM_ROOT/bin:$DM_ROOT/sbin:$PATH"
+    test -n "$DM_ROOT" && PATH="$DM_ROOT/bin:$DM_ROOT/sbin:$PATH"
     PATH="/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"
     PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
     export PATH
@@ -238,9 +238,9 @@ find_pkg(){
     PKG=""
     # Prefer the manager belonging to the detected Download Master tree.
     for p in "$DM_ROOT/bin/opkg" "$DM_ROOT/bin/ipkg" /opt/bin/opkg /opt/bin/ipkg /tmp/opt/bin/opkg /tmp/opt/bin/ipkg; do
-        [ -x "$p" ] && { PKG="$p"; break; }
+        test -x "$p" && { PKG="$p"; break; }
     done
-    [ -n "$PKG" ]
+    test -n "$PKG"
 }
 
 pkg_log(){
@@ -249,14 +249,14 @@ pkg_log(){
 }
 
 pkg_update_index(){
-    [ -n "$PKG" ] || return 1
+    test -n "$PKG" || return 1
     pkg_log "RUN: $PKG update"
     "$PKG" update >> "$BASE/logs/packages.log" 2>&1
 }
 
 pkg_install_one(){
     name="$1"
-    [ -n "$PKG" ] || return 1
+    test -n "$PKG" || return 1
     ensure_optware_link >/dev/null 2>&1 || true
     pkg_log "RUN: $PKG install $name"
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && return 0
@@ -299,7 +299,7 @@ find_nano(){
         /tmp/opt/bin/nano \
         "$DM_ROOT/bin/nano" \
         "$DM_ROOT/sbin/nano"; do
-        [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+        test -x "$p" && { printf '%s\n' "$p"; return 0; }
     done
     command -v nano 2>/dev/null || return 1
 }
@@ -312,7 +312,7 @@ restart_download_master_env(){
         /tmp/opt/S50downloadmaster.1 \
         "$DM_ROOT/etc/init.d/S50downloadmaster" \
         "$DM_ROOT/etc/init.d/S50downloadmaster.1"; do
-        [ -x "$script" ] || continue
+        test -x "$script" || continue
         pkg_log "RUN: $script restart"
         "$script" restart >> "$BASE/logs/packages.log" 2>&1 || \
             "$script" start >> "$BASE/logs/packages.log" 2>&1 || true
@@ -351,28 +351,28 @@ find_sftp_server(){
         "$DM_ROOT/libexec/sftp-server" \
         "$DM_ROOT/lib/openssh/sftp-server"
     do
-        [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+        test -x "$p" && { printf '%s\n' "$p"; return 0; }
     done
     return 1
 }
 
 optware_sftp_package_line(){
-    [ -n "$PKG" ] || return 1
+    test -n "$PKG" || return 1
     "$PKG" list 2>/dev/null | awk '$1=="openssh-sftp-server" {print; exit}'
 }
 
 install_optware_sftp(){
-    [ -n "$PKG" ] && [ -x "$PKG" ] || return 0
+    test -n "$PKG" && test -x "$PKG" || return 0
     if sftp_bin="$(find_sftp_server 2>/dev/null)"; then
         say "SFTP binary: $sftp_bin"
         return 0
     fi
     pkg_line="$(optware_sftp_package_line)"
-    if [ -z "$pkg_line" ]; then
+    if test -z "$pkg_line"; then
         pkg_update_index >/dev/null 2>&1 || true
         pkg_line="$(optware_sftp_package_line)"
     fi
-    if [ -z "$pkg_line" ]; then
+    if test -z "$pkg_line"; then
         warn "openssh-sftp-server отсутствует в текущем Optware feed; продолжаю без SFTP"
         return 0
     fi
@@ -384,7 +384,7 @@ install_optware_sftp(){
     }
     ensure_optware_link >/dev/null 2>&1 || true
     sftp_bin="$(find_sftp_server 2>/dev/null)"
-    if [ -n "$sftp_bin" ]; then
+    if test -n "$sftp_bin"; then
         mkdir -p "$BASE/state" 2>/dev/null || true
         printf '%s\n' "$sftp_bin" > "$BASE/state/sftp-server.path" 2>/dev/null || true
         printf '%s\n' "${pkg_ver:-unknown}" > "$BASE/state/sftp-server.version" 2>/dev/null || true
@@ -406,9 +406,9 @@ prepare_packages(){
     need_index=0
     find_full_unzip >/dev/null 2>&1 || need_index=1
     find_nano >/dev/null 2>&1 || need_index=1
-    [ -x "$GZIP_BIN" ] || need_index=1
-    [ -n "$DOWNLOADER" ] || need_index=1
-    [ "$need_index" = 1 ] && pkg_update_index || true
+    test -x "$GZIP_BIN" || need_index=1
+    test -n "$DOWNLOADER" || need_index=1
+    test "$need_index" = 1 && pkg_update_index || true
 
     if ! find_full_unzip >/dev/null 2>&1; then
         say "Готовлю Info-ZIP"
@@ -419,12 +419,12 @@ prepare_packages(){
         repair_nano_package || { fail "Не удалось получить nano"; return 1; }
     fi
     refresh_tools
-    if [ ! -x "$GZIP_BIN" ]; then
+    if test ! -x "$GZIP_BIN"; then
         say "Устанавливаю gzip"
         pkg_install_one gzip || { fail "Не удалось установить gzip"; return 1; }
         refresh_tools
     fi
-    if [ -z "$DOWNLOADER" ]; then
+    if test -z "$DOWNLOADER"; then
         say "Устанавливаю wget"
         pkg_install_one wget || { fail "Не удалось установить wget/curl"; return 1; }
         refresh_tools
@@ -432,10 +432,10 @@ prepare_packages(){
 
     UNZIP_BIN="$(find_full_unzip 2>/dev/null)"
     NANO_BIN="$(find_nano 2>/dev/null)"
-    [ -n "$UNZIP_BIN" ] || { fail "Полноценный unzip не найден"; return 1; }
-    [ -n "$NANO_BIN" ] || { fail "nano не найден"; return 1; }
-    [ -x "$GZIP_BIN" ] || { fail "gzip не найден"; return 1; }
-    [ -n "$DOWNLOADER" ] || { fail "wget/curl не найден"; return 1; }
+    test -n "$UNZIP_BIN" || { fail "Полноценный unzip не найден"; return 1; }
+    test -n "$NANO_BIN" || { fail "nano не найден"; return 1; }
+    test -x "$GZIP_BIN" || { fail "gzip не найден"; return 1; }
+    test -n "$DOWNLOADER" || { fail "wget/curl не найден"; return 1; }
 
     install_optware_sftp || true
     say "Инструменты: nano=$NANO_BIN, unzip=$UNZIP_BIN, gzip=$GZIP_BIN, downloader=$DOWNLOADER"
@@ -445,12 +445,12 @@ wget_fetch(){
     url="$1"; out="$2"
     w=""
     for p in /usr/sbin/wget /usr/bin/wget "$DM_ROOT/bin/wget" /opt/bin/wget /tmp/opt/bin/wget; do
-        [ -x "$p" ] && { w="$p"; break; }
+        test -x "$p" && { w="$p"; break; }
     done
-    [ -n "$w" ] || return 1
+    test -n "$w" || return 1
 
     echo "--- wget: $url"
-    "$w" --no-check-certificate -O "$out.part" "$url" && [ -s "$out.part" ] && {
+    "$w" --no-check-certificate -O "$out.part" "$url" && test -s "$out.part" && {
         mv -f "$out.part" "$out"
         return 0
     }
@@ -461,15 +461,15 @@ curl_fetch(){
     url="$1"; out="$2"
     c=""
     for p in "$DM_ROOT/bin/curl" /opt/bin/curl /tmp/opt/bin/curl /usr/bin/curl; do
-        [ -x "$p" ] && { c="$p"; break; }
+        test -x "$p" && { c="$p"; break; }
     done
-    [ -n "$c" ] || return 1
+    test -n "$c" || return 1
 
     echo "--- curl: $url"
     # No connect timeout and no overall max-time: the transfer may continue as
     # long as the connection is alive. The progress bar remains visible.
     "$c" -k -fL --retry 3 --retry-delay 3 -# \
-        -A "GoshaCrash/$INSTALLER_VERSION" -o "$out.part" "$url" && [ -s "$out.part" ] && {
+        -A "GoshaCrash/$INSTALLER_VERSION" -o "$out.part" "$url" && test -s "$out.part" && {
         mv -f "$out.part" "$out"
         return 0
     }
@@ -480,7 +480,7 @@ fetch(){
     url="$1"; out="$2"
     rm -f "$out" "$out.part"
 
-    if [ "$DOWNLOADER" = "wget" ]; then
+    if test "$DOWNLOADER" = "wget"; then
         wget_fetch "$url" "$out" && return 0
         warn "wget не скачал файл; пробую curl"
         curl_fetch "$url" "$out" && return 0
@@ -546,7 +546,7 @@ detect_platform(){
         s390x) MIHOMO_TARGET="s390x" ;;
         *) fail "Неподдерживаемая архитектура: $machine"; return 1 ;;
     esac
-    if [ "$MIHOMO_TARGET" = armv5 ]; then
+    if test "$MIHOMO_TARGET" = armv5; then
         MIHOMO_SOURCE="project-legacy-release"
         MIHOMO_VERSION_SELECTED="$LEGACY_MIHOMO_VERSION"
         ACTIVE_CONFIG="$BASE/config.yaml"
@@ -556,7 +556,7 @@ detect_platform(){
 
 existing_routing_mode(){
     f="$BASE/state/platform.env"
-    [ -f "$f" ] || return 1
+    test -f "$f" || return 1
     mode="$( ( . "$f" 2>/dev/null; printf '%s\n' "${ROUTING_MODE:-}" ) 2>/dev/null )"
     case "$mode" in manual|auto) printf '%s\n' "$mode"; return 0;; esac
     return 1
@@ -564,8 +564,8 @@ existing_routing_mode(){
 
 choose_routing_mode(){
     # ARMv5 is intentionally manual-only: this includes the RT-AC68U legacy build.
-    if [ "$MIHOMO_TARGET" = armv5 ]; then
-        if [ "$ROUTING_REQUEST" = auto ]; then
+    if test "$MIHOMO_TARGET" = armv5; then
+        if test "$ROUTING_REQUEST" = auto; then
             fail "Автоматическая маршрутизация для ARMv5 отключена. Используй manual"
             return 1
         fi
@@ -579,10 +579,10 @@ choose_routing_mode(){
         manual|auto) ROUTING_MODE="$ROUTING_REQUEST" ;;
         '')
             old="$(existing_routing_mode 2>/dev/null)"
-            if [ -n "$old" ]; then
+            if test -n "$old"; then
                 ROUTING_MODE="$old"
                 say "Сохраняю ранее выбранную маршрутизацию: $ROUTING_MODE"
-            elif [ -t 0 ] && [ -t 1 ]; then
+            elif test -t 0 && test -t 1; then
                 echo
                 echo "Выбери маршрутизацию:"
                 echo "  1) automatic — маршруты создаёт Mihomo (auto-route + auto-redirect)"
@@ -608,21 +608,21 @@ choose_routing_mode(){
 install_controller(){
     tmp="$TMP_ROOT/goshacrash.sh"
     fetch_repo_file goshacrash.sh "$tmp" || { fail "Не удалось скачать goshacrash.sh"; return 1; }
-    [ "$(sed -n '1p' "$tmp" 2>/dev/null)" = '#!/bin/sh' ] || { fail "goshacrash.sh скачан неверно"; return 1; }
+    test "$(sed -n '1p' "$tmp" 2>/dev/null)" = '#!/bin/sh' || { fail "goshacrash.sh скачан неверно"; return 1; }
     sh -n "$tmp" || { fail "Синтаксическая ошибка в goshacrash.sh"; return 1; }
-    [ -f "$BASE/goshacrash.sh" ] && cp -f "$BASE/goshacrash.sh" "$BASE/backups/goshacrash.sh.previous" 2>/dev/null || true
+    test -f "$BASE/goshacrash.sh" && cp -f "$BASE/goshacrash.sh" "$BASE/backups/goshacrash.sh.previous" 2>/dev/null || true
     mv -f "$tmp" "$BASE/goshacrash.sh" || return 1
     chmod 755 "$BASE/goshacrash.sh" || return 1
 }
 
 install_network_helper(){
-    if [ "$MIHOMO_TARGET" != armv5 ]; then
+    if test "$MIHOMO_TARGET" != armv5; then
         GCNET_BIN=""
         return 0
     fi
     tmp="$TMP_ROOT/gcnet-armv5"
     fetch_repo_file assets/gcnet-armv5 "$tmp" || { fail "Не удалось скачать legacy network helper gcnet"; return 1; }
-    [ -s "$tmp" ] || { fail "gcnet скачан пустым"; return 1; }
+    test -s "$tmp" || { fail "gcnet скачан пустым"; return 1; }
     chmod 755 "$tmp" || return 1
     "$tmp" link-exists lo >/dev/null 2>&1 || { fail "gcnet не запускается на этом legacy-роутере"; return 1; }
     mv -f "$tmp" "$BASE/bin/gcnet" || return 1
@@ -633,14 +633,14 @@ install_network_helper(){
 
 generate_dashboard_secret(){
     secret=""
-    if [ -r /dev/urandom ]; then
+    if test -r /dev/urandom; then
         if command -v od >/dev/null 2>&1; then
             secret="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
         elif command -v hexdump >/dev/null 2>&1; then
             secret="$(hexdump -n 16 -e '16/1 "%02x"' /dev/urandom 2>/dev/null)"
         fi
     fi
-    [ -n "$secret" ] || secret="GC$(date +%s 2>/dev/null)$$"
+    test -n "$secret" || secret="GC$(date +%s 2>/dev/null)$$"
     printf '%s\n' "$secret"
 }
 
@@ -648,7 +648,7 @@ replace_placeholder_secret(){
     file="$1"
     grep -q '^secret:[[:space:]]*["'"'"']CHANGE_ME["'"'"'][[:space:]]*$' "$file" 2>/dev/null || return 0
     secret="$(generate_dashboard_secret)"
-    [ -n "$secret" ] || return 1
+    test -n "$secret" || return 1
     sed -i "s@^secret:.*@secret: \"$secret\"@" "$file" || return 1
     say "Для Zashboard создан уникальный локальный secret"
 }
@@ -693,8 +693,8 @@ yaml_remove_top_key(){
 
 configure_routing_in_config(){
     file="$1"
-    [ -f "$file" ] || return 1
-    if [ "$ROUTING_MODE" = manual ]; then
+    test -f "$file" || return 1
+    if test "$ROUTING_MODE" = manual; then
         yaml_set_section_key "$file" tun stack "$TUN_STACK" || return 1
         yaml_set_section_key "$file" tun auto-route false || return 1
         yaml_set_section_key "$file" tun auto-redirect false || return 1
@@ -712,7 +712,7 @@ configure_routing_in_config(){
 generate_base_config(){
     file="$1"
     secret="$(generate_dashboard_secret)"
-    [ -n "$secret" ] || { fail "Не удалось создать secret для Zashboard"; return 1; }
+    test -n "$secret" || { fail "Не удалось создать secret для Zashboard"; return 1; }
 
     cat > "$file" <<EOF
 # GoshaCrash base configuration.
@@ -766,17 +766,17 @@ EOF
 }
 
 install_configs(){
-    [ -n "$ACTIVE_CONFIG" ] || ACTIVE_CONFIG="$BASE/config.yaml"
+    test -n "$ACTIVE_CONFIG" || ACTIVE_CONFIG="$BASE/config.yaml"
 
     # Migration from GoshaCrash <= 3.5.x: legacy installations used
     # config-legacy.yaml as the active file. Keep the user's configuration.
-    if [ ! -f "$ACTIVE_CONFIG" ] && [ -f "$BASE/config-legacy.yaml" ]; then
+    if test ! -f "$ACTIVE_CONFIG" && test -f "$BASE/config-legacy.yaml"; then
         cp -f "$BASE/config-legacy.yaml" "$BASE/backups/config-legacy.yaml.before-3.6" 2>/dev/null || true
         cp -f "$BASE/config-legacy.yaml" "$ACTIVE_CONFIG" || return 1
         say "Legacy-конфиг перенесён в единый $ACTIVE_CONFIG"
     fi
 
-    if [ ! -f "$ACTIVE_CONFIG" ]; then
+    if test ! -f "$ACTIVE_CONFIG"; then
         generate_base_config "$ACTIVE_CONFIG" || { fail "Не удалось сгенерировать базовый config.yaml"; return 1; }
         say "Базовый config.yaml создан install.sh для $PLATFORM (routing=$ROUTING_MODE, tun.stack=$TUN_STACK)"
         warn "VPN ещё не настроен: добавь свои proxy/rules и выполни gc restart"
@@ -803,7 +803,7 @@ latest_official_mihomo_url(){
             *) pattern="/mihomo-linux-$MIHOMO_TARGET-v[^/]*\\.gz$" ;;
         esac
         url="$(json_asset_urls "$api" | grep -E "$pattern" | head -n 1)"
-        if [ -n "$url" ]; then
+        if test -n "$url"; then
             MIHOMO_VERSION_SELECTED="$(printf '%s\n' "$url" | sed -n 's#.*/download/\([^/]*\)/.*#\1#p')"
             printf '%s\n' "$url"
             return 0
@@ -831,7 +831,7 @@ validate_downloaded_mihomo(){
     chmod 755 "$newbin" || return 1
     out="$("$newbin" -v 2>&1)" || { printf '%s\n' "$out" >&2; fail "Mihomo не запускается на этой архитектуре"; return 1; }
     printf '%s\n' "$out" | grep -qi 'mihomo' || { printf '%s\n' "$out" >&2; fail "Скачанный файл не похож на Mihomo"; return 1; }
-    if [ "$MIHOMO_TARGET" = armv5 ]; then
+    if test "$MIHOMO_TARGET" = armv5; then
         printf '%s\n' "$out" | grep -Fq 'Use tags: with_gvisor' || { printf '%s\n' "$out" >&2; fail "Legacy-профилю нужна сборка Mihomo with_gvisor"; return 1; }
     fi
     printf '%s\n' "$out" > "$BASE/state/mihomo-version.txt"
@@ -842,7 +842,7 @@ install_mihomo(){
     newbin="$BASE/bin/mihomo.new"
     rm -f "$archive" "$newbin"
 
-    if [ "$MIHOMO_TARGET" = armv5 ] && [ "${FORCE_CORE_REINSTALL:-0}" != 1 ] && [ -x "$BASE/bin/mihomo" ]; then
+    if test "$MIHOMO_TARGET" = armv5 && test "${FORCE_CORE_REINSTALL:-0}" != 1 && test -x "$BASE/bin/mihomo"; then
         existing_out="$("$BASE/bin/mihomo" -v 2>&1)"
         if printf '%s\n' "$existing_out" | grep -qi 'mihomo' && \
            printf '%s\n' "$existing_out" | grep -Fq 'Use tags: with_gvisor'; then
@@ -852,14 +852,14 @@ install_mihomo(){
         fi
     fi
 
-    if [ "$MIHOMO_TARGET" = armv5 ]; then
+    if test "$MIHOMO_TARGET" = armv5; then
         success=0
         legacy_mihomo_urls | while IFS= read -r url; do
-            [ -n "$url" ] || continue
+            test -n "$url" || continue
             printf '%s\n' "$url"
         done > "$TMP_ROOT/legacy-urls.txt"
         while IFS= read -r url; do
-            [ -n "$url" ] || continue
+            test -n "$url" || continue
             say "Скачиваю проверенный legacy Mihomo: $url"
             if fetch "$url" "$archive" && validate_downloaded_mihomo "$archive" "$newbin"; then
                 MIHOMO_URL_SELECTED="$url"
@@ -868,17 +868,17 @@ install_mihomo(){
             fi
             rm -f "$archive" "$newbin"
         done < "$TMP_ROOT/legacy-urls.txt"
-        [ "$success" -eq 1 ] || { fail "Не удалось скачать совместимый ARMv5+gVisor Mihomo из Releases проекта"; return 1; }
+        test "$success" -eq 1 || { fail "Не удалось скачать совместимый ARMv5+gVisor Mihomo из Releases проекта"; return 1; }
     else
         MIHOMO_URL_SELECTED="$(latest_official_mihomo_url)" || return 1
         MIHOMO_VERSION_SELECTED="$(printf '%s\n' "$MIHOMO_URL_SELECTED" | sed -n 's#.*/download/\([^/]*\)/.*#\1#p')"
-        [ -n "$MIHOMO_VERSION_SELECTED" ] || MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_FALLBACK"
+        test -n "$MIHOMO_VERSION_SELECTED" || MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_FALLBACK"
         say "Скачиваю официальный Mihomo $MIHOMO_VERSION_SELECTED для $MIHOMO_TARGET"
         fetch "$MIHOMO_URL_SELECTED" "$archive" || { fail "Не удалось скачать $MIHOMO_URL_SELECTED"; return 1; }
         validate_downloaded_mihomo "$archive" "$newbin" || return 1
     fi
 
-    [ -f "$BASE/bin/mihomo" ] && cp -f "$BASE/bin/mihomo" "$BASE/backups/mihomo.previous" 2>/dev/null || true
+    test -f "$BASE/bin/mihomo" && cp -f "$BASE/bin/mihomo" "$BASE/backups/mihomo.previous" 2>/dev/null || true
     mv -f "$newbin" "$BASE/bin/mihomo" || return 1
     chmod 755 "$BASE/bin/mihomo" || return 1
 }
@@ -886,10 +886,10 @@ install_mihomo(){
 find_ui_root(){
     unpack="$1"
     for p in "$unpack/index.html" "$unpack"/*/index.html "$unpack"/*/*/index.html; do
-        [ -f "$p" ] && { dirname "$p"; return 0; }
+        test -f "$p" && { dirname "$p"; return 0; }
     done
     p="$(find "$unpack" -type f -name index.html 2>/dev/null | head -n 1)"
-    [ -n "$p" ] && { dirname "$p"; return 0; }
+    test -n "$p" && { dirname "$p"; return 0; }
     return 1
 }
 
@@ -903,9 +903,9 @@ unpack_ui(){
     # archive look broken on RT-AC68U-class routers.
     "$UNZIP_BIN" -oq "$archive" -d "$unpack" >> "$INSTALL_LOG" 2>&1 || return 1
     src="$(find_ui_root "$unpack")" || return 1
-    [ -s "$src/index.html" ] || return 1
+    test -s "$src/index.html" || return 1
     cp -R "$src"/. "$dst"/ || return 1
-    [ -s "$dst/index.html" ]
+    test -s "$dst/index.html"
 }
 
 install_zashboard(){
@@ -919,8 +919,8 @@ install_zashboard(){
         "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip" \
         "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-cdn-fonts.zip" \
         "https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip"; do
-        [ -n "$url" ] || continue
-        [ "$url" = "$last_url" ] && continue
+        test -n "$url" || continue
+        test "$url" = "$last_url" && continue
         last_url="$url"
         say "Скачиваю Zashboard: $url"
         if fetch "$url" "$archive" && unpack_ui "$archive" "$unpack" "$ui_new"; then
@@ -930,12 +930,12 @@ install_zashboard(){
         warn "Архив Zashboard не подошёл: $url"
         rm -rf "$unpack" "$ui_new" "$archive"
     done
-    [ -n "$selected" ] || { fail "Не удалось скачать и распаковать Zashboard"; return 1; }
+    test -n "$selected" || { fail "Не удалось скачать и распаковать Zashboard"; return 1; }
 
     rm -rf "$BASE/ui.previous"
-    [ -d "$BASE/ui" ] && mv "$BASE/ui" "$BASE/ui.previous" 2>/dev/null || true
+    test -d "$BASE/ui" && mv "$BASE/ui" "$BASE/ui.previous" 2>/dev/null || true
     mv "$ui_new" "$BASE/ui" || {
-        [ -d "$BASE/ui.previous" ] && mv "$BASE/ui.previous" "$BASE/ui" 2>/dev/null || true
+        test -d "$BASE/ui.previous" && mv "$BASE/ui.previous" "$BASE/ui" 2>/dev/null || true
         fail "Не удалось активировать Zashboard"
         return 1
     }
@@ -945,14 +945,14 @@ install_zashboard(){
 
 add_once(){
     file="$1"; line="$2"
-    [ -f "$file" ] || printf '#!/bin/sh\n' > "$file"
+    test -f "$file" || printf '#!/bin/sh\n' > "$file"
     grep -Fqx "$line" "$file" 2>/dev/null || printf '%s\n' "$line" >> "$file"
     chmod 755 "$file" 2>/dev/null || true
 }
 
 remove_legacy_hook_lines(){
     file="$1"
-    [ -f "$file" ] || return 0
+    test -f "$file" || return 0
     tmp="$file.goshacrash.$$"
     awk '
       /goshacrash-autostart/ {next}
@@ -972,7 +972,7 @@ write_command_wrapper(){
     cat > "$dst" <<'WRAP'
 #!/bin/sh
 BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] && [ -x "$BASE/goshacrash.sh" ] || { echo "GoshaCrash не найден на USB" >&2; exit 1; }
+test -n "$BASE" && test -x "$BASE/goshacrash.sh" || { echo "GoshaCrash не найден на USB" >&2; exit 1; }
 GOSHACRASH_BASE="$BASE"
 export GOSHACRASH_BASE
 exec "$BASE/goshacrash.sh" "$@"
@@ -996,9 +996,9 @@ write_nano_wrapper(){
 #!/bin/sh
 BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
 DM_ROOT=""
-[ -f "$BASE/state/platform.env" ] && . "$BASE/state/platform.env"
+test -f "$BASE/state/platform.env" && . "$BASE/state/platform.env"
 for p in /opt/bin/nano /tmp/opt/bin/nano "$DM_ROOT/bin/nano" "$DM_ROOT/sbin/nano"; do
-  [ -x "$p" ] && exec "$p" "$@"
+  test -x "$p" && exec "$p" "$@"
 done
 echo "nano не найден. Установи nano через пакетный менеджер Download Master" >&2
 exit 1
@@ -1030,10 +1030,10 @@ rewrite_nvram_hook(){
 install_nvram_usb_hooks(){
     find_nvram || { warn "nvram недоступен: stock USB hook пропущен; JFFS и Download Master hooks установлены"; return 0; }
     rewrite_nvram_hook script_usbmount '# GOSHACRASH_USBMOUNT_BEGIN' '# GOSHACRASH_USBMOUNT_END' \
-      'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); [ -x "$BASE/goshacrash.sh" ] && /jffs/addons/goshacrash/start.sh &' || warn "Не удалось записать USB-mount hook"
+      'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); test -x "$BASE/goshacrash.sh" && /jffs/addons/goshacrash/start.sh &' || warn "Не удалось записать USB-mount hook"
     rewrite_nvram_hook script_usbumount '# GOSHACRASH_USBUMOUNT_BEGIN' '# GOSHACRASH_USBUMOUNT_END' \
-      'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" service-stop >/dev/null 2>&1' || warn "Не удалось записать USB-unmount hook"
-    [ "$(nvram_get jffs2_scripts)" = 1 ] || nvram_set jffs2_scripts 1 || true
+      'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); test -x "$BASE/goshacrash.sh" && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" service-stop >/dev/null 2>&1' || warn "Не удалось записать USB-unmount hook"
+    test "$(nvram_get jffs2_scripts)" = 1 || nvram_set jffs2_scripts 1 || true
     nvram_commit || true
     case "$(nvram_get script_usbmount)" in
       *GOSHACRASH_USBMOUNT_BEGIN*) : ;;
@@ -1045,9 +1045,9 @@ install_nvram_usb_hooks(){
 
 merge_ipkg_package_stanza(){
     src="$1"; dst="$2"; package="$3"
-    [ -f "$src" ] || return 1
+    test -f "$src" || return 1
     mkdir -p "$(dirname "$dst")" || return 1
-    [ -f "$dst" ] || : > "$dst"
+    test -f "$dst" || : > "$dst"
     grep -q "^Package: $package\$" "$dst" 2>/dev/null && return 0
 
     awk -v pkg="$package" '
@@ -1074,12 +1074,12 @@ device="$(echo "$mount" | awk '{print $1}')"
 mount="$(echo "$mount" | awk '{print $2}')"
 case "$1" in
   start)
-    if [ -x /jffs/scripts/usb-mount-script ]; then
+    if test -x /jffs/scripts/usb-mount-script; then
       /jffs/scripts/usb-mount-script "$device" "$mount" &
     fi
     {
       timeout=15
-      while [ "$(nvram get apps_state_autorun)" != "4" ] && [ "$timeout" -ge 0 ]; do
+      while test "$(nvram get apps_state_autorun)" != "4" && test "$timeout" -ge 0; do
         sleep 1
         timeout=$((timeout-1))
       done
@@ -1089,7 +1089,7 @@ case "$1" in
     } >/dev/null 2>&1 &
     ;;
   stop)
-    [ -x /jffs/scripts/usb-umount-script ] && /jffs/scripts/usb-umount-script "$device" "$mount" &
+    test -x /jffs/scripts/usb-umount-script && /jffs/scripts/usb-umount-script "$device" "$mount" &
     ;;
 esac
 HOOK
@@ -1140,7 +1140,7 @@ remove_pre3712_autostart(){
               !skip {print}
             ' > "$tmp" 2>/dev/null || true
             cleaned="$(cat "$tmp" 2>/dev/null)"
-            [ "$cleaned" = "$value" ] || nvram_set "$key" "$cleaned" >/dev/null 2>&1 || true
+            test "$cleaned" = "$value" || nvram_set "$key" "$cleaned" >/dev/null 2>&1 || true
             rm -f "$tmp"
         done
         nvram_commit >/dev/null 2>&1 || true
@@ -1157,8 +1157,8 @@ install_hooks(){
 BASE_FILE=/jffs/addons/goshacrash/base
 WAITED=0
 BASE="$(cat "$BASE_FILE" 2>/dev/null)"
-while [ -z "$BASE" ] || [ ! -x "$BASE/goshacrash.sh" ]; do
-  [ "$WAITED" -ge 300 ] && exit 0
+while test -z "$BASE" || test ! -x "$BASE/goshacrash.sh"; do
+  test "$WAITED" -ge 300 && exit 0
   sleep 5
   WAITED=$((WAITED + 5))
   BASE="$(cat "$BASE_FILE" 2>/dev/null)"
@@ -1177,21 +1177,21 @@ HOOK
 #!/bin/sh
 MOUNT_POINT="$2"
 BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] || exit 0
+test -n "$BASE" || exit 0
 case "$BASE" in
   "$MOUNT_POINT"/*)
     DM=""
     for d in "$MOUNT_POINT/asusware.arm" "$MOUNT_POINT/asusware.arm64" "$MOUNT_POINT/asusware"; do
-      [ -d "$d" ] && { DM="$d"; break; }
+      test -d "$d" && { DM="$d"; break; }
     done
-    if [ -n "$DM" ] && [ -d "$DM" ]; then
-      if [ -L /tmp/opt ]; then
+    if test -n "$DM" && test -d "$DM"; then
+      if test -L /tmp/opt; then
         ln -snf "$DM" /tmp/opt 2>/dev/null || true
-      elif [ -d /tmp/opt ]; then
-        if [ ! -x /tmp/opt/bin/ipkg ] && [ ! -x /tmp/opt/bin/opkg ]; then
+      elif test -d /tmp/opt; then
+        if test ! -x /tmp/opt/bin/ipkg && test ! -x /tmp/opt/bin/opkg; then
           rmdir /tmp/opt 2>/dev/null && ln -s "$DM" /tmp/opt 2>/dev/null || true
         fi
-      elif [ ! -e /tmp/opt ]; then
+      elif test ! -e /tmp/opt; then
         ln -s "$DM" /tmp/opt 2>/dev/null || true
       fi
       touch "$DM/.asusrouter" 2>/dev/null || true
@@ -1207,10 +1207,10 @@ HOOK
 #!/bin/sh
 MOUNT_POINT="$2"
 BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] || exit 0
+test -n "$BASE" || exit 0
 case "$BASE" in
   "$MOUNT_POINT"/*)
-    [ -x "$BASE/goshacrash.sh" ] && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" service-stop >/dev/null 2>&1 || true
+    test -x "$BASE/goshacrash.sh" && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" service-stop >/dev/null 2>&1 || true
     ;;
 esac
 exit 0
@@ -1222,7 +1222,7 @@ HOOK
     write_command_wrapper /jffs/scripts/gc
     write_nano_wrapper /jffs/scripts/nano
     write_command_wrapper "$DM_ROOT/bin/gc"
-    [ -d /opt/bin ] && [ -w /opt/bin ] && write_command_wrapper /opt/bin/gc 2>/dev/null || true
+    test -d /opt/bin && test -w /opt/bin && write_command_wrapper /opt/bin/gc 2>/dev/null || true
     add_once /jffs/configs/profile.add 'export PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"'
 
     remove_pre3712_autostart
@@ -1232,25 +1232,30 @@ HOOK
 }
 
 verify_shell_compat(){
-    PATH="/jffs/scripts:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
-    export PATH
+    wrapper="/jffs/scripts/["
+    busybox="/bin/busybox"
 
-    command -v '[' >/dev/null 2>&1 || {
-        fail "Shell compatibility: команда [ не найдена"
+    test -x "$busybox" || {
+        fail "Shell compatibility: /bin/busybox не найден"
+        return 1
+    }
+    test -x "$wrapper" || {
+        fail "Shell compatibility: wrapper $wrapper не создан"
+        ls -la /jffs/scripts >> "$INSTALL_LOG" 2>&1 || true
         return 1
     }
 
-    [ -n "goshacrash" ] || {
-        fail "Shell compatibility: [ не работает"
+    "$busybox" '[' -n "goshacrash" ']' >/dev/null 2>&1 || {
+        fail "Shell compatibility: BusyBox applet [ не работает"
+        return 1
+    }
+    "$wrapper" -n "goshacrash" ']' >/dev/null 2>&1 || {
+        fail "Shell compatibility: $wrapper не работает"
         return 1
     }
 
-    /bin/busybox '[' -n "goshacrash" ']' >/dev/null 2>&1 || {
-        fail "BusyBox [ applet не работает"
-        return 1
-    }
-
-    say "Shell compatibility: [=$(command -v '[' 2>/dev/null)"
+    say "Shell compatibility: OK ($wrapper -> /bin/busybox [)"
+    ls -l "$wrapper" >> "$INSTALL_LOG" 2>&1 || true
     return 0
 }
 
@@ -1278,7 +1283,7 @@ EOF
 
 save_install_log(){
     mkdir -p "$BASE/logs" 2>/dev/null || return 0
-    if [ "$INSTALL_LOG" = "$TMP_LOG" ]; then
+    if test "$INSTALL_LOG" = "$TMP_LOG"; then
         cat "$TMP_LOG" >> "$BASE/logs/install.log" 2>/dev/null || true
         INSTALL_LOG="$BASE/logs/install.log"
     fi
@@ -1290,12 +1295,12 @@ normalize_legacy_optware_unzip() {
     # Old ASUS Download Master / Optware packages may install Info-ZIP as
     # /opt/bin/unzip-unzip and rely on an alternatives symlink that is absent
     # on some ASUSWRT builds. Create the compatibility symlink ourselves.
-    if [ ! -x /opt/bin/unzip ] && [ -x /opt/bin/unzip-unzip ]; then
+    if test ! -x /opt/bin/unzip && test -x /opt/bin/unzip-unzip; then
         ln -sf /opt/bin/unzip-unzip /opt/bin/unzip 2>/dev/null || true
     fi
 
     # Some installs expose /opt through the USB prefix only.
-    if [ -n "$DM_ROOT" ] && [ -x "$DM_ROOT/bin/unzip-unzip" ] && [ ! -x "$DM_ROOT/bin/unzip" ]; then
+    if test -n "$DM_ROOT" && test -x "$DM_ROOT/bin/unzip-unzip" && test ! -x "$DM_ROOT/bin/unzip"; then
         ln -sf "$DM_ROOT/bin/unzip-unzip" "$DM_ROOT/bin/unzip" 2>/dev/null || true
     fi
 }
@@ -1303,7 +1308,7 @@ normalize_legacy_optware_unzip() {
 
 main(){
     : > "$TMP_LOG"
-    [ "$#" -eq 0 ] || { fail "install.sh запускается без аргументов"; return 1; }
+    test "$#" -eq 0 || { fail "install.sh запускается без аргументов"; return 1; }
     acquire_lock || return 1
 
     verify_asuswrt || return 1
@@ -1323,7 +1328,7 @@ main(){
 
     detect_platform || return 1
     choose_routing_mode || return 1
-    model_name="$(nvram_get productid)"; [ -n "$model_name" ] || model_name="$(hostname 2>/dev/null)"; [ -n "$model_name" ] || model_name="ASUSWRT"
+    model_name="$(nvram_get productid)"; test -n "$model_name" || model_name="$(hostname 2>/dev/null)"; test -n "$model_name" || model_name="ASUSWRT"
     say "Роутер: $model_name, архитектура $(uname -m 2>/dev/null), ядро $(uname -r 2>/dev/null)"
     say "Профиль: $PLATFORM; routing=$ROUTING_MODE; tun.stack=$TUN_STACK"
 

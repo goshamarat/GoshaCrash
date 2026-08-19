@@ -1,4 +1,4 @@
-# GoshaCrash 3.8.5
+# GoshaCrash 3.8.6
 
 Здесь нет описания shell-функций. Ниже — команды, которые можно **буквально вставлять в SSH**.
 
@@ -547,4 +547,29 @@ gc doctor
 
 ```text
 shell [: OK
+```
+
+
+## 3.8.6 — исправление shell compatibility
+
+В 3.8.5 preflight ошибочно проверял `command -v '['`. На старом stock ASUSWRT/ash
+это не является надёжной проверкой внешнего wrapper-файла. Кроме того, сам installer
+успевал использовать `[ ... ]` до установки wrapper.
+
+В 3.8.6 installer использует builtin `test` для собственных проверок, а совместимость
+проверяется прямым запуском:
+
+```sh
+/bin/busybox '[' -n "goshacrash" ']'
+/jffs/scripts/'[' -n "goshacrash" ']'
+```
+
+Проверка после установки:
+
+```sh
+gc version
+/bin/busybox '[' -n "ok" ']'; echo "BUSYBOX=$?"
+/jffs/scripts/'[' -n "ok" ']'; echo "WRAPPER=$?"
+gc doctor
+gc status
 ```
