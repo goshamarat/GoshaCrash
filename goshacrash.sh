@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.7.11"
-BUILD_ID="2026-08-18-stock-asus-optware-sftp-r11"
+VERSION="3.8.1"
+BUILD_ID="2026-08-19-terminal-guide-r1"
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -25,10 +25,7 @@ CONTROL_LOCK="$RUN/control.lock"
 MANUAL_STOP="$STATE/manual-stop"
 
 MIHOMO_LOG="$LOGS/mihomo.log"
-SYSTEM_LOG="$LOGS/goshacrash.log"
 INSTALL_LOG="$LOGS/install.log"
-BOOT_LOG="$LOGS/boot.log"
-WATCHDOG_LOG="$LOGS/watchdog.log"
 PACKAGES_LOG="$LOGS/packages.log"
 
 JFFS_DIR="/jffs/addons/goshacrash"
@@ -43,7 +40,15 @@ OUTBOUND_MARK="${GOSHACRASH_OUTBOUND_MARK:-0x2334}"
 DNS_PORT="${MIHOMO_DNS_PORT:-1053}"
 ROUTE_ROUTER="${GOSHACRASH_ROUTE_ROUTER:-1}"
 BOOT_WAIT="${GOSHACRASH_BOOT_WAIT:-300}"
-WATCHDOG_INTERVAL="${GOSHACRASH_WATCHDOG_INTERVAL:-60}"
+WATCHDOG_INTERVAL="${GOSHACRASH_WATCHDOG_INTERVAL:-10}"
+WAN_FAIL_LIMIT="${GOSHACRASH_WAN_FAIL_LIMIT:-3}"
+WAN_RECOVER_LIMIT="${GOSHACRASH_WAN_RECOVER_LIMIT:-2}"
+WAN_PROBE_TIMEOUT="${GOSHACRASH_WAN_PROBE_TIMEOUT:-2}"
+WAN_PROBE_IPS="${GOSHACRASH_WAN_PROBE_IPS:-1.1.1.1 8.8.8.8 9.9.9.9}"
+WAN_OFFLINE="$STATE/wan-offline"
+WAN_FAIL_COUNT="$STATE/wan-fail-count"
+WAN_OK_COUNT="$STATE/wan-ok-count"
+WAN_STATE="$STATE/internet.state"
 PROC_SYS="${GOSHACRASH_PROC_SYS:-/proc/sys}"
 
 ROUTE_STATE="$STATE/route"
@@ -95,12 +100,7 @@ rotate_log(){
     : > "$file"
 }
 
-log_event(){
-    level="$1"; area="$2"; shift 2
-    ensure_dirs >/dev/null 2>&1 || true
-    rotate_log "$SYSTEM_LOG" 1048576
-    printf '[%s] [%s] [%s] %s\n' "$(now)" "$level" "$area" "$*" >> "$SYSTEM_LOG" 2>/dev/null || true
-}
+log_event(){ :; }
 
 say(){ printf '%s\n' "[GoshaCrash] $*"; log_event INFO main "$*"; }
 ok(){ printf '%s\n' "[GoshaCrash:OK] $*"; log_event OK main "$*"; }
@@ -192,20 +192,43 @@ find_pkg(){
     [ -n "$PKG" ]
 }
 
-repair_opt(){
-    find_dm_root || { fail "Download Master не найден на $USB_MOUNT"; return 1; }
-    refresh_path
-    if find_pkg; then ok "Download Master и пакетный менеджер готовы: $PKG"; return 0; fi
 
-    say "Пробую штатно перезапустить окружение Download Master"
-    for script in "$DM_ROOT/S50downloadmaster.1" /tmp/opt/S50downloadmaster.1 "$DM_ROOT/etc/init.d/S50downloadmaster" "$DM_ROOT/etc/init.d/S50downloadmaster.1"; do
-        [ -x "$script" ] || continue
-        "$script" restart >> "$PACKAGES_LOG" 2>&1 || "$script" start >> "$PACKAGES_LOG" 2>&1 || true
-        sleep 3
-        refresh_path
-        find_pkg && { ok "Пакетный менеджер восстановлен: $PKG"; return 0; }
+
+ensure_optware_link(){
+    find_dm_root || return 1
+    [ -d "$DM_ROOT" ] || return 1
+    touch "$DM_ROOT/.asusrouter" 2>/dev/null || true
+    if [ -L /tmp/opt ]; then
+      target="$(readlink /tmp/opt 2>/dev/null)"
+      [ "$target" = "$DM_ROOT" ] || ln -snf "$DM_ROOT" /tmp/opt 2>/dev/null || return 1
+    elif [ -d /tmp/opt ]; then
+      if [ ! -x /tmp/opt/bin/ipkg ] && [ ! -x /tmp/opt/bin/opkg ]; then
+        rmdir /tmp/opt 2>/dev/null && ln -s "$DM_ROOT" /tmp/opt 2>/dev/null || true
+      fi
+    elif [ ! -e /tmp/opt ]; then
+      ln -s "$DM_ROOT" /tmp/opt 2>/dev/null || return 1
+    fi
+    return 0
+}
+optware_runtime_ready(){
+    ensure_optware_link >/dev/null 2>&1 || true
+    [ -x /tmp/opt/bin/ipkg ] || [ -x /tmp/opt/bin/opkg ] || [ -x /opt/bin/ipkg ] || [ -x /opt/bin/opkg ] || [ -x "$DM_ROOT/bin/ipkg" ] || [ -x "$DM_ROOT/bin/opkg" ]
+}
+repair_opt(){
+    find_dm_root || return 1
+    ensure_optware_link >/dev/null 2>&1 || true
+    refresh_path
+    find_pkg || return 1
+    optware_runtime_ready && return 0
+    for script in "$DM_ROOT/S50downloadmaster.1" "$DM_ROOT/etc/init.d/S50downloadmaster" "$DM_ROOT/etc/init.d/S50downloadmaster.1"; do
+      [ -x "$script" ] || continue
+      "$script" start >> "$PACKAGES_LOG" 2>&1 || true
+      sleep 2
+      ensure_optware_link >/dev/null 2>&1 || true
+      refresh_path
+      optware_runtime_ready && return 0
     done
-    fail "Download Master найден, но ipkg/opkg не готов. Перезапусти Download Master в веб-интерфейсе ASUS"
+    [ -x "$DM_ROOT/bin/ipkg" ] || [ -x "$DM_ROOT/bin/opkg" ]
 }
 
 pkg_update_index(){
@@ -498,6 +521,9 @@ build_router_chain(){
     ipt -t mangle -A "$ROUTER_CHAIN" -m mark --mark "$OUTBOUND_MARK" -j RETURN || return 1
     ipt -t mangle -A "$ROUTER_CHAIN" -p udp --dport 53 -j RETURN || return 1
     ipt -t mangle -A "$ROUTER_CHAIN" -p tcp --dport 53 -j RETURN || return 1
+    for probe_ip in $WAN_PROBE_IPS; do
+        ipt -t mangle -A "$ROUTER_CHAIN" -d "$probe_ip/32" -j RETURN || return 1
+    done
     add_exclusions mangle "$ROUTER_CHAIN" || return 1
     ipt -t mangle -A "$ROUTER_CHAIN" -j MARK --set-mark "$TUN_MARK" || return 1
     ipt -t mangle -I OUTPUT 1 -j "$ROUTER_CHAIN" || return 1
@@ -527,7 +553,51 @@ build_forward(){
     ipt -t filter -I FORWARD 1 -j "$FORWARD_CHAIN" || return 1
 }
 
-manual_route_start(){
+manual_counter_get(){ n="$(cat "$1" 2>/dev/null)"; case "$n" in ''|*[!0-9]*) n=0;; esac; printf '%s\n' "$n"; }
+counter_set(){ printf '%s\n' "$2" > "$1" 2>/dev/null || true; }
+set_wan_state(){ printf '%s\n' "$1" > "$WAN_STATE" 2>/dev/null || true; }
+internet_probe_once(){
+    main_default_route || return 1
+    ping_bin="$(command -v ping 2>/dev/null)"
+    if [ -n "$ping_bin" ]; then
+      for ip in $WAN_PROBE_IPS; do
+        "$ping_bin" -c 1 -W "$WAN_PROBE_TIMEOUT" "$ip" >/dev/null 2>&1 && return 0
+      done
+    fi
+    wget_bin="$(command -v wget 2>/dev/null)"
+    [ -n "$wget_bin" ] && "$wget_bin" -q -T "$WAN_PROBE_TIMEOUT" -O /dev/null http://1.1.1.1/cdn-cgi/trace >/dev/null 2>&1 && return 0
+    return 1
+}
+wan_mark_offline(){ touch "$WAN_OFFLINE" 2>/dev/null || true; counter_set "$WAN_OK_COUNT" 0; set_wan_state offline; }
+wan_mark_online(){ rm -f "$WAN_OFFLINE" 2>/dev/null || true; counter_set "$WAN_FAIL_COUNT" 0; set_wan_state online; }
+runtime_health_ok(){
+    running_pid >/dev/null 2>&1 || return 1
+    netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" || return 1
+    net_link_exists "$TUN_DEVICE" || return 1
+    route_status >/dev/null 2>&1 || return 1
+}
+watchdog_connectivity_step(){
+    if internet_probe_once; then
+      counter_set "$WAN_FAIL_COUNT" 0
+      n="$(counter_get "$WAN_OK_COUNT")"; n=$((n+1)); counter_set "$WAN_OK_COUNT" "$n"
+      if [ -f "$WAN_OFFLINE" ]; then
+        [ "$n" -ge "$WAN_RECOVER_LIMIT" ] || return 1
+        wan_mark_online
+      else
+        set_wan_state online
+      fi
+      return 0
+    fi
+    counter_set "$WAN_OK_COUNT" 0
+    n="$(counter_get "$WAN_FAIL_COUNT")"; n=$((n+1)); counter_set "$WAN_FAIL_COUNT" "$n"
+    if [ "$n" -ge "$WAN_FAIL_LIMIT" ] && [ ! -f "$WAN_OFFLINE" ]; then
+      wan_mark_offline
+      stop_runtime
+    fi
+    return 1
+}
+
+route_start(){
     select_net_backend || return 1
     [ -x "$IPTABLES" ] || { fail "iptables не найден"; return 1; }
     net_link_exists "$TUN_DEVICE" || { fail "TUN-интерфейс $TUN_DEVICE не найден"; return 1; }
@@ -629,25 +699,48 @@ watchdog_stop(){ if p="$(watchdog_pid)"; then kill "$p" 2>/dev/null || true; sle
 watchdog_start(){
     [ -f "$MANUAL_STOP" ] && return 0
     watchdog_pid >/dev/null 2>&1 && return 0
-    rotate_log "$WATCHDOG_LOG" 524288
-    if have nohup; then GOSHACRASH_BASE="$BASE" nohup "$BASE/goshacrash.sh" watchdog-loop </dev/null >> "$WATCHDOG_LOG" 2>&1 & else GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" watchdog-loop </dev/null >> "$WATCHDOG_LOG" 2>&1 & fi
-    p=$!; echo "$p" > "$WATCHDOG_PIDFILE"; sleep 1; kill -0 "$p" 2>/dev/null || { rm -f "$WATCHDOG_PIDFILE"; return 1; }
+    if have nohup; then
+      GOSHACRASH_BASE="$BASE" nohup "$BASE/goshacrash.sh" watchdog-loop </dev/null >/dev/null 2>&1 &
+    else
+      GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" watchdog-loop </dev/null >/dev/null 2>&1 &
+    fi
+    p=$!; echo "$p" > "$WATCHDOG_PIDFILE"; sleep 1
+    kill -0 "$p" 2>/dev/null || { rm -f "$WATCHDOG_PIDFILE"; return 1; }
 }
 watchdog_check(){
     [ -f "$MANUAL_STOP" ] && return 0
     [ -d "$CONTROL_LOCK" ] && return 0
     [ -d "$START_LOCK" ] && return 0
-    if ! running_pid >/dev/null 2>&1; then printf '%s Mihomo stopped; restart\n' "$(now)" >> "$WATCHDOG_LOG"; with_start_lock start_runtime >> "$WATCHDOG_LOG" 2>&1 || true; return 0; fi
-    if ! route_status >/dev/null 2>&1; then printf '%s route broken; repair\n' "$(now)" >> "$WATCHDOG_LOG"; route_start >> "$WATCHDOG_LOG" 2>&1 || { stop_runtime; with_start_lock start_runtime >> "$WATCHDOG_LOG" 2>&1 || true; }; fi
+    watchdog_connectivity_step || true
+    [ -f "$WAN_OFFLINE" ] && return 0
+    if ! running_pid >/dev/null 2>&1; then
+      with_start_lock start_runtime >/dev/null 2>&1 || true
+      return 0
+    fi
+    if ! runtime_health_ok; then
+      stop_runtime
+      with_start_lock start_runtime >/dev/null 2>&1 || true
+    fi
 }
 watchdog_loop(){
-    ensure_dirs || exit 1; echo "$$" > "$WATCHDOG_PIDFILE"; trap 'rm -f "$WATCHDOG_PIDFILE"; exit 0' HUP INT TERM
-    while :; do sleep "$WATCHDOG_INTERVAL"; watchdog_check; rotate_log "$WATCHDOG_LOG" 524288; done
+    ensure_dirs || exit 1
+    echo "$$" > "$WATCHDOG_PIDFILE"
+    trap 'rm -f "$WATCHDOG_PIDFILE"; exit 0' HUP INT TERM
+    while :; do sleep "$WATCHDOG_INTERVAL"; watchdog_check; done
 }
 
 start(){
-    ensure_dirs || return 1; load_platform || return 1; rm -f "$MANUAL_STOP"; mkdir "$CONTROL_LOCK" 2>/dev/null || true
-    with_start_lock start_runtime; rc=$?; rmdir "$CONTROL_LOCK" 2>/dev/null || true; [ "$rc" -eq 0 ] && watchdog_start; return "$rc"
+    ensure_dirs || return 1; load_platform || return 1
+    rm -f "$MANUAL_STOP"; mkdir "$CONTROL_LOCK" 2>/dev/null || true
+    if internet_probe_once; then
+      wan_mark_online; with_start_lock start_runtime; rc=$?
+    else
+      wan_mark_offline; stop_runtime; rc=0
+      warn "Интернет недоступен: Mihomo остановлен, watchdog ждёт восстановления"
+    fi
+    rmdir "$CONTROL_LOCK" 2>/dev/null || true
+    watchdog_start
+    return "$rc"
 }
 stop(){
     ensure_dirs || return 1; load_platform || true; touch "$MANUAL_STOP"; mkdir "$CONTROL_LOCK" 2>/dev/null || true
@@ -667,36 +760,24 @@ service_stop(){
     return 0
 }
 restart(){
-    ensure_dirs || return 1
-    load_platform || return 1
-    refresh_path
-
-    # restart is the only public start/apply action:
-    # validate before touching a working runtime, then restart/start it.
+    ensure_dirs || return 1; load_platform || return 1; refresh_path
     check_config || return 1
     backup_config >/dev/null 2>&1 || true
-
-    rm -f "$MANUAL_STOP"
-    mkdir "$CONTROL_LOCK" 2>/dev/null || true
-    watchdog_stop
-    stop_runtime
-    with_start_lock start_runtime
-    rc=$?
-    rmdir "$CONTROL_LOCK" 2>/dev/null || true
-    if [ "$rc" -eq 0 ]; then
-        watchdog_start
-        return 0
+    rm -f "$MANUAL_STOP"; mkdir "$CONTROL_LOCK" 2>/dev/null || true
+    watchdog_stop; stop_runtime
+    if internet_probe_once; then
+      wan_mark_online; with_start_lock start_runtime; rc=$?
+    else
+      wan_mark_offline; rc=0
+      warn "Интернет недоступен: Mihomo оставлен остановленным; watchdog запустит его после восстановления"
     fi
-
-    # If a newly edited config starts badly, restore the last known-good one.
+    rmdir "$CONTROL_LOCK" 2>/dev/null || true
+    watchdog_start
+    [ "$rc" -eq 0 ] && return 0
     if [ -f "$BACKUPS/config.last-good.yaml" ]; then
-        warn "Новый config.yaml не запустился; возвращаю последний рабочий"
-        cp -f "$BACKUPS/config.last-good.yaml" "$CONFIG" || return 1
-        rm -f "$MANUAL_STOP"
-        mkdir "$CONTROL_LOCK" 2>/dev/null || true
-        with_start_lock start_runtime >/dev/null 2>&1 || true
-        rmdir "$CONTROL_LOCK" 2>/dev/null || true
-        running_pid >/dev/null 2>&1 && watchdog_start >/dev/null 2>&1 || true
+      warn "Новый config.yaml не запустился; возвращаю последний рабочий"
+      cp -f "$BACKUPS/config.last-good.yaml" "$CONFIG" || return 1
+      if internet_probe_once; then with_start_lock start_runtime >/dev/null 2>&1 || true; fi
     fi
     return 1
 }
@@ -707,13 +788,19 @@ main_default_route(){
 }
 boot(){
     ensure_dirs || return 1; load_platform || return 1
-    [ -f "$MANUAL_STOP" ] && { say "Автозапуск пропущен после ручной остановки"; return 0; }
+    [ -f "$MANUAL_STOP" ] && return 0
     if [ -f "$BOOT_PIDFILE" ]; then old="$(cat "$BOOT_PIDFILE" 2>/dev/null)"; case "$old" in ''|*[!0-9]*) old="";; esac; [ -n "$old" ] && kill -0 "$old" 2>/dev/null && return 0; fi
-    echo "$$" > "$BOOT_PIDFILE"; repair_opt >/dev/null 2>&1 || true
-    waited=0; while ! main_default_route; do [ "$waited" -ge "$BOOT_WAIT" ] && { warn "Default route не появился за $BOOT_WAIT секунд"; rm -f "$BOOT_PIDFILE"; return 0; }; sleep 5; waited=$((waited + 5)); done
-    sleep 5; start; rc=$?; rm -f "$BOOT_PIDFILE"; return "$rc"
+    echo "$$" > "$BOOT_PIDFILE"
+    repair_opt >/dev/null 2>&1 || true
+    rm -f "$BOOT_PIDFILE"
+    if internet_probe_once; then wan_mark_online; start; else wan_mark_offline; stop_runtime; watchdog_start; return 0; fi
 }
-firewall_reload(){ load_platform || return 0; running_pid >/dev/null 2>&1 || return 0; if [ "$ROUTING_MODE" = manual ]; then route_start || { warn "Не восстановлены legacy-правила после firewall restart"; return 1; }; else restart; fi; }
+firewall_reload(){
+    load_platform || return 0
+    [ -f "$WAN_OFFLINE" ] && return 0
+    running_pid >/dev/null 2>&1 || return 0
+    if [ "$ROUTING_MODE" = manual ]; then route_start || return 1; else restart; fi
+}
 
 backup_config(){
     [ -f "$CONFIG" ] || return 1
@@ -723,23 +810,78 @@ backup_config(){
 
 find_editor(){
     refresh_path
-    for e in /opt/bin/nano /tmp/opt/bin/nano "$DM_ROOT/bin/nano" /jffs/scripts/nano; do [ -x "$e" ] && { printf '%s\n' "$e"; return 0; }; done
+
+    for e in \
+        /opt/bin/nano \
+        /tmp/opt/bin/nano \
+        "$DM_ROOT/bin/nano" \
+        "$DM_ROOT/sbin/nano"
+    do
+        [ -x "$e" ] && { printf '%s\n' "$e"; return 0; }
+    done
+
     return 1
 }
 
+repair_nano_runtime(){
+    find_editor >/dev/null 2>&1 && return 0
+    repair_opt >/dev/null 2>&1 || true
+    find_editor >/dev/null 2>&1 && return 0
+    find_pkg || return 1
+    if "$PKG" list_installed 2>/dev/null | grep -q '^nano[[:space:]]*-'; then
+      "$PKG" install nano >> "$PACKAGES_LOG" 2>&1 || {
+        "$PKG" remove nano >> "$PACKAGES_LOG" 2>&1 || true
+        "$PKG" install nano >> "$PACKAGES_LOG" 2>&1 || return 1
+      }
+    else
+      "$PKG" update >> "$PACKAGES_LOG" 2>&1 || true
+      "$PKG" install nano >> "$PACKAGES_LOG" 2>&1 || return 1
+    fi
+    ensure_optware_link >/dev/null 2>&1 || true
+    refresh_path
+    find_editor >/dev/null 2>&1
+}
+
 edit_config(){
-    load_platform || return 1; refresh_path
+    load_platform || return 1
+    refresh_path
+
     editor="$(find_editor 2>/dev/null)"
     if [ -z "$editor" ]; then
-        warn "nano не найден; устанавливаю через Download Master"
-        pkg_install nano || return 1
-        editor="$(find_editor 2>/dev/null)" || { fail "nano не найден после установки"; return 1; }
+        repair_nano_runtime || {
+            fail "nano не удалось восстановить. См. $PACKAGES_LOG"
+            return 1
+        }
+        editor="$(find_editor 2>/dev/null)" || {
+            fail "nano не найден после восстановления Optware"
+            return 1
+        }
     fi
-    backup="$(backup_config)" || { fail "Не создана резервная копия config.yaml"; return 1; }
+
+    backup="$(backup_config)" || {
+        fail "Не создана резервная копия config.yaml"
+        return 1
+    }
     say "Резервная копия: $backup"
-    TERM="${TERM:-xterm}" "$editor" "$CONFIG" || { warn "Редактор завершился с ошибкой"; return 1; }
-    if ! check_config; then cp -f "$backup" "$CONFIG"; fail "Конфиг некорректен; восстановлена предыдущая версия"; return 1; fi
-    if ! restart; then cp -f "$backup" "$CONFIG"; warn "Новый конфиг не запустился; восстановлен старый"; restart || true; return 1; fi
+
+    TERM="${TERM:-xterm}" "$editor" "$CONFIG" || {
+        warn "Редактор завершился с ошибкой"
+        return 1
+    }
+
+    if ! check_config; then
+        cp -f "$backup" "$CONFIG"
+        fail "Конфиг некорректен; восстановлена предыдущая версия"
+        return 1
+    fi
+
+    if ! restart; then
+        cp -f "$backup" "$CONFIG"
+        warn "Новый конфиг не запустился; восстановлен старый"
+        restart || true
+        return 1
+    fi
+
     ok "config.yaml сохранён и применён"
 }
 
@@ -897,63 +1039,38 @@ dashboard_base_url(){
 
 log_file_for_kind(){
     case "${1:-mihomo}" in
-        mihomo) printf '%s\n' "$MIHOMO_LOG";;
-        system|goshacrash) printf '%s\n' "$SYSTEM_LOG";;
-        install) printf '%s\n' "$INSTALL_LOG";;
-        boot) printf '%s\n' "$BOOT_LOG";;
-        watchdog) printf '%s\n' "$WATCHDOG_LOG";;
-        packages) printf '%s\n' "$PACKAGES_LOG";;
-        *) return 1;;
+      mihomo) printf '%s\n' "$MIHOMO_LOG";;
+      install) printf '%s\n' "$INSTALL_LOG";;
+      packages) printf '%s\n' "$PACKAGES_LOG";;
+      *) return 1;;
     esac
 }
 
 show_logs(){
-    kind="${1:-mihomo}"; lines="${2:-100}"; case "$lines" in ''|*[!0-9]*) lines=100;; esac
-    file="$(log_file_for_kind "$kind")" || {
-        echo "logs: mihomo|system|install|boot|watchdog|packages"
-        return 1
-    }
+    kind="${1:-mihomo}"; lines="${2:-100}"
+    case "$lines" in ''|*[!0-9]*) lines=100;; esac
+    file="$(log_file_for_kind "$kind")" || { echo "logs: mihomo|install|packages"; return 1; }
     tail -n "$lines" "$file" 2>/dev/null || true
 }
 
 follow_logs(){
-    kind="${1:-mihomo}"; lines="${2:-100}"; case "$lines" in ''|*[!0-9]*) lines=100;; esac
-    file="$(log_file_for_kind "$kind")" || {
-        echo "live logs: mihomo|system|install|boot|watchdog|packages"
-        return 1
-    }
-    [ -e "$file" ] || : > "$file"
-    echo "Live log: $kind ($file)"
-    echo "Ctrl+C — выйти из live-режима"
-    tail -n "$lines" -f "$file"
+    kind="${1:-mihomo}"; lines="${2:-100}"
+    case "$lines" in ''|*[!0-9]*) lines=100;; esac
+    [ "$kind" = mihomo ] || { echo "Live доступен только для Mihomo"; return 1; }
+    [ -e "$MIHOMO_LOG" ] || : > "$MIHOMO_LOG"
+    tail -n "$lines" -f "$MIHOMO_LOG"
 }
 
 status(){
-    ensure_dirs >/dev/null 2>&1 || true
-    load_platform >/dev/null 2>&1 || true
-    refresh_path
-
-    if p="$(running_pid)"; then
-        echo "Mihomo: работает, PID=$p"
-    else
-        echo "Mihomo: не запущен"
-    fi
-
-    if [ "${LEGACY:-0}" = 1 ]; then
-        echo "Профиль: legacy"
-        [ "${MIHOMO_TARGET:-}" = armv5 ] && echo "Ядро: закреплено для legacy ARMv5; обновление ядра отключено"
-    else
-        echo "Профиль: modern"
-    fi
+    ensure_dirs >/dev/null 2>&1 || true; load_platform >/dev/null 2>&1 || true; refresh_path
+    if p="$(running_pid 2>/dev/null)"; then echo "Mihomo: работает, PID=$p"; else echo "Mihomo: не запущен"; fi
+    if [ -f "$WAN_OFFLINE" ]; then echo "Интернет: OFFLINE"; else state="$(cat "$WAN_STATE" 2>/dev/null)"; [ -n "$state" ] || state=unknown; echo "Интернет: $state"; fi
+    if p="$(watchdog_pid 2>/dev/null)"; then echo "Watchdog: работает, PID=$p"; else echo "Watchdog: не запущен"; fi
+    if [ "${LEGACY:-0}" = 1 ]; then echo "Профиль: legacy"; [ "${MIHOMO_TARGET:-}" = armv5 ] && echo "Ядро: закреплено для legacy ARMv5"; else echo "Профиль: modern"; fi
     echo "Режим маршрутизации: $ROUTING_MODE"
-
     echo "Конфиг: $CONFIG"
     net_link_exists "$TUN_DEVICE" && echo "TUN: $TUN_DEVICE работает" || echo "TUN: $TUN_DEVICE не найден"
-    if running_pid >/dev/null 2>&1 && route_status >/dev/null 2>&1; then
-        echo "Состояние маршрутизации: работает"
-    else
-        echo "Состояние маршрутизации: не работает"
-    fi
+    if runtime_health_ok; then echo "Runtime: OK (process + DNS + TUN + routing)"; elif [ -f "$WAN_OFFLINE" ]; then echo "Runtime: остановлен из-за отсутствия интернета"; else echo "Runtime: требует восстановления"; fi
     echo "Zashboard: $(dashboard_base_url)"
 }
 
@@ -1103,10 +1220,11 @@ menu_draw(){
     printf '├───────────────────────────────────────────┤\n'
     printf '\033[0m'
     menu_item "$selected" 1 "Status"
-    menu_item "$selected" 2 "Restart"
-    menu_item "$selected" 3 "Stop"
-    menu_item "$selected" 4 "Logs"
-    menu_item "$selected" 5 "Exit"
+    menu_item "$selected" 2 "Edit config"
+    menu_item "$selected" 3 "Restart"
+    menu_item "$selected" 4 "Stop"
+    menu_item "$selected" 5 "Logs"
+    menu_item "$selected" 6 "Exit"
     printf '\033[1;36m'
     printf '├───────────────────────────────────────────┤\n'
     printf '\033[0m'
@@ -1136,24 +1254,20 @@ menu_read_key(){
 
 menu_logs(){
     while :; do
-        printf '\033[2J\033[H'
-        printf '\033[1;36m=== LOGS ===\033[0m\n\n'
-        echo "  1) Mihomo — последние 100 строк"
-        echo "  2) GoshaCrash — последние 100 строк"
-        echo "  3) Mihomo — LIVE"
-        echo "  4) GoshaCrash — LIVE"
-        echo "  5) Назад"
-        echo
-        printf "Выбор [1-5]: "
-        IFS= read -r log_choice || return 0
-        case "$log_choice" in
-            1) show_logs mihomo 100; menu_pause ;;
-            2) show_logs system 100; menu_pause ;;
-            3) follow_logs mihomo 100; menu_pause ;;
-            4) follow_logs system 100; menu_pause ;;
-            5|q|Q) return 0 ;;
-            *) echo "Неверный выбор"; sleep 1 ;;
-        esac
+      printf '\033[2J\033[H'
+      printf '\033[1;36m=== MIHOMO LOG ===\033[0m\n\n'
+      echo "  1) Последние 100 строк"
+      echo "  2) LIVE"
+      echo "  3) Назад"
+      echo
+      printf "Выбор [1-3]: "
+      IFS= read -r log_choice || return 0
+      case "$log_choice" in
+        1) show_logs mihomo 100; menu_pause ;;
+        2) follow_logs mihomo 100; menu_pause ;;
+        3|q|Q) return 0 ;;
+        *) echo "Неверный выбор"; sleep 1 ;;
+      esac
     done
 }
 
@@ -1164,18 +1278,20 @@ menu_basic(){
         printf 'Mihomo: %s | TUN: %s | Profile: %s | Routing: %s\n\n' \
             "$(menu_state_core)" "$(menu_state_tun)" "$(menu_profile_name)" "${ROUTING_MODE:-unknown}"
         echo "  1) Status"
-        echo "  2) Restart"
-        echo "  3) Stop"
-        echo "  4) Logs"
-        echo "  5) Exit"
-        printf '\nВыбор [1-5]: '
+        echo "  2) Edit config"
+        echo "  3) Restart"
+        echo "  4) Stop"
+        echo "  5) Logs"
+        echo "  6) Exit"
+        printf '\nВыбор [1-6]: '
         IFS= read -r choice || return 0
         case "$choice" in
             1) status ;;
-            2) restart ;;
-            3) stop ;;
-            4) menu_logs ;;
-            5|q|Q) return 0 ;;
+            2) edit_config ;;
+            3) restart ;;
+            4) stop ;;
+            5) menu_logs ;;
+            6|q|Q) return 0 ;;
             *) echo "Неверный выбор" ;;
         esac
         printf '\nНажми Enter, чтобы вернуться в меню...'
@@ -1192,7 +1308,7 @@ menu(){
         return $?
     fi
 
-    items_count=5
+    items_count=6
     selected=1
 
     menu_stty -echo -icanon min 1 time 0 >/dev/null 2>&1 || {
@@ -1223,10 +1339,11 @@ menu(){
                 printf '\033[2J\033[H'
                 case "$selected" in
                     1) status; menu_pause ;;
-                    2) restart; menu_pause ;;
-                    3) stop; menu_pause ;;
-                    4) menu_logs ;;
-                    5) break ;;
+                    2) edit_config; menu_pause ;;
+                    3) restart; menu_pause ;;
+                    4) stop; menu_pause ;;
+                    5) menu_logs ;;
+                    6) break ;;
                 esac
                 load_platform >/dev/null 2>&1 || true
                 menu_stty -echo -icanon min 1 time 0 >/dev/null 2>&1 || true
@@ -1240,198 +1357,289 @@ menu(){
 }
 
 autostart_status(){
-    ensure_dirs >/dev/null 2>&1 || true
-    load_platform >/dev/null 2>&1 || true
-    echo "Autostart GoshaCrash (stock ASUSWRT)"
-    echo "  BASE: $BASE"
-    [ -x /jffs/addons/goshacrash/start.sh ] && echo "  start.sh: OK" || echo "  start.sh: НЕТ"
-    [ -x /jffs/scripts/usb-mount-script ] && echo "  /jffs/scripts/usb-mount-script: OK" || echo "  /jffs/scripts/usb-mount-script: НЕТ"
-
-    if [ -n "$DM_ROOT" ] && [ -x "$DM_ROOT/etc/init.d/S50usb-mount-script" ]; then
-        echo "  ASUS app S50usb-mount-script: OK"
-    else
-        echo "  ASUS app S50usb-mount-script: НЕТ"
-    fi
-
-    if [ -n "$DM_ROOT" ] && grep -q '^Package: usb-mount-script$' "$DM_ROOT/lib/ipkg/status" 2>/dev/null; then
-        echo "  ASUS app package metadata: OK"
-    else
-        echo "  ASUS app package metadata: НЕТ"
-    fi
-
-    [ -f "$MANUAL_STOP" ] && echo "  manual-stop: ДА (включить: gc restart)" || echo "  manual-stop: нет"
-
-    if [ -f "$STATE/autostart-hook-ran" ]; then
-        echo "  последний вызов hook: $(cat "$STATE/autostart-hook-ran" 2>/dev/null)"
-    else
-        echo "  последний вызов hook: ещё не было"
-    fi
-
-    echo "  NVRAM script_usbmount: не используется"
-    echo "  Merlin services-start: не используется"
-    echo "  boot log: $BOOT_LOG"
-    [ -f "$BOOT_LOG" ] && tail -n 20 "$BOOT_LOG"
+    ensure_dirs >/dev/null 2>&1 || true; load_platform >/dev/null 2>&1 || true
+    echo "Autostart (stock ASUSWRT)"
+    [ -x /jffs/addons/goshacrash/start.sh ] && echo "  start.sh: OK" || echo "  start.sh: FAIL"
+    [ -x /jffs/scripts/usb-mount-script ] && echo "  usb-mount-script: OK" || echo "  usb-mount-script: FAIL"
+    [ -x "$DM_ROOT/etc/init.d/S50usb-mount-script" ] && echo "  ASUS app bridge: OK" || echo "  ASUS app bridge: FAIL"
+    [ -f "$STATE/autostart-hook-ran" ] && echo "  last hook: $(cat "$STATE/autostart-hook-ran" 2>/dev/null)" || echo "  last hook: never"
+    [ -f "$MANUAL_STOP" ] && echo "  manual-stop: YES" || echo "  manual-stop: no"
     return 0
 }
 
-
 sftp_status(){
     echo "SFTP / Optware"
-
     p="$(cat "$STATE/sftp-server.path" 2>/dev/null)"
     v="$(cat "$STATE/sftp-server.version" 2>/dev/null)"
 
     if [ -n "$p" ] && [ -x "$p" ]; then
-        echo "  sftp-server: $p"
-        [ -n "$v" ] && echo "  version: $v"
         echo "  binary: OK"
+        echo "  path: $p"
+        [ -n "$v" ] && echo "  version: $v"
     else
         found=""
         for x in /opt/libexec/sftp-server /opt/lib/openssh/sftp-server; do
             [ -x "$x" ] && { found="$x"; break; }
         done
-        [ -n "$found" ] && echo "  sftp-server: $found" || echo "  sftp-server: НЕ НАЙДЕН"
-        [ -n "$v" ] && echo "  version: $v"
+        [ -n "$found" ] && echo "  path: $found" || echo "  binary: НЕ НАЙДЕН"
     fi
-
-    echo "  package: openssh-sftp-server (Optware/ipkg)"
-    echo "  SSH daemon: штатный ASUS/Dropbear не заменяется"
-    echo "  test from PC: sftp admin@<IP-роутера>"
+    echo "  SSH daemon: stock ASUS Dropbear не заменяется"
+    echo "  Проверка с ПК: sftp admin@<IP роутера>"
 }
 
+doctor(){
+    load_platform >/dev/null 2>&1 || true; refresh_path
+    echo "GoshaCrash doctor"
+    echo "  version: $VERSION"
+    echo "  model: $(nvram_get productid)"
+    echo "  kernel: $(uname -r 2>/dev/null)"
+    echo "  arch: $(uname -m 2>/dev/null)"
+    internet_probe_once && echo "  internet: OK" || echo "  internet: FAIL"
+    running_pid >/dev/null 2>&1 && echo "  Mihomo: OK" || echo "  Mihomo: FAIL"
+    netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" && echo "  DNS: OK" || echo "  DNS: FAIL"
+    net_link_exists "$TUN_DEVICE" && echo "  TUN: OK" || echo "  TUN: FAIL"
+    route_status >/dev/null 2>&1 && echo "  routing: OK" || echo "  routing: FAIL"
+    watchdog_pid >/dev/null 2>&1 && echo "  watchdog: OK" || echo "  watchdog: FAIL"
+    find_dm_root >/dev/null 2>&1 && echo "  Download Master: $DM_ROOT" || echo "  Download Master: FAIL"
+    ensure_optware_link >/dev/null 2>&1 && echo "  /tmp/opt: OK" || echo "  /tmp/opt: FAIL"
+    find_pkg >/dev/null 2>&1 && echo "  package manager: $PKG" || echo "  package manager: FAIL"
+    e="$(find_editor 2>/dev/null)"; [ -n "$e" ] && echo "  nano: $e" || echo "  nano: NOT FOUND"
+    s="$(cat "$STATE/sftp-server.path" 2>/dev/null)"; [ -n "$s" ] && [ -x "$s" ] && echo "  sftp-server: $s" || echo "  sftp-server: optional/not found"
+    [ -x /jffs/scripts/usb-mount-script ] && echo "  stock USB hook: OK" || echo "  stock USB hook: FAIL"
+    [ -x "$DM_ROOT/etc/init.d/S50usb-mount-script" ] && echo "  ASUS app bridge: OK" || echo "  ASUS app bridge: FAIL"
+    return 0
+}
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.7.9 — RT-AC68U / stock ASUSWRT
+GoshaCrash 3.8.1 — что буквально вводить в SSH
 
-Этот help показывает ручные команды для установленного RT-AC68U.
-Полная установка с нуля руками расписана в README.md релиза.
-
-Сначала узнай каталог установки. Обычно это /tmp/mnt/SANDISK/goshacrash:
+КАТАЛОГ УСТАНОВКИ
   BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
   [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  echo "$BASE"
+
+МЕНЮ
+  gc
 
 СТАТУС
-  GoshaCrash:
-    gc status
-  Вручную:
-    ps | grep '[m]ihomo'
-    cat "$BASE/run/mihomo.pid" 2>/dev/null
-    ifconfig tun0
-    route -n
+  gc status
 
-КОНФИГ
-  GoshaCrash:
-    gc edit
-  Вручную открыть config.yaml:
-    /opt/bin/nano "$BASE/config.yaml"
-  Сделать backup:
-    cp "$BASE/config.yaml" "$BASE/backups/config-manual.yaml"
-  Проверить config.yaml без запуска:
-    "$BASE/bin/mihomo" -t -d "$BASE" -f "$BASE/config.yaml"
+ПОЛНАЯ ДИАГНОСТИКА
+  gc doctor
 
-ПЕРЕЗАПУСК MIHOMO
-  Безопасный способ GoshaCrash:
-    gc restart
-  Вручную — остановить текущий процесс:
-    PID="$(cat "$BASE/run/mihomo.pid" 2>/dev/null)"
-    [ -n "$PID" ] && kill "$PID"
-    rm -f "$BASE/run/mihomo.pid"
-  Вручную — запустить:
-    GOGC=50 nohup "$BASE/bin/mihomo" -d "$BASE" -f "$BASE/config.yaml" \
-      </dev/null >>"$BASE/logs/mihomo.log" 2>&1 &
-    echo $! > "$BASE/run/mihomo.pid"
-  Важно: ручной запуск Mihomo НЕ восстанавливает policy routing/watchdog GoshaCrash.
-  Для полного восстановления VPN после ручных действий используй:
-    gc restart
+ИЗМЕНИТЬ CONFIG
+  gc edit
 
-ОСТАНОВКА
-  Полностью и безопасно (Mihomo + watchdog + маршрутизация):
-    gc stop
-  Только процесс Mihomo вручную:
-    PID="$(cat "$BASE/run/mihomo.pid" 2>/dev/null)"
-    [ -n "$PID" ] && kill "$PID"
-  Важно: watchdog может запустить Mihomo снова. Для штатной остановки нужен gc stop.
+ОТКРЫТЬ CONFIG ВРУЧНУЮ
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  /jffs/scripts/nano "$BASE/config.yaml"
+
+BACKUP CONFIG
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  cp "$BASE/config.yaml" "$BASE/backups/config-manual.yaml"
+
+ПРОВЕРИТЬ CONFIG
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  "$BASE/bin/mihomo" -t -d "$BASE" -f "$BASE/config.yaml"
+
+ВЕРНУТЬ BACKUP
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  cp "$BASE/backups/config-manual.yaml" "$BASE/config.yaml"
+  gc restart
+
+ПЕРЕЗАПУСТИТЬ VPN
+  gc restart
+
+ОСТАНОВИТЬ VPN
+  gc stop
+
+ВКЛЮЧИТЬ ПОСЛЕ gc stop
+  gc restart
 
 ЛОГ MIHOMO
-  Последние 100 строк:
-    tail -n 100 "$BASE/logs/mihomo.log"
-  В реальном времени:
-    tail -f "$BASE/logs/mihomo.log"
-  Выйти из live-лога:
-    Ctrl+C
+  gc logs
 
-ОСТАЛЬНЫЕ ЛОГИ
-  GoshaCrash:
-    tail -n 100 "$BASE/logs/goshacrash.log"
-  Установка:
-    tail -n 100 "$BASE/logs/install.log"
-  Автозапуск:
-    tail -n 100 "$BASE/logs/boot.log"
-  Watchdog:
-    tail -n 100 "$BASE/logs/watchdog.log"
-  Пакеты ipkg/opkg:
-    tail -n 100 "$BASE/logs/packages.log"
-  Через gc:
-    gc logs mihomo 100
-    gc logs system 100
-    gc logs install 100
-    gc logs boot 100
-    gc logs watchdog 100
-    gc logs packages 100
-    gc logs live mihomo 100
+200 СТРОК MIHOMO
+  gc logs mihomo 200
 
-TUN И МАРШРУТЫ
-  Интерфейс:
-    ifconfig tun0
-  Обычная таблица маршрутов:
-    route -n
-  Policy routing, если установлен ip:
-    ip rule show
-    ip route show table 2022
-  Правила GoshaCrash:
-    iptables -t mangle -L -n -v
-    iptables -t nat -L -n -v
-  Проверка через GoshaCrash:
-    gc routing status
+LIVE MIHOMO
+  gc logs live mihomo 100
+
+ЛОГ MIHOMO ВРУЧНУЮ
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  tail -n 100 "$BASE/logs/mihomo.log"
+
+LIVE ВРУЧНУЮ
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  tail -f "$BASE/logs/mihomo.log"
+
+ЛОГ УСТАНОВКИ
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  tail -n 200 "$BASE/logs/install.log"
+
+ЛОГ ПАКЕТОВ
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  tail -n 200 "$BASE/logs/packages.log"
+
+ПРОЦЕСС MIHOMO
+  ps | grep '[m]ihomo'
+
+PID MIHOMO
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  cat "$BASE/run/mihomo.pid" 2>/dev/null
+
+TUN
+  ifconfig tun0
+
+DNS MIHOMO
+  netstat -ln | grep ':1053'
+
+МАРШРУТЫ
+  route -n
+
+IPTABLES MANGLE
+  iptables -t mangle -L -n -v
+
+IPTABLES NAT
+  iptables -t nat -L -n -v
+
+ROUTING STATUS
+  gc routing status
+
+MANUAL ROUTING
+  gc routing manual
+
+AUTO ROUTING
+  gc routing auto
+
+RT-AC68U / LEGACY
+  gc routing manual
+
+WATCHDOG
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  cat "$BASE/run/watchdog.pid" 2>/dev/null
+  PID="$(cat "$BASE/run/watchdog.pid" 2>/dev/null)"
+  [ -n "$PID" ] && kill -0 "$PID" && echo "watchdog OK"
+
+СОСТОЯНИЕ INTERNET WATCHDOG
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  cat "$BASE/state/internet.state" 2>/dev/null
+  ls -l "$BASE/state/wan-offline" 2>/dev/null
+
+АВТОЗАПУСК
+  gc autostart status
+
+HOOK AUTOSTART
+  ls -l /jffs/scripts/usb-mount-script
+  ls -l /jffs/addons/goshacrash/start.sh
+
+СРАБОТАЛ ЛИ AUTOSTART ПОСЛЕ REBOOT
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  cat "$BASE/state/autostart-hook-ran" 2>/dev/null
+
+ПРОВЕРИТЬ /opt ПОСЛЕ REBOOT
+  ls -ld /opt /tmp/opt
+  readlink /tmp/opt 2>/dev/null
+  mount | grep -E '/opt|asusware|SANDISK'
+
+NANO
+  which nano
+  ls -l /opt/bin/nano /tmp/opt/bin/nano 2>/dev/null
+
+NANO ЧЕРЕЗ IPKG НА RT-AC68U
+  IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
+  "$IPKG" list_installed | grep '^nano '
+  "$IPKG" files nano
+
+ПЕРЕУСТАНОВИТЬ NANO
+  IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
+  "$IPKG" update
+  "$IPKG" remove nano
+  "$IPKG" install nano
+
+UNZIP
+  which unzip
+  ls -l /opt/bin/unzip /opt/bin/unzip-unzip /tmp/opt/bin/unzip-unzip 2>/dev/null
+
+UNZIP ЧЕРЕЗ IPKG НА RT-AC68U
+  IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
+  "$IPKG" list_installed | grep '^unzip '
+  "$IPKG" files unzip
+
+ПЕРЕУСТАНОВИТЬ UNZIP
+  IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
+  "$IPKG" update
+  "$IPKG" remove unzip
+  "$IPKG" install unzip
+
+SFTP
+  gc sftp status
+
+SFTP ЧЕРЕЗ IPKG
+  IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
+  "$IPKG" list | grep '^openssh-sftp-server '
+  "$IPKG" list_installed | grep '^openssh-sftp-server '
+  "$IPKG" files openssh-sftp-server
+
+УСТАНОВИТЬ SFTP
+  IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
+  "$IPKG" update
+  "$IPKG" install openssh-sftp-server
+
+SFTP С WINDOWS
+  sftp admin@10.10.10.100
 
 ZASHBOARD
-  Получить правильный URL:
-    gc dashboard
-  Порт controller из config.yaml:
-    grep '^external-controller:' "$BASE/config.yaml"
-  Secret:
-    grep '^secret:' "$BASE/config.yaml"
+  gc dashboard
 
-ROUTING
-  Текущий режим:
-    gc routing status
-  Переключить на manual:
-    gc routing manual
-  Переключить на auto:
-    gc routing auto
-  ARMv5/RT-AC68U: только manual.
+CONTROLLER И SECRET
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  grep '^external-controller:' "$BASE/config.yaml"
+  grep '^secret:' "$BASE/config.yaml"
 
-КОМАНДЫ GC
-  gc                 интерактивное меню
-  gc status          состояние Mihomo/TUN/routing
-  gc edit            backup -> nano -> проверка -> безопасный restart
-  gc restart         проверить config -> перезапустить весь runtime
-  gc stop            остановить watchdog/Mihomo и убрать routing
-  gc logs ...        показать журнал
-  gc logs live ...   следить за журналом
-  gc dashboard       вывести URL Zashboard
-  gc routing status  показать routing
-  gc routing manual  включить manual routing
-  gc routing auto    включить automatic routing (не ARMv5)
-  gc autostart status проверить stock ASUS USB-mount hook и boot.log
-  gc sftp status      проверить Optware sftp-server
-  gc help            этот SSH-справочник
+РУЧНОЙ RESTART ТОЛЬКО MIHOMO
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  PID="$(cat "$BASE/run/mihomo.pid" 2>/dev/null)"
+  [ -n "$PID" ] && kill "$PID"
+  rm -f "$BASE/run/mihomo.pid"
+  GOGC=50 nohup "$BASE/bin/mihomo" -d "$BASE" -f "$BASE/config.yaml" </dev/null >>"$BASE/logs/mihomo.log" 2>&1 &
+  echo $! > "$BASE/run/mihomo.pid"
 
-Правило:
-  Команды "вручную" нужны для диагностики и понимания системы.
-  Для штатного управления VPN используй gc restart / gc stop, потому что
-  GoshaCrash управляет не только процессом Mihomo, но и TUN, policy routing,
-  iptables, DNS-перехватом и watchdog.
+ПОСЛЕ РУЧНОГО ЗАПУСКА ВЕРНУТЬ ПОЛНЫЙ RUNTIME
+  gc restart
+
+ПОСЛЕ REBOOT
+  gc doctor
+  gc autostart status
+  gc status
+  gc edit
+
+ТЕСТ ПОТЕРИ WAN
+  gc status
+  ps | grep '[m]ihomo'
+
+Отключи WAN примерно на 40 секунд, затем введи:
+  gc status
+  ps | grep '[m]ihomo'
+
+Верни WAN, подожди примерно 30 секунд, затем введи:
+  gc status
+  ps | grep '[m]ihomo'
+
 USAGE
 }
 ensure_dirs >/dev/null 2>&1 || true
@@ -1460,6 +1668,7 @@ case "${1:-menu}" in
             *) echo 'Использование: gc sftp status'; exit 1;;
         esac
         ;;
+    doctor) doctor;;
     routing)
         shift
         case "${1:-status}" in
