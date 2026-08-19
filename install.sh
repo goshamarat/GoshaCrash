@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.8.4"
+INSTALLER_VERSION="3.8.5"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -980,6 +980,16 @@ WRAP
     chmod 755 "$dst"
 }
 
+write_bracket_wrapper(){
+    target="$1"
+    mkdir -p "$(dirname "$target")" || return 1
+    cat > "$target" <<'WRAP'
+#!/bin/sh
+exec /bin/busybox '[' "$@"
+WRAP
+    chmod 755 "$target" || return 1
+}
+
 write_nano_wrapper(){
     dst="$1"
     cat > "$dst" <<'WRAP'
@@ -1208,6 +1218,7 @@ HOOK
     chmod 755 /jffs/scripts/usb-umount-script || return 1
 
     rm -f /jffs/scripts/gc "$DM_ROOT/bin/gc" /opt/bin/gc 2>/dev/null || true
+    write_bracket_wrapper /jffs/scripts/'[' || return 1
     write_command_wrapper /jffs/scripts/gc
     write_nano_wrapper /jffs/scripts/nano
     write_command_wrapper "$DM_ROOT/bin/gc"
@@ -1218,6 +1229,29 @@ HOOK
     install_stock_usb_mount_bridge || return 1
     rm -f "$BASE/logs/goshacrash.log" "$BASE/logs/watchdog.log" "$BASE/logs/boot.log" 2>/dev/null || true
     ok "Автозапуск установлен для stock ASUSWRT"
+}
+
+verify_shell_compat(){
+    PATH="/jffs/scripts:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+    export PATH
+
+    command -v '[' >/dev/null 2>&1 || {
+        fail "Shell compatibility: команда [ не найдена"
+        return 1
+    }
+
+    [ -n "goshacrash" ] || {
+        fail "Shell compatibility: [ не работает"
+        return 1
+    }
+
+    /bin/busybox '[' -n "goshacrash" ']' >/dev/null 2>&1 || {
+        fail "BusyBox [ applet не работает"
+        return 1
+    }
+
+    say "Shell compatibility: [=$(command -v '[' 2>/dev/null)"
+    return 0
 }
 
 write_platform_state(){
@@ -1302,6 +1336,7 @@ main(){
     write_platform_state || return 1
 
     install_hooks || return 1
+    verify_shell_compat || return 1
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" check || return 1
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" restart || {
         fail "Первый запуск не удался. Проверь $BASE/logs/mihomo.log и команду gc logs"

@@ -3,12 +3,24 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.8.4"
-BUILD_ID="2026-08-19-routing-path-fix-r1"
+VERSION="3.8.5"
+BUILD_ID="2026-08-19-busybox-bracket-r1"
 
-# Stock ASUSWRT may invoke hooks with a minimal/empty PATH.
-# Set firmware directories before any command or test is executed.
+# Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
+# do not expose the BusyBox `[` applet as /bin/[.
 PATH="/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+export PATH
+
+# Create a private `[` command before the first shell test is executed.
+# Do this unconditionally: it is tiny and /tmp is recreated on every boot.
+GC_COMPAT_BIN="/tmp/goshacrash-compat"
+mkdir -p "$GC_COMPAT_BIN" 2>/dev/null
+cat > "$GC_COMPAT_BIN/[" <<'GC_BRACKET'
+#!/bin/sh
+exec /bin/busybox '[' "$@"
+GC_BRACKET
+chmod 755 "$GC_COMPAT_BIN/[" 2>/dev/null
+PATH="$GC_COMPAT_BIN:$PATH"
 export PATH
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
@@ -133,8 +145,7 @@ find_dm_root(){
 refresh_path(){
     find_dm_root >/dev/null 2>&1 || true
 
-    # Build PATH from scratch. Do not inherit a broken/empty shell PATH.
-    PATH="/jffs/scripts"
+    PATH="$GC_COMPAT_BIN:/jffs/scripts"
     [ -n "$DM_ROOT" ] && PATH="$DM_ROOT/bin:$DM_ROOT/sbin:$PATH"
     PATH="/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"
     PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -1540,6 +1551,11 @@ doctor(){
     echo "  kernel: $(uname -r 2>/dev/null)"
     echo "  arch: $(uname -m 2>/dev/null)"
     echo "  PATH: $PATH"
+    if command -v '[' >/dev/null 2>&1 && [ -n "ok" ]; then
+        echo "  shell [: OK ($(command -v '[' 2>/dev/null))"
+    else
+        echo "  shell [: FAIL"
+    fi
 
     [ -x /bin/ping ] && echo "  firmware ping: /bin/ping" || echo "  firmware ping: NOT FOUND"
     wan_nvram_up && echo "  ASUS WAN: UP" || echo "  ASUS WAN: DOWN"
@@ -1588,6 +1604,11 @@ GoshaCrash 3.8.1 — что буквально вводить в SSH
 
 ПРОВЕРИТЬ ТОЛЬКО INTERNET PROBE
   gc internet-probe
+
+ПРОВЕРИТЬ SHELL [
+  command -v '['
+  /bin/busybox '[' -n "ok" ']'
+  echo "BRACKET_RC=$?"
 
 ПРОВЕРИТЬ СИСТЕМНЫЙ PING
   /bin/ping -c 2 -W 2 1.1.1.1
