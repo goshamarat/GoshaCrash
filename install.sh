@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.8.12"
+INSTALLER_VERSION="3.9.0"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -254,6 +254,100 @@ prepare_path(){
     hash -r 2>/dev/null || true
 }
 
+copy_alias_if_missing(){
+    src="$1"
+    dst="$2"
+
+    test -f "$src" || return 1
+    test -f "$dst" && return 0
+
+    cp -f "$src" "$dst" 2>/dev/null || return 1
+    chmod 755 "$dst" 2>/dev/null || true
+    return 0
+}
+
+find_first_versioned(){
+    pattern="$1"
+    for f in $pattern; do
+        test -f "$f" && { printf '%s\n' "$f"; return 0; }
+    done
+    return 1
+}
+
+repair_optware_abi(){
+    test -n "$DM_ROOT" && test -d "$DM_ROOT/lib" || return 1
+
+    # TFAT does not reliably preserve the symlink layout expected by old Optware.
+    # Recreate required SONAME aliases as regular files on persistent USB storage.
+    #
+    # libipkg
+    if test ! -f "$DM_ROOT/lib/libipkg.so.0"; then
+        src="$(find_first_versioned "$DM_ROOT/lib/libipkg.so.0.*")"
+        test -n "$src" && {
+            say "Optware ABI: восстанавливаю libipkg.so.0"
+            copy_alias_if_missing "$src" "$DM_ROOT/lib/libipkg.so.0" || return 1
+        }
+    fi
+
+    # uClibc loader/runtime aliases. The exact version suffix differs by feed.
+    if test ! -f "$DM_ROOT/lib/libc.so.0"; then
+        src="$(find_first_versioned "$DM_ROOT/lib/libuClibc-*.so")"
+        test -n "$src" && {
+            say "Optware ABI: восстанавливаю libc.so.0"
+            copy_alias_if_missing "$src" "$DM_ROOT/lib/libc.so.0" || return 1
+        }
+    fi
+
+    if test ! -f "$DM_ROOT/lib/ld-uClibc.so.0"; then
+        src="$(find_first_versioned "$DM_ROOT/lib/ld-uClibc-*.so")"
+        test -n "$src" && {
+            say "Optware ABI: восстанавливаю ld-uClibc.so.0"
+            copy_alias_if_missing "$src" "$DM_ROOT/lib/ld-uClibc.so.0" || return 1
+        }
+    fi
+
+    for base in libcrypt libdl libm libnsl libpthread libresolv librt libutil; do
+        dst="$DM_ROOT/lib/$base.so.0"
+        test -f "$dst" && continue
+        src="$(find_first_versioned "$DM_ROOT/lib/$base-*.so")"
+        test -n "$src" || continue
+        say "Optware ABI: восстанавливаю $base.so.0"
+        copy_alias_if_missing "$src" "$dst" || return 1
+    done
+
+    # libstdc++ SONAME alias if only a fully versioned file survived.
+    if test ! -f "$DM_ROOT/lib/libstdc++.so.6"; then
+        src="$(find_first_versioned "$DM_ROOT/lib/libstdc++.so.6.*")"
+        test -n "$src" && {
+            say "Optware ABI: восстанавливаю libstdc++.so.6"
+            copy_alias_if_missing "$src" "$DM_ROOT/lib/libstdc++.so.6" || return 1
+        }
+    fi
+
+    return 0
+}
+
+verify_ipkg_runtime(){
+    ensure_optware_link >/dev/null 2>&1 || return 1
+    repair_optware_abi || true
+    prepare_path
+
+    test -n "$PKG" || find_pkg || return 1
+
+    # Do not pipe this command: we need the real ipkg return code.
+    "$PKG" list_installed >/dev/null 2>"$BASE/logs/ipkg-runtime.err"
+    rc=$?
+    if test "$rc" -eq 0; then
+        rm -f "$BASE/logs/ipkg-runtime.err" 2>/dev/null || true
+        say "Optware runtime: ipkg OK"
+        return 0
+    fi
+
+    fail "Optware runtime повреждён; ipkg rc=$rc"
+    cat "$BASE/logs/ipkg-runtime.err" >> "$BASE/logs/packages.log" 2>/dev/null || true
+    return 1
+}
+
 find_pkg(){
     PKG=""
     # Prefer the manager belonging to the detected Download Master tree.
@@ -291,16 +385,22 @@ pkg_install_one(){
     name="$1"
     test -n "$PKG" || return 1
 
-    ensure_optware_link >/dev/null 2>&1 || true
+    verify_ipkg_runtime || return 1
     pkg_progress "install $name (локальный индекс)"
     pkg_log "RUN: $PKG install $name"
 
-    "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && return 0
+    "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && {
+        repair_optware_abi >/dev/null 2>&1 || true
+        return 0
+    }
 
     warn "install $name не удался с текущим индексом"
     pkg_update_index_once || true
     pkg_progress "повторный install $name"
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
+    rc=$?
+    repair_optware_abi >/dev/null 2>&1 || true
+    return "$rc"
 }
 
 pkg_is_installed(){
@@ -311,18 +411,28 @@ pkg_reinstall_one(){
     name="$1"
     test -n "$PKG" || return 1
 
+    verify_ipkg_runtime || return 1
+
     pkg_progress "remove $name"
     pkg_log "REINSTALL: $name"
     "$PKG" remove "$name" >> "$BASE/logs/packages.log" 2>&1 || true
 
-    ensure_optware_link >/dev/null 2>&1 || true
+    repair_optware_abi >/dev/null 2>&1 || true
+    verify_ipkg_runtime || return 1
+
     pkg_progress "install $name (локальный индекс)"
-    "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && return 0
+    "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && {
+        repair_optware_abi >/dev/null 2>&1 || true
+        return 0
+    }
 
     warn "reinstall $name не удался с текущим индексом"
     pkg_update_index_once || true
     pkg_progress "повторный install $name"
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
+    rc=$?
+    repair_optware_abi >/dev/null 2>&1 || true
+    return "$rc"
 }
 
 repair_unzip_package(){
@@ -468,6 +578,9 @@ verify_persistent_optware(){
         return 1
     }
 
+    repair_optware_abi || return 1
+    verify_ipkg_runtime || return 1
+
     install_or_repair_persistent_package nano bin/nano || {
         fail "nano не сохранён на USB: $DM_ROOT/bin/nano"
         return 1
@@ -548,12 +661,17 @@ prepare_packages(){
     say "Менеджер пакетов ASUS: $PKG"
 
     ensure_optware_link >/dev/null 2>&1 || true
+    repair_optware_abi || {
+        fail "Не удалось восстановить ABI Optware"
+        return 1
+    }
+    verify_ipkg_runtime || return 1
+
     refresh_tools
     normalize_legacy_optware_unzip
 
     if ! find_full_unzip >/dev/null 2>&1; then
         say "Готовлю Info-ZIP"
-        say "Проверяю unzip на USB: $DM_ROOT/bin/unzip*"
         repair_unzip_package || { fail "Не удалось получить полноценный unzip"; return 1; }
     else
         say "Info-ZIP уже есть на USB — пропускаю"
@@ -561,7 +679,6 @@ prepare_packages(){
 
     if ! find_nano >/dev/null 2>&1; then
         say "Готовлю nano"
-        say "Проверяю nano на USB: $DM_ROOT/bin/nano"
         repair_nano_package || { fail "Не удалось получить nano"; return 1; }
     else
         say "nano уже есть на USB — пропускаю"
@@ -590,6 +707,11 @@ prepare_packages(){
     test -n "$DOWNLOADER" || { fail "wget/curl не найден"; return 1; }
 
     install_optware_sftp || true
+
+    # Final physical persistence check on USB.
+    verify_persistent_optware || return 1
+    verify_ipkg_runtime || return 1
+
     say "Инструменты: nano=$NANO_BIN, unzip=$UNZIP_BIN, gzip=$GZIP_BIN, downloader=$DOWNLOADER"
 }
 

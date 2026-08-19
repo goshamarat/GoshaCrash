@@ -1,4 +1,4 @@
-# GoshaCrash 3.8.12
+# GoshaCrash 3.9.0
 
 Здесь нет описания shell-функций. Ниже — команды, которые можно **буквально вставлять в SSH**.
 
@@ -746,3 +746,62 @@ restart_download_master_env
 ```
 
 SFTP тоже больше не инициирует `ipkg update` только ради поиска пакета в feed.
+
+
+## 3.9.0 — стабильный Optware на TFAT
+
+Причина прошлых проблем найдена: старый ASUS Optware рассчитывает на SONAME-ссылки
+в `/opt/lib`, а TFAT не сохраняет этот layout надёжно. В итоге оставались только
+versioned-файлы вроде:
+
+```text
+libipkg.so.0.0.0
+libuClibc-<version>.so
+```
+
+а `ipkg` требовал:
+
+```text
+libipkg.so.0
+libc.so.0
+ld-uClibc.so.0
+```
+
+3.9.0 восстанавливает необходимые ABI-алиасы как обычные файлы на USB, а не symlink.
+
+Порядок установки теперь жёсткий:
+
+```text
+USB
+-> /tmp/opt
+-> repair Optware ABI
+-> ipkg self-test
+-> nano/unzip/SFTP
+-> physical USB payload check
+-> Mihomo
+```
+
+На reboot:
+
+```text
+USB
+-> /tmp/opt
+-> repair ABI aliases
+-> запуск GoshaCrash
+```
+
+Без `ipkg update`, без package reinstall и без Download Master restart.
+
+Проверка вручную:
+
+```sh
+gc packages-repair
+gc doctor
+
+DM=/tmp/mnt/SANDISK/asusware.arm
+ls -l "$DM/lib/libipkg.so.0"
+ls -l "$DM/lib/libc.so.0"
+ls -l "$DM/lib/ld-uClibc.so.0"
+ls -l "$DM/bin/nano"
+ls -l "$DM/libexec/sftp-server"
+```

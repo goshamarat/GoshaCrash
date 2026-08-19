@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.8.12"
-BUILD_ID="2026-08-19-fast-optware-clean-r2"
+VERSION="3.9.0"
+BUILD_ID="2026-08-19-optware-abi-stable-r1"
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.
@@ -242,6 +242,55 @@ optware_runtime_ready(){
     ensure_optware_link >/dev/null 2>&1 || true
     [ -x /tmp/opt/bin/ipkg ] || [ -x /tmp/opt/bin/opkg ] || [ -x /opt/bin/ipkg ] || [ -x /opt/bin/opkg ] || [ -x "$DM_ROOT/bin/ipkg" ] || [ -x "$DM_ROOT/bin/opkg" ]
 }
+runtime_copy_alias(){
+    src="$1"
+    dst="$2"
+    test -f "$src" || return 1
+    test -f "$dst" && return 0
+    cp -f "$src" "$dst" 2>/dev/null || return 1
+    chmod 755 "$dst" 2>/dev/null || true
+}
+
+runtime_first_versioned(){
+    pattern="$1"
+    for f in $pattern; do
+        test -f "$f" && { printf '%s\n' "$f"; return 0; }
+    done
+    return 1
+}
+
+repair_optware_abi_runtime(){
+    test -n "$DM_ROOT" && test -d "$DM_ROOT/lib" || return 1
+
+    if test ! -f "$DM_ROOT/lib/libipkg.so.0"; then
+        src="$(runtime_first_versioned "$DM_ROOT/lib/libipkg.so.0.*")"
+        test -n "$src" && runtime_copy_alias "$src" "$DM_ROOT/lib/libipkg.so.0"
+    fi
+
+    if test ! -f "$DM_ROOT/lib/libc.so.0"; then
+        src="$(runtime_first_versioned "$DM_ROOT/lib/libuClibc-*.so")"
+        test -n "$src" && runtime_copy_alias "$src" "$DM_ROOT/lib/libc.so.0"
+    fi
+
+    if test ! -f "$DM_ROOT/lib/ld-uClibc.so.0"; then
+        src="$(runtime_first_versioned "$DM_ROOT/lib/ld-uClibc-*.so")"
+        test -n "$src" && runtime_copy_alias "$src" "$DM_ROOT/lib/ld-uClibc.so.0"
+    fi
+
+    for base in libcrypt libdl libm libnsl libpthread libresolv librt libutil; do
+        dst="$DM_ROOT/lib/$base.so.0"
+        test -f "$dst" && continue
+        src="$(runtime_first_versioned "$DM_ROOT/lib/$base-*.so")"
+        test -n "$src" && runtime_copy_alias "$src" "$dst"
+    done
+
+    if test ! -f "$DM_ROOT/lib/libstdc++.so.6"; then
+        src="$(runtime_first_versioned "$DM_ROOT/lib/libstdc++.so.6.*")"
+        test -n "$src" && runtime_copy_alias "$src" "$DM_ROOT/lib/libstdc++.so.6"
+    fi
+    return 0
+}
+
 repair_opt(){
     find_dm_root >/dev/null 2>&1 || return 1
     test -n "$DM_ROOT" && test -d "$DM_ROOT" || return 1
@@ -259,6 +308,7 @@ repair_opt(){
         ln -s "$DM_ROOT" /tmp/opt 2>/dev/null || return 1
     fi
 
+    repair_optware_abi_runtime >/dev/null 2>&1 || true
     refresh_path
     return 0
 }
@@ -997,7 +1047,6 @@ find_editor(){
     repair_opt >/dev/null 2>&1 || true
     refresh_path
 
-    # Persistent USB location is authoritative.
     test -n "$DM_ROOT" && test -x "$DM_ROOT/bin/nano" && {
         printf '%s\n' "$DM_ROOT/bin/nano"
         return 0
@@ -1006,18 +1055,6 @@ find_editor(){
     for e in /opt/bin/nano /tmp/opt/bin/nano; do
         test -x "$e" && { printf '%s\n' "$e"; return 0; }
     done
-
-    # Only repair when the physical USB payload is genuinely absent.
-    find_pkg >/dev/null 2>&1 || return 1
-    if pkg_is_installed_runtime nano; then
-        warn "nano зарегистрирован, но $DM_ROOT/bin/nano отсутствует; восстанавливаю пакет" >&2
-        pkg_reinstall_runtime nano >/dev/null 2>&1 || return 1
-    else
-        pkg_install nano >/dev/null 2>&1 || return 1
-    fi
-
-    repair_opt >/dev/null 2>&1 || true
-    test -x "$DM_ROOT/bin/nano" && { printf '%s\n' "$DM_ROOT/bin/nano"; return 0; }
     return 1
 }
 
@@ -1585,6 +1622,31 @@ sftp_status(){
     echo "  Проверка с ПК: sftp admin@<IP роутера>"
 }
 
+packages_repair(){
+    repair_opt || { fail "Не удалось восстановить /opt"; return 1; }
+    find_pkg || { fail "ipkg/opkg не найден"; return 1; }
+
+    repair_optware_abi_runtime || {
+        fail "Не удалось восстановить ABI Optware"
+        return 1
+    }
+
+    "$PKG" list_installed >/dev/null 2>&1 || {
+        fail "ipkg не запускается даже после ABI repair"
+        return 1
+    }
+
+    echo "Optware runtime: OK"
+    test -x "$DM_ROOT/bin/nano" && echo "nano: OK" || echo "nano: MISSING"
+    if test -x "$DM_ROOT/bin/unzip" || test -x "$DM_ROOT/bin/unzip-unzip"; then
+        echo "unzip: OK"
+    else
+        echo "unzip: MISSING"
+    fi
+    test -x "$DM_ROOT/libexec/sftp-server" && echo "sftp-server: OK" || echo "sftp-server: MISSING"
+    return 0
+}
+
 doctor(){
     load_platform >/dev/null 2>&1 || true
     refresh_path
@@ -1596,6 +1658,11 @@ doctor(){
     echo "  arch: $(uname -m 2>/dev/null)"
     echo "  PATH: $PATH"
     echo "  Persistent Optware: ${DM_ROOT:-not-found}"
+    if test -n "$DM_ROOT"; then
+        test -f "$DM_ROOT/lib/libipkg.so.0" && echo "  libipkg.so.0: OK" || echo "  libipkg.so.0: MISSING"
+        test -f "$DM_ROOT/lib/libc.so.0" && echo "  libc.so.0: OK" || echo "  libc.so.0: MISSING"
+        test -f "$DM_ROOT/lib/ld-uClibc.so.0" && echo "  ld-uClibc.so.0: OK" || echo "  ld-uClibc.so.0: MISSING"
+    fi
     if test -n "$DM_ROOT"; then
         test -x "$DM_ROOT/bin/nano" && echo "  USB nano: OK" || echo "  USB nano: MISSING"
         if test -x "$DM_ROOT/bin/unzip" || test -x "$DM_ROOT/bin/unzip-unzip"; then
@@ -1936,6 +2003,9 @@ case "${1:-menu}" in
             echo "Internet probe: FAIL"
             exit 1
         fi
+        ;;
+    packages-repair)
+        packages_repair
         ;;
     doctor) doctor;;
     routing)
