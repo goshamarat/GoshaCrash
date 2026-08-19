@@ -1,4 +1,4 @@
-# GoshaCrash 3.8.3
+# GoshaCrash 3.8.4
 
 Здесь нет описания shell-функций. Ниже — команды, которые можно **буквально вставлять в SSH**.
 
@@ -471,3 +471,35 @@ echo online > "$BASE/state/internet.state"
 
 gc restart
 ```
+
+
+## 3.8.4 — routing/PATH fix
+
+Исправлены два дефекта 3.8.3:
+
+```text
+manual_route_start: not found
+[: not found
+```
+
+Проверить routing-функцию:
+
+```sh
+grep -n '^manual_route_start()' /tmp/mnt/SANDISK/goshacrash/goshacrash.sh
+```
+
+Должна быть одна строка с определением функции.
+
+Проверить PATH:
+
+```sh
+gc doctor
+```
+
+В начале `goshacrash.sh` теперь сразу устанавливаются системные каталоги:
+
+```text
+/usr/sbin:/usr/bin:/sbin:/bin
+```
+
+ещё до первого `[`, `mkdir`, `dirname` или другой BusyBox-команды.

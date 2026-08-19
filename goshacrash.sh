@@ -3,8 +3,13 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.8.3"
-BUILD_ID="2026-08-19-stable-r3"
+VERSION="3.8.4"
+BUILD_ID="2026-08-19-routing-path-fix-r1"
+
+# Stock ASUSWRT may invoke hooks with a minimal/empty PATH.
+# Set firmware directories before any command or test is executed.
+PATH="/usr/sbin:/usr/bin:/sbin:/bin${PATH:+:$PATH}"
+export PATH
 
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
@@ -654,7 +659,7 @@ watchdog_connectivity_step(){
     return 1
 }
 
-route_start(){
+manual_route_start(){
     select_net_backend || return 1
     [ -x "$IPTABLES" ] || { fail "iptables не найден"; return 1; }
     net_link_exists "$TUN_DEVICE" || { fail "TUN-интерфейс $TUN_DEVICE не найден"; return 1; }
@@ -709,6 +714,7 @@ route_stop(){
 route_status(){
     if [ "$ROUTING_MODE" = manual ]; then manual_route_status; else modern_route_status; fi
 }
+
 
 start_runtime(){
     ensure_dirs || return 1
@@ -1683,6 +1689,10 @@ IPTABLES NAT
 ROUTING STATUS
   gc routing status
 
+ПРОВЕРИТЬ MANUAL ROUTING-ФУНКЦИЮ
+  grep -n '^manual_route_start()' /tmp/mnt/SANDISK/goshacrash/goshacrash.sh
+
+
 MANUAL ROUTING
   gc routing manual
 
@@ -1810,6 +1820,7 @@ CONTROLLER И SECRET
 
 USAGE
 }
+refresh_path >/dev/null 2>&1 || true
 ensure_dirs >/dev/null 2>&1 || true
 load_platform >/dev/null 2>&1 || true
 refresh_path >/dev/null 2>&1 || true
