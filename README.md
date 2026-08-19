@@ -1,4 +1,4 @@
-# GoshaCrash 3.8.9
+# GoshaCrash 3.8.10
 
 Здесь нет описания shell-функций. Ниже — команды, которые можно **буквально вставлять в SSH**.
 
@@ -664,3 +664,36 @@ Installer теперь до первой условной проверки со�
 
 Это происходит до установки и проверки Optware, поэтому `nano`, `unzip` и SFTP
 больше не зависят от отсутствующих symlink-команд stock ASUSWRT.
+
+
+## 3.8.10 — bootstrap PATH и прогресс Optware
+
+3.8.9 создавал `/tmp/goshacrash-bootstrap/test`, но затем `prepare_path()` строил PATH
+заново и терял этот каталог. Поэтому на старом stock ASUSWRT снова появлялось:
+
+```text
+test: not found
+```
+
+3.8.10 сохраняет bootstrap во всех PATH:
+
+```text
+/tmp/goshacrash-bootstrap
+```
+
+Перед работой с пакетами installer отдельно проверяет:
+
+```text
+Shell bootstrap: test + [ OK
+```
+
+Для долгих операций Optware теперь выводится текущий шаг:
+
+```text
+Optware: обновляю индекс пакетов
+Optware: remove nano
+Optware: install nano
+Optware: повторный install nano
+```
+
+То есть во время старого `ipkg update` больше не выглядит так, будто installer завис.

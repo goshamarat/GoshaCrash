@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.8.9"
+INSTALLER_VERSION="3.8.10"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -244,7 +244,9 @@ ensure_optware_link(){
 
 prepare_path(){
     ensure_optware_link >/dev/null 2>&1 || true
-    PATH="/jffs/scripts"
+
+    # Keep installer bootstrap tools in PATH on old stock ASUSWRT.
+    PATH="$GC_BOOTSTRAP_BIN:/jffs/scripts"
     test -n "$DM_ROOT" && PATH="$DM_ROOT/bin:$DM_ROOT/sbin:$PATH"
     PATH="/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"
     PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -266,8 +268,13 @@ pkg_log(){
     printf '[%s] %s\n' "$(now)" "$*" >> "$BASE/logs/packages.log" 2>/dev/null || true
 }
 
+pkg_progress(){
+    say "Optware: $*"
+}
+
 pkg_update_index(){
     test -n "$PKG" || return 1
+    pkg_progress "обновляю индекс пакетов"
     pkg_log "RUN: $PKG update"
     "$PKG" update >> "$BASE/logs/packages.log" 2>&1
 }
@@ -275,11 +282,16 @@ pkg_update_index(){
 pkg_install_one(){
     name="$1"
     test -n "$PKG" || return 1
+
     ensure_optware_link >/dev/null 2>&1 || true
+    pkg_progress "install $name"
     pkg_log "RUN: $PKG install $name"
+
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && return 0
+
     warn "Установка $name не удалась; обновляю индекс и повторяю"
     pkg_update_index >/dev/null 2>&1 || true
+    pkg_progress "повторный install $name"
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
 }
 
@@ -289,9 +301,17 @@ pkg_is_installed(){
 
 pkg_reinstall_one(){
     name="$1"
+    test -n "$PKG" || return 1
+    pkg_progress "remove $name"
     pkg_log "REINSTALL: $name"
     "$PKG" remove "$name" >> "$BASE/logs/packages.log" 2>&1 || true
+
     ensure_optware_link >/dev/null 2>&1 || true
+    pkg_progress "install $name"
+    "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && return 0
+
+    pkg_update_index >/dev/null 2>&1 || true
+    pkg_progress "повторный install $name"
     "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
 }
 
@@ -535,11 +555,11 @@ prepare_packages(){
     test "$need_index" = 1 && pkg_update_index || true
 
     if ! find_full_unzip >/dev/null 2>&1; then
-        say "Готовлю Info-ZIP"
+        say "Готовлю Info-ZIP"; say "Проверяю физический payload unzip на USB"
         repair_unzip_package || { fail "Не удалось получить полноценный unzip"; return 1; }
     fi
     if ! find_nano >/dev/null 2>&1; then
-        say "Готовлю nano"
+        say "Готовлю nano"; say "Проверяю физический payload nano на USB"
         repair_nano_package || { fail "Не удалось получить nano"; return 1; }
     fi
     refresh_tools
@@ -1479,6 +1499,16 @@ main(){
     say "Роутер: $model_name, архитектура $(uname -m 2>/dev/null), ядро $(uname -r 2>/dev/null)"
     say "Профиль: $PLATFORM; routing=$ROUTING_MODE; tun.stack=$TUN_STACK"
 
+    prepare_path
+    "$GC_BOOTSTRAP_BIN/test" -n "goshacrash" >/dev/null 2>&1 || {
+        fail "Bootstrap test потерян из PATH/runtime"
+        return 1
+    }
+    "$GC_BOOTSTRAP_BIN/[" -n "goshacrash" ']' >/dev/null 2>&1 || {
+        fail "Bootstrap [ не работает"
+        return 1
+    }
+    say "Shell bootstrap: test + [ OK"
     prepare_packages || return 1
     install_controller || return 1
     install_network_helper || return 1
