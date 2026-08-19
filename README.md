@@ -956,3 +956,28 @@ gc edit
 ls -l /tmp/mnt/SANDISK/asusware.arm/bin/nano
 ls -l /tmp/mnt/SANDISK/asusware.arm/libexec/sftp-server
 ```
+
+
+## 3.10.1 — Optware environment scoped per process
+
+3.10.0 ошибочно экспортировал `LD_LIBRARY_PATH` глобально. На старом RT-AC68U
+это заставляло даже системный `/bin/sh` загружать Optware-библиотеки и приводило к:
+
+```text
+/bin/sh: can't resolve symbol '__aeabi_uidivmod'
+```
+
+3.10.1 никогда не экспортирует Optware library path глобально.
+
+Только конкретный Optware ELF запускается так:
+
+```text
+LD_LIBRARY_PATH=/tmp/goshacrash-opt/lib:<asusware>/lib:/lib:/usr/lib <program>
+```
+
+Системные BusyBox-команды (`sh`, `cp`, `grep`, `mount`, `iptables`) работают в
+обычном системном окружении.
+
+`nano` и `ipkg` запускаются через scoped runner. Для SFTP сохраняется реальный
+`sftp-server.real`, а штатный путь `/opt/libexec/sftp-server` становится маленьким
+shell-wrapper, который задаёт library path только перед `exec` реального SFTP.

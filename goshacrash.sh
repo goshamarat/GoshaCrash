@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.0"
-BUILD_ID="2026-08-19-fat-optware-overlay-r1"
+VERSION="3.10.1"
+BUILD_ID="2026-08-19-scoped-optware-env-r1"
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.
@@ -300,8 +300,7 @@ build_optware_overlay_runtime(){
 
 optware_env_runtime(){
     build_optware_overlay_runtime || return 1
-    LD_LIBRARY_PATH="$OPTWARE_OVERLAY_LIB:$DM_ROOT/lib:/lib:/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    export LD_LIBRARY_PATH
+    printf '%s\n' "$OPTWARE_OVERLAY_LIB:$DM_ROOT/lib:/lib:/usr/lib"
 }
 
 repair_generic_sonames_runtime(){
@@ -330,6 +329,11 @@ repair_optware_abi_runtime(){
     build_optware_overlay_runtime
 }
 
+run_optware_runtime(){
+    ldpath="$(optware_env_runtime)" || return 1
+    LD_LIBRARY_PATH="$ldpath" "$@"
+}
+
 repair_opt(){
     find_dm_root >/dev/null 2>&1 || return 1
     test -n "$DM_ROOT" && test -d "$DM_ROOT" || return 1
@@ -348,7 +352,6 @@ repair_opt(){
     fi
 
     repair_optware_abi_runtime >/dev/null 2>&1 || true
-    optware_env_runtime >/dev/null 2>&1 || true
     refresh_path
     return 0
 }
@@ -1085,12 +1088,12 @@ backup_config(){
 
 find_editor(){
     repair_opt >/dev/null 2>&1 || true
-    optware_env_runtime >/dev/null 2>&1 || true
+    repair_optware_abi_runtime >/dev/null 2>&1 || true
     refresh_path
 
     for e in "$DM_ROOT/bin/nano" /opt/bin/nano /tmp/opt/bin/nano; do
         test -x "$e" || continue
-        "$e" --version >/dev/null 2>&1 || continue
+        run_optware_runtime "$e" --version >/dev/null 2>&1 || continue
         printf '%s\n' "$e"
         return 0
     done
@@ -1663,16 +1666,16 @@ sftp_status(){
 
 packages_repair(){
     repair_opt || { fail "Не удалось восстановить /tmp/opt"; return 1; }
-    optware_env_runtime || { fail "Не удалось построить Optware RAM overlay"; return 1; }
+    repair_optware_abi_runtime || { fail "Не удалось построить Optware RAM overlay"; return 1; }
 
     echo "Optware overlay: $OPTWARE_OVERLAY_LIB"
     if test -n "$PKG" || find_pkg; then
-        "$PKG" list_installed >/dev/null 2>&1 && echo "ipkg: OK" || echo "ipkg: BROKEN"
+        run_optware_runtime "$PKG" list_installed >/dev/null 2>&1 && echo "ipkg: OK" || echo "ipkg: BROKEN"
     else
         echo "ipkg: MISSING"
     fi
 
-    if test -x "$DM_ROOT/bin/nano" && "$DM_ROOT/bin/nano" --version >/dev/null 2>&1; then
+    if test -x "$DM_ROOT/bin/nano" && run_optware_runtime "$DM_ROOT/bin/nano" --version >/dev/null 2>&1; then
         echo "nano: OK"
     else
         echo "nano: BROKEN/MISSING"

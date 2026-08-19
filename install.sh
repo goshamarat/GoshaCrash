@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.0"
+INSTALLER_VERSION="3.10.1"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -321,9 +321,7 @@ build_optware_overlay(){
 
 optware_env(){
     build_optware_overlay || return 1
-    LD_LIBRARY_PATH="$OPTWARE_OVERLAY_LIB:$DM_ROOT/lib:/lib:/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-    export LD_LIBRARY_PATH
-    return 0
+    printf '%s\n' "$OPTWARE_OVERLAY_LIB:$DM_ROOT/lib:/lib:/usr/lib"
 }
 
 repair_generic_sonames(){
@@ -363,22 +361,31 @@ repair_optware_abi(){
     build_optware_overlay
 }
 
+run_optware(){
+    ldpath="$(optware_env)" || return 1
+    LD_LIBRARY_PATH="$ldpath" "$@"
+}
+
 verify_ipkg_runtime(){
     ensure_optware_link >/dev/null 2>&1 || return 1
     repair_optware_abi || return 1
     prepare_path
     test -n "$PKG" || find_pkg || return 1
 
-    optware_env || return 1
-    "$PKG" list_installed >/dev/null 2>"$BASE/logs/ipkg-runtime.err"
+    err="$BASE/logs/ipkg-runtime.err"
+    : > "$err"
+
+    run_optware "$PKG" list_installed >/dev/null 2>"$err"
     rc=$?
-    if test "$rc" -eq 0; then
-        rm -f "$BASE/logs/ipkg-runtime.err" 2>/dev/null || true
-        say "Optware runtime: OK (RAM overlay)"
+
+    if test "$rc" -eq 0 && ! grep -Eq "can't (load library|resolve symbol)" "$err" 2>/dev/null; then
+        rm -f "$err" 2>/dev/null || true
+        say "Optware runtime: ipkg OK (scoped RAM overlay)"
         return 0
     fi
+
     fail "Optware runtime повреждён; ipkg rc=$rc"
-    cat "$BASE/logs/ipkg-runtime.err" >> "$BASE/logs/packages.log" 2>/dev/null || true
+    cat "$err" >> "$BASE/logs/packages.log" 2>/dev/null || true
     return 1
 }
 
@@ -402,7 +409,7 @@ pkg_update_index_once(){
     test "$PKG_INDEX_REFRESHED" = "1" && return 0
     pkg_progress "обновляю индекс пакетов (один раз)"
     pkg_log "RUN: $PKG update"
-    "$PKG" update >> "$BASE/logs/packages.log" 2>&1 || return 1
+    run_optware "$PKG" update >> "$BASE/logs/packages.log" 2>&1 || return 1
     PKG_INDEX_REFRESHED=1
     return 0
 }
@@ -420,11 +427,10 @@ pkg_install_one(){
     test -n "$PKG" || return 1
 
     verify_ipkg_runtime || return 1
-    optware_env || return 1
     pkg_progress "install $name (локальный индекс)"
     pkg_log "RUN: $PKG install $name"
 
-    "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && {
+    run_optware "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && {
         repair_optware_abi >/dev/null 2>&1 || true
         return 0
     }
@@ -432,7 +438,7 @@ pkg_install_one(){
     warn "install $name не удался с текущим индексом"
     pkg_update_index_once || true
     pkg_progress "повторный install $name"
-    "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
+    run_optware "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
     rc=$?
     repair_optware_abi >/dev/null 2>&1 || true
     return "$rc"
@@ -447,17 +453,16 @@ pkg_reinstall_one(){
     test -n "$PKG" || return 1
 
     verify_ipkg_runtime || return 1
-    optware_env || return 1
 
     pkg_progress "remove $name"
     pkg_log "REINSTALL: $name"
-    "$PKG" remove "$name" >> "$BASE/logs/packages.log" 2>&1 || true
+    run_optware "$PKG" remove "$name" >> "$BASE/logs/packages.log" 2>&1 || true
 
     repair_optware_abi >/dev/null 2>&1 || true
     verify_ipkg_runtime || return 1
 
     pkg_progress "install $name (локальный индекс)"
-    "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && {
+    run_optware "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && {
         repair_optware_abi >/dev/null 2>&1 || true
         return 0
     }
@@ -465,7 +470,7 @@ pkg_reinstall_one(){
     warn "reinstall $name не удался с текущим индексом"
     pkg_update_index_once || true
     pkg_progress "повторный install $name"
-    "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
+    run_optware "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
     rc=$?
     repair_optware_abi >/dev/null 2>&1 || true
     return "$rc"
@@ -525,10 +530,10 @@ repair_nano_package(){
 
     if find_nano >/dev/null 2>&1; then
         nano_bin="$(find_nano 2>/dev/null)"
-        "$nano_bin" --version >/dev/null 2>&1 && return 0
+        run_optware "$nano_bin" --version >/dev/null 2>&1 && return 0
         warn "nano существует, но не запускается; восстанавливаю Optware ABI"
         repair_optware_abi || return 1
-        "$nano_bin" --version >/dev/null 2>&1 && return 0
+        run_optware "$nano_bin" --version >/dev/null 2>&1 && return 0
     fi
 
     if pkg_is_installed nano; then
@@ -542,7 +547,7 @@ repair_nano_package(){
     prepare_path
     nano_bin="$(find_nano 2>/dev/null)"
     test -n "$nano_bin" || return 1
-    "$nano_bin" --version >/dev/null 2>&1
+    run_optware "$nano_bin" --version >/dev/null 2>&1
 }
 
 
@@ -657,6 +662,29 @@ verify_persistent_optware(){
     return 0
 }
 
+install_sftp_wrapper(){
+    real="$DM_ROOT/libexec/sftp-server.real"
+    current="$DM_ROOT/libexec/sftp-server"
+
+    test -x "$current" || test -x "$real" || return 1
+
+    # Preserve the real ELF once. FAT stores regular files safely.
+    if test ! -f "$real"; then
+        cp -f "$current" "$real" || return 1
+        chmod 755 "$real" 2>/dev/null || true
+    fi
+
+    cat > "$current" <<'SFTPWRAP'
+#!/bin/sh
+DM_ROOT="$(readlink /tmp/opt 2>/dev/null)"
+test -n "$DM_ROOT" || DM_ROOT=/tmp/mnt/SANDISK/asusware.arm
+OVERLAY=/tmp/goshacrash-opt/lib
+LD_LIBRARY_PATH="$OVERLAY:$DM_ROOT/lib:/lib:/usr/lib" exec "$DM_ROOT/libexec/sftp-server.real" "$@"
+SFTPWRAP
+    chmod 755 "$current" || return 1
+    return 0
+}
+
 install_optware_sftp(){
     test -n "$PKG" && test -x "$PKG" || return 0
     ensure_optware_link >/dev/null 2>&1 || true
@@ -700,6 +728,8 @@ install_optware_sftp(){
     else
         warn "openssh-sftp-server зарегистрирован, но payload всё ещё отсутствует"
     fi
+    install_sftp_wrapper >/dev/null 2>&1 || true
+
     return 0
 }
 
