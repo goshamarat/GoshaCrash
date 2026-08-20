@@ -1,12 +1,12 @@
-# GoshaCrash 3.10.2-rc3
+# GoshaCrash 3.10.2-rc6
 
-Изменения относительно rc2:
-- обычный `sh install.sh` после определения legacy-профиля сам проверяет filesystem,
-  на котором реально находится Download Master/Optware;
-- EXT3 проходит preflight автоматически;
-- TFAT/FAT/NTFS/другая ФС останавливает установку до изменения runtime;
-- сообщение сразу предлагает `sh install.sh --prepare-usb`;
-- `--prepare-usb` остаётся отдельным безопасным мастером MBR + EXT3 + symlink-test.
+Primary test path:
+Rufus -> Non bootable -> MBR -> Large FAT32 -> one full-size partition
+-> ASUS -> sh /tmp/install.sh --prepare-usb -> EXT3.
 
-Перед stable release всё ещё нужно закрепить runtime-файлы на immutable release tag,
-а не на `main`.
+Safety change:
+A single /dev/sdX1 is reused only if it occupies >=98% of the physical USB disk.
+A small/partial single partition is NOT silently formatted and left wasting the
+rest of the drive.
+
+No fdisk/reboot is expected for the normal Rufus layout.
