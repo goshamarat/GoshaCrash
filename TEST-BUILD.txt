@@ -1,14 +1,12 @@
-# GoshaCrash 3.10.2-rc8
+# GoshaCrash 3.10.2-rc9
 
-Fix: resume after old ASUSWRT BLKRRPART/stale-geometry reboot.
+Fixes rc8 resume detection on 32-bit BusyBox ash.
 
-Resume is accepted only when:
-- exactly one /dev/sdX1 exists;
-- partition type is 83 (Linux);
-- it occupies >=98% of the physical disk;
-- fdisk block count equals /proc/partitions block count.
+Root cause:
+disk_blocks * 98 overflowed 32-bit shell arithmetic for the 123 GB USB disk.
 
-Then fdisk is skipped and installer continues directly to:
-mkfs.ext3 -L SANDISK /dev/sdX1
+Fix:
+convert block counts to MiB first, then calculate the 98% threshold.
 
-This prevents the rc7 loop.
+Added Resume check diagnostics showing:
+part count, MBR type, fdisk blocks, kernel blocks.

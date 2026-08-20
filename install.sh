@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc8"
+INSTALLER_VERSION="3.10.2-rc9"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -375,11 +375,18 @@ prepare_usb_wizard(){
        && test -n "$kernel_blocks" \
        && test "$fdisk_blocks" = "$kernel_blocks" \
        && test "$fdisk_type" = "83"; then
-        min_blocks=$((disk_blocks * 98 / 100))
-        if test "$kernel_blocks" -ge "$min_blocks" 2>/dev/null; then
+        # BusyBox ash on this 32-bit ASUSWRT can overflow on:
+        #   disk_blocks * 98
+        # for a 120M-block USB disk. Compare in MiB-sized units instead.
+        disk_mb=$((disk_blocks / 1024))
+        kernel_mb=$((kernel_blocks / 1024))
+        min_mb=$((disk_mb * 98 / 100))
+        if test "$kernel_mb" -ge "$min_mb" 2>/dev/null; then
             resume_ready=1
         fi
     fi
+
+    say "Resume check: parts=$part_count type=${fdisk_type:-?} fdisk_blocks=${fdisk_blocks:-?} kernel_blocks=${kernel_blocks:-?}"
 
     if test "$resume_ready" -eq 1; then
         ok "MBR уже готова после reboot: $target_part, type 83, ${kernel_blocks} blocks"
