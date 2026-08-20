@@ -4,7 +4,7 @@ GoshaCrash — установщик и контроллер Mihomo для ASUSWR
 
 Этот RC в первую очередь проверяется на **ASUS RT-AC68U** со старым ASUSWRT / Linux 2.6.36. Для legacy-профиля используется **Mihomo ARMv5 + gVisor**.
 
-> **Тестовая версия:** 3.10.2-rc12  
+> **Тестовая версия:** 3.10.2-rc13  
 > Не публикуйте её как универсально стабильную для всех ASUS до проверки новых ARM64-моделей.
 
 ## Что уже проверено на RT-AC68U
@@ -266,6 +266,22 @@ rc11 сначала проверяет **clean runtime** (`LD_LIBRARY_PATH` unse
   Для `/tmp/mnt/SANDISK/...` это `/tmp/mnt/SANDISK` (`ext3`), а не `/tmp` (`tmpfs`)
   и не `/` (`rootfs`);
 - legacy ARMv5 остаётся строго `manual` routing + `gvisor`.
+
+
+### rc13: подготовка modern/ZenWiFi BT10
+
+- ARMv5 legacy остаётся строго `manual + gVisor`.
+- Modern-профиль больше не зависит от старого Optware для самой установки:
+  обязательны только `unzip`, `gzip`, `wget/curl`; `nano`, SFTP и ipkg/opkg являются optional.
+- Для stock ASUSWRT теперь реально устанавливаются NVRAM `script_usbmount/script_usbumount`
+  hooks; в предыдущем коде функция существовала, но не вызывалась.
+- Старый Download Master `lib/ipkg` USB bridge создаётся только для legacy или когда
+  соответствующая ipkg-база реально существует.
+- `tun.auto-detect-interface` включается только если доступен `nft`, поскольку эта
+  функция Mihomo требует nftables; без `nft` остаются `auto-route + auto-redirect`.
+- `wget` получает отдельный writable HOME в `/tmp`, чтобы не засорять лог ошибкой
+  `/root/.wget-hsts`.
+- Для модели BT10 installer печатает обнаруженные `uname -m` и выбранный Mihomo target.
 
 ## Ручной способ
 

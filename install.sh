@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc12"
+INSTALLER_VERSION="3.10.2-rc13"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -1263,13 +1263,78 @@ check_usb_filesystem(){
             ;;
         *)
             warn "USB filesystem не определена или не Linux: ${USB_FSTYPE:-unknown}"
-            warn "Для старого stock ASUSWRT + Download Master рекомендуется EXT3."
+            if test "${LEGACY:-0}" = 1; then
+                warn "Для legacy stock ASUSWRT + Download Master требуется EXT3."
+            else
+                warn "Modern profile продолжит работу; предпочтительна Linux filesystem (ext3/ext4)."
+            fi
             return 0
             ;;
     esac
 }
 
+prepare_packages_modern(){
+    prepare_path
+    check_usb_filesystem
+    refresh_tools
+
+    # On modern ASUSWRT the GoshaCrash core only requires unzip, gzip and a
+    # downloader. nano/SFTP and Download Master's package manager are optional.
+    # If ipkg/opkg exists, use it only to fill missing tools.
+    if find_pkg; then
+        say "Менеджер пакетов ASUS: $PKG"
+        verify_ipkg_runtime || warn "Пакетный менеджер недоступен; продолжаю с firmware tools"
+    else
+        PKG=""
+        OPTWARE_RUNTIME_MODE=""
+        say "Пакетный менеджер Download Master не найден — для modern-профиля это не блокирует установку"
+    fi
+
+    refresh_tools
+
+    # BusyBox unzip is sufficient here because Zashboard is validated by real
+    # extraction, not by Info-ZIP-only test flags.
+    UNZIP_BIN="$(tool_path unzip 2>/dev/null)"
+    if test -z "$UNZIP_BIN" && test -n "$PKG"; then
+        pkg_install_one unzip >/dev/null 2>&1 || true
+        refresh_tools
+        UNZIP_BIN="$(tool_path unzip 2>/dev/null)"
+    fi
+
+    if test ! -x "$GZIP_BIN" && test -n "$PKG"; then
+        pkg_install_one gzip >/dev/null 2>&1 || true
+        refresh_tools
+    fi
+
+    if test -z "$DOWNLOADER" && test -n "$PKG"; then
+        pkg_install_one wget >/dev/null 2>&1 || true
+        refresh_tools
+    fi
+
+    test -n "$UNZIP_BIN" || { fail "На modern ASUSWRT не найден unzip"; return 1; }
+    test -x "$GZIP_BIN" || { fail "На modern ASUSWRT не найден gzip"; return 1; }
+    test -n "$DOWNLOADER" || { fail "На modern ASUSWRT не найден wget/curl"; return 1; }
+
+    # Convenience tools are best-effort on modern routers.
+    NANO_BIN="$(find_nano 2>/dev/null)"
+    if test -z "$NANO_BIN" && test -n "$PKG"; then
+        pkg_install_one nano >/dev/null 2>&1 || true
+        NANO_BIN="$(find_nano 2>/dev/null)"
+    fi
+    if test -n "$PKG"; then
+        install_optware_sftp >/dev/null 2>&1 || true
+    fi
+
+    say "Modern tools: unzip=$UNZIP_BIN, gzip=$GZIP_BIN, downloader=$DOWNLOADER, nano=${NANO_BIN:-optional}"
+    return 0
+}
+
 prepare_packages(){
+    if test "${LEGACY:-0}" != 1; then
+        prepare_packages_modern
+        return $?
+    fi
+
     prepare_path
     check_usb_filesystem
     find_pkg || { fail "В Download Master не найден ipkg/opkg"; return 1; }
@@ -1339,7 +1404,10 @@ wget_fetch(){
     test -n "$w" || return 1
 
     echo "--- wget: $url"
-    "$w" --no-check-certificate -O "$out.part" "$url" && test -s "$out.part" && {
+    WGET_HOME="/tmp/goshacrash-wget"
+    mkdir -p "$WGET_HOME" 2>/dev/null || true
+    chmod 700 "$WGET_HOME" 2>/dev/null || true
+    HOME="$WGET_HOME" "$w" --no-check-certificate -O "$out.part" "$url" && test -s "$out.part" && {
         mv -f "$out.part" "$out"
         return 0
     }
@@ -1441,6 +1509,16 @@ detect_platform(){
         ACTIVE_CONFIG="$BASE/config.yaml"
     fi
     PLATFORM="modern-$MIHOMO_TARGET"
+
+    case "$model" in
+        *BT10*)
+            say "ZenWiFi BT10 detected: modern profile, machine=$machine, mihomo=$MIHOMO_TARGET"
+            case "$machine" in
+                aarch64|arm64) : ;;
+                *) warn "BT10 вернул неожиданную архитектуру uname -m=$machine; выбран core=$MIHOMO_TARGET" ;;
+            esac
+            ;;
+    esac
 }
 
 existing_routing_mode(){
@@ -1593,7 +1671,12 @@ configure_routing_in_config(){
         yaml_set_section_key "$file" tun stack "$TUN_STACK" || return 1
         yaml_set_section_key "$file" tun auto-route true || return 1
         yaml_set_section_key "$file" tun auto-redirect true || return 1
-        yaml_set_section_key "$file" tun auto-detect-interface true || return 1
+        if command -v nft >/dev/null 2>&1; then
+            yaml_set_section_key "$file" tun auto-detect-interface true || return 1
+        else
+            yaml_set_section_key "$file" tun auto-detect-interface false || return 1
+            warn "nft не найден: auto-detect-interface выключен; auto-route/auto-redirect остаются включены"
+        fi
         yaml_remove_top_key "$file" routing-mark || return 1
     fi
 }
@@ -2126,7 +2209,20 @@ HOOK
     add_once /jffs/configs/profile.add 'export PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"'
 
     remove_pre3712_autostart
-    install_stock_usb_mount_bridge || return 1
+
+    # NVRAM USB hooks are the generic stock-ASUSWRT path and are especially
+    # important for newer firmware where Download Master's old ipkg init.d
+    # layout may differ.
+    install_nvram_usb_hooks || true
+
+    # Legacy Download Master bridge is a fallback. On modern layouts without
+    # an ipkg status database, do not manufacture old Optware package metadata.
+    if test "${LEGACY:-0}" = 1 || test -f "$DM_ROOT/lib/ipkg/status"; then
+        install_stock_usb_mount_bridge || return 1
+    else
+        say "Modern Download Master: old ipkg USB-mount bridge не требуется"
+    fi
+
     rm -f "$BASE/logs/goshacrash.log" "$BASE/logs/watchdog.log" "$BASE/logs/boot.log" 2>/dev/null || true
     ok "Автозапуск установлен для stock ASUSWRT"
 }
@@ -2296,7 +2392,11 @@ main(){
     install_zashboard || return 1
     write_platform_state || return 1
 
-    verify_persistent_optware || return 1
+    if test "${LEGACY:-0}" = 1; then
+        verify_persistent_optware || return 1
+    else
+        verify_persistent_optware >/dev/null 2>&1 || say "Modern profile: persistent Optware payload optional"
+    fi
     install_hooks || return 1
     verify_shell_compat || return 1
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" check || return 1

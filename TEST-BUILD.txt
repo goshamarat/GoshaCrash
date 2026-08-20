@@ -1,10 +1,13 @@
-# GoshaCrash 3.10.2-rc12
+# GoshaCrash 3.10.2-rc13
 
-Fixes after successful rc11 end-to-end installation on RT-AC68U:
+Modern/BT10 portability hardening:
+- modern core install no longer hard-depends on legacy Optware package payload;
+- firmware unzip/gzip/wget/curl are sufficient;
+- nano/SFTP/package manager optional on modern;
+- NVRAM USB hooks are now actually installed;
+- old ipkg USB bridge only when appropriate;
+- auto-detect-interface enabled only when nft exists;
+- wget uses private writable HOME to avoid HSTS-store noise;
+- BT10 detection logs uname architecture and selected Mihomo target.
 
-1. Installer unsets inherited LD_LIBRARY_PATH at startup.
-   Manual `unset LD_LIBRARY_PATH` is no longer required before install.
-2. USB filesystem detection now selects the longest containing mountpoint.
-   /tmp/mnt/SANDISK correctly resolves to ext3 instead of tmpfs/rootfs.
-3. Legacy ARMv5 policy is documented as manual routing only + gVisor.
-4. Clean Optware runtime from rc11 is preserved.
+RT-AC68U legacy policy remains ARMv5 + gVisor + manual routing only.
