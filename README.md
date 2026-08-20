@@ -1,45 +1,238 @@
-# GoshaCrash 3.9.2
+# GoshaCrash
 
-Здесь нет описания shell-функций. Ниже — команды, которые можно **буквально вставлять в SSH**.
+GoshaCrash — установщик и контроллер Mihomo для ASUSWRT с Zashboard, TUN-маршрутизацией, watchdog, автозапуском и вспомогательными утилитами.
 
-## Установка
+Этот RC в первую очередь проверяется на **ASUS RT-AC68U** со старым ASUSWRT / Linux 2.6.36. Для legacy-профиля используется **Mihomo ARMv5 + gVisor**.
 
-```sh
-rm -f /tmp/install.sh
+> **Тестовая версия:** 3.10.2-rc3  
+> Не публикуйте её как универсально стабильную для всех ASUS до проверки новых ARM64-моделей.
 
-wget --no-check-certificate \
-  -O /tmp/install.sh \
-  'https://raw.githubusercontent.com/goshamarat/GoshaCrash/refs/heads/main/install.sh'
+## Что уже проверено на RT-AC68U
 
-grep INSTALLER_VERSION /tmp/install.sh
-sh /tmp/install.sh
+На тестовом RT-AC68U подтверждены:
+
+- EXT3 USB и корректные Unix symlink;
+- ASUS Download Master / Optware;
+- `ipkg`, `nano`, `openssh-sftp-server`;
+- Mihomo legacy ARMv5 + gVisor;
+- TUN `tun0`;
+- режим маршрутизации `manual`;
+- DNS Fake-IP;
+- watchdog;
+- восстановление Mihomo после принудительного `kill`;
+- WAN loss → `offline` → остановка Mihomo;
+- WAN recovery → автоматический запуск Mihomo/TUN/routing;
+- `gc stop` / `gc start`;
+- автозапуск после reboot;
+- SFTP через штатный ASUS Dropbear: upload/download/rename/delete.
+
+## Быстрый путь для RT-AC68U
+
+Правильная последовательность установки:
+
+```text
+USB
+ ↓
+EXT3
+ ↓
+ASUS Download Master
+ ↓
+GoshaCrash
+ ↓
+выбор маршрутизации
+ ↓
+Mihomo + Zashboard + watchdog
 ```
 
-Проверка:
+Для старого Download Master **не используйте TFAT/FAT как базу Optware**. Optware требует Unix symlink. На TFAT установка пакетов может внешне завершаться успешно, но библиотеки вида `libipkg.so.0 -> libipkg.so.0.0.0` не создаются, после чего ломаются `ipkg`, `nano` и SFTP.
 
-```sh
-gc doctor
-gc autostart status
-gc status
+---
+
+# 1. Подготовка USB
+
+Обычный `sh install.sh` сам проверяет файловую систему USB на legacy RT-AC68U.
+
+Если Download Master находится на EXT3, установка продолжается автоматически:
+
+```text
+[GoshaCrash:OK] USB filesystem: EXT3 (/tmp/mnt/...)
 ```
 
-## Меню
+Если обнаружена TFAT/FAT/NTFS или другая неподходящая ФС, установщик **останавливается до изменения системы**, показывает текущую файловую систему и объясняет, что для проверенной legacy-схемы требуется EXT3.
+
+Он сразу предложит:
+
+```sh
+sh install.sh --prepare-usb
+```
+
+То есть пользователю не нужно заранее вручную смотреть `mount` или `fdisk`.
+
+## Встроенный мастер форматирования
+
+Запустите:
+
+```sh
+sh install.sh --prepare-usb
+```
+
+Мастер:
+
+1. покажет найденные `/dev/sdX`;
+2. покажет модель и размер;
+3. ничего не форматирует без явного выбора;
+4. потребует точную строку подтверждения вида:
+
+```text
+FORMAT /dev/sda
+```
+
+5. создаст DOS/MBR;
+6. создаст один primary Linux-раздел;
+7. отформатирует его в EXT3;
+8. присвоит label `GOSHACRASH`;
+9. тестово смонтирует раздел;
+10. проверит создание symlink.
+
+**Все данные на выбранном USB-диске будут удалены.**
+
+После успешного завершения:
+
+```text
+USB подготовлен: /dev/sda1, EXT3, label=GOSHACRASH, symlink=OK
+```
+
+Выньте и снова вставьте флешку или перезагрузите роутер, чтобы штатный ASUSWRT автомонтировал её в `/tmp/mnt/...`.
+
+## Ручной способ
+
+Если мастер не подходит:
+
+```sh
+fdisk /dev/sda
+```
+
+В старом `fdisk` последовательно:
+
+```text
+o
+n
+p
+1
+<Enter>
+<Enter>
+w
+```
+
+Проверьте появление раздела:
+
+```sh
+cat /proc/partitions
+fdisk -l /dev/sda
+```
+
+Затем:
+
+```sh
+mkfs.ext3 -L GOSHACRASH /dev/sda1
+```
+
+После переподключения:
+
+```sh
+mount | grep /dev/sd
+```
+
+Ожидается примерно:
+
+```text
+/dev/sda1 on /tmp/mnt/GOSHACRASH type ext3 (...)
+```
+
+---
+
+# 2. Установите ASUS Download Master
+
+Для legacy RT-AC68U сначала установите **Download Master** через веб-интерфейс ASUS:
+
+**USB-приложения → Download Master → Install**
+
+Выберите подготовленную EXT3-флешку.
+
+Проверка по SSH:
+
+```sh
+ls -ld /opt /tmp/opt
+readlink /tmp/opt
+ls -l /tmp/opt/bin/ipkg
+/tmp/opt/bin/ipkg list_installed | head
+```
+
+Для исправной EXT3-установки должны существовать symlink библиотеки:
+
+```sh
+ls -l /tmp/opt/lib/libipkg.so*
+```
+
+Пример:
+
+```text
+libipkg.so   -> libipkg.so.0.0.0
+libipkg.so.0 -> libipkg.so.0.0.0
+libipkg.so.0.0.0
+```
+
+---
+
+# 3. Установка GoshaCrash
+
+Запуск:
+
+```sh
+sh install.sh
+```
+
+Установщик:
+
+- определяет модель, архитектуру и ядро;
+- на legacy ASUS выбирает ARMv5/gVisor core;
+- находит Download Master;
+- подготавливает Optware environment;
+- ставит необходимые пакеты;
+- устанавливает `goshacrash.sh`;
+- устанавливает `gcnet` для legacy/manual;
+- устанавливает Mihomo;
+- устанавливает Zashboard;
+- создаёт конфигурацию;
+- настраивает автозапуск;
+- запускает runtime и выполняет первичную проверку.
+
+## Маршрутизация
+
+Выбор маршрутизации остаётся за пользователем.
+
+```text
+auto
+manual
+```
+
+`manual` использует собственную policy routing / iptables-логику GoshaCrash.
+
+`auto` использует возможности Mihomo, когда они допустимы для выбранной платформы и конфигурации.
+
+Legacy-профиль и routing mode — **разные вещи**. На RT-AC68U core остаётся ARMv5 + gVisor независимо от пользовательского выбора маршрутизации.
+
+---
+
+# 4. После установки
+
+Главная команда:
 
 ```sh
 gc
 ```
 
-В меню: `Status`, `Edit config`, `Restart`, `Stop`, `Logs`, `Exit`.
-
-## Узнать каталог установки
-
-```sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
-echo "$BASE"
-```
-
-## Статус
+Статус:
 
 ```sh
 gc status
@@ -51,933 +244,282 @@ gc status
 gc doctor
 ```
 
-## Изменить config.yaml
+Ожидаемый healthy-state:
+
+```text
+Mihomo: работает
+Интернет: online
+Watchdog: работает
+Профиль: legacy
+Ядро: закреплено для legacy ARMv5
+TUN: tun0 работает
+Runtime: OK
+```
+
+Редактирование конфигурации:
 
 ```sh
 gc edit
 ```
 
-Вручную:
+Проверка nano:
 
 ```sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
-
-cp "$BASE/config.yaml" "$BASE/backups/config-manual.yaml"
-/jffs/scripts/nano "$BASE/config.yaml"
+nano --version
 ```
 
-Проверить:
+---
+
+# 5. Zashboard
+
+URL выводится после установки и в:
 
 ```sh
-"$BASE/bin/mihomo" -t -d "$BASE" -f "$BASE/config.yaml"
-```
-
-Применить:
-
-```sh
-gc restart
-```
-
-Откатить:
-
-```sh
-cp "$BASE/backups/config-manual.yaml" "$BASE/config.yaml"
-gc restart
-```
-
-## Restart / Stop
-
-```sh
-gc restart
-```
-
-```sh
-gc stop
-```
-
-После `gc stop` снова включить:
-
-```sh
-gc restart
-```
-
-## Лог Mihomo
-
-```sh
-gc logs
-```
-
-```sh
-gc logs mihomo 200
-```
-
-```sh
-gc logs live mihomo 100
-```
-
-Без `gc`:
-
-```sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
-
-tail -n 100 "$BASE/logs/mihomo.log"
-```
-
-Live:
-
-```sh
-tail -f "$BASE/logs/mihomo.log"
-```
-
-## Логи установки
-
-```sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
-
-tail -n 200 "$BASE/logs/install.log"
-tail -n 200 "$BASE/logs/packages.log"
-```
-
-## Проверить Mihomo
-
-```sh
-ps | grep '[m]ihomo'
-```
-
-```sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
-cat "$BASE/run/mihomo.pid" 2>/dev/null
-```
-
-## Проверить TUN / DNS / маршруты
-
-```sh
-ifconfig tun0
-```
-
-```sh
-netstat -ln | grep ':1053'
-```
-
-```sh
-route -n
-```
-
-```sh
-iptables -t mangle -L -n -v
-iptables -t nat -L -n -v
-```
-
-## Routing
-
-```sh
-gc routing status
-```
-
-```sh
-gc routing manual
-```
-
-```sh
-gc routing auto
-```
-
-Для RT-AC68U:
-
-```sh
-gc routing manual
-```
-
-## Watchdog
-
-```sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
-
-cat "$BASE/run/watchdog.pid" 2>/dev/null
-
-PID="$(cat "$BASE/run/watchdog.pid" 2>/dev/null)"
-[ -n "$PID" ] && kill -0 "$PID" && echo "watchdog OK"
-```
-
-Состояние интернета:
-
-```sh
-cat "$BASE/state/internet.state" 2>/dev/null
-ls -l "$BASE/state/wan-offline" 2>/dev/null
-```
-
-## Проверить автозапуск
-
-```sh
-gc autostart status
-```
-
-```sh
-ls -l /jffs/scripts/usb-mount-script
-ls -l /jffs/addons/goshacrash/start.sh
-```
-
-После reboot:
-
-```sh
-gc doctor
-gc autostart status
 gc status
 ```
 
-Проверить время срабатывания:
-
-```sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
-
-cat "$BASE/state/autostart-hook-ran" 2>/dev/null
-```
-
-## Проверить `/opt` после reboot
-
-```sh
-ls -ld /opt /tmp/opt
-readlink /tmp/opt 2>/dev/null
-mount | grep -E '/opt|asusware|SANDISK'
-```
-
-## Nano
-
-```sh
-which nano
-ls -l /opt/bin/nano /tmp/opt/bin/nano 2>/dev/null
-```
-
-На RT-AC68U через Download Master:
-
-```sh
-IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
-
-"$IPKG" list_installed | grep '^nano '
-"$IPKG" files nano
-```
-
-Переустановить:
-
-```sh
-"$IPKG" update
-"$IPKG" remove nano
-"$IPKG" install nano
-```
-
-## Unzip
-
-```sh
-which unzip
-ls -l /opt/bin/unzip /opt/bin/unzip-unzip /tmp/opt/bin/unzip-unzip 2>/dev/null
-```
-
-```sh
-IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
-
-"$IPKG" list_installed | grep '^unzip '
-"$IPKG" files unzip
-```
-
-Переустановить:
-
-```sh
-"$IPKG" update
-"$IPKG" remove unzip
-"$IPKG" install unzip
-```
-
-На старом Optware рабочий бинарник может быть:
-
-```text
-/opt/bin/unzip-unzip
-```
-
-## SFTP
-
-```sh
-gc sftp status
-```
-
-```sh
-IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
-
-"$IPKG" list | grep '^openssh-sftp-server '
-"$IPKG" list_installed | grep '^openssh-sftp-server '
-"$IPKG" files openssh-sftp-server
-```
-
-Установить:
-
-```sh
-"$IPKG" update
-"$IPKG" install openssh-sftp-server
-```
-
-С Windows:
-
-```powershell
-sftp admin@10.10.10.100
-```
-
-## Zashboard
+Также:
 
 ```sh
 gc dashboard
 ```
 
-Посмотреть controller и secret:
+---
 
-```sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+# 6. Watchdog и WAN recovery
 
-grep '^external-controller:' "$BASE/config.yaml"
-grep '^secret:' "$BASE/config.yaml"
-```
-
-## Ручной restart только процесса Mihomo
-
-```sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
-
-PID="$(cat "$BASE/run/mihomo.pid" 2>/dev/null)"
-[ -n "$PID" ] && kill "$PID"
-
-rm -f "$BASE/run/mihomo.pid"
-
-GOGC=50 nohup "$BASE/bin/mihomo" \
-  -d "$BASE" \
-  -f "$BASE/config.yaml" \
-  </dev/null >>"$BASE/logs/mihomo.log" 2>&1 &
-
-echo $! > "$BASE/run/mihomo.pid"
-```
-
-После этого лучше выполнить:
-
-```sh
-gc restart
-```
-
-## Тест потери интернета
-
-До отключения WAN:
-
-```sh
-gc status
-ps | grep '[m]ihomo'
-```
-
-Отключить WAN примерно на 40 секунд.
-
-Проверить:
-
-```sh
-gc status
-ps | grep '[m]ihomo'
-```
-
-Вернуть WAN, подождать примерно 30 секунд.
-
-Проверить:
-
-```sh
-gc status
-ps | grep '[m]ihomo'
-```
-
-## Короткая шпаргалка
-
-```sh
-gc
-gc status
-gc doctor
-gc edit
-gc restart
-gc stop
-gc logs
-gc logs live
-gc dashboard
-gc routing status
-gc autostart status
-gc sftp status
-gc help
-```
-
-
-## Проверка internet probe
-
-Если GoshaCrash пишет, что интернета нет:
-
-```sh
-gc internet-probe
-```
-
-Ручная проверка:
-
-```sh
-ping -c 2 -W 2 1.1.1.1
-ping -c 2 -W 2 8.8.8.8
-route -n
-```
-
-В 3.8.2 исправлен legacy-баг: наличие старого Optware `ip` больше не может само по себе объявить WAN offline. Сначала выполняются реальные внешние probes.
-
-
-## 3.8.3 — исправление ложного OFFLINE
-
-WAN probe больше не зависит от Optware PATH. Используется системный BusyBox:
-
-```sh
-/bin/ping -c 2 -W 2 1.1.1.1
-```
-
-Проверка GoshaCrash:
-
-```sh
-gc internet-probe
-```
-
-`gc restart` теперь не оставляет Mihomo выключенным после одного неудачного внешнего probe, если stock ASUSWRT одновременно сообщает:
-
-```text
-wan0_state_t = 2
-wan0_auxstate_t = 0
-WAN IP есть
-gateway есть
-default route есть
-```
-
-Решение об остановке работающего runtime принимает watchdog только после нескольких последовательных неудачных probes.
-
-Если от старой версии остался ложный offline:
-
-```sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-[ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
-
-rm -f "$BASE/state/wan-offline"
-rm -f "$BASE/state/wan-fail-count"
-rm -f "$BASE/state/wan-ok-count"
-echo online > "$BASE/state/internet.state"
-
-gc restart
-```
-
-
-## 3.8.4 — routing/PATH fix
-
-Исправлены два дефекта 3.8.3:
-
-```text
-manual_route_start: not found
-[: not found
-```
-
-Проверить routing-функцию:
-
-```sh
-grep -n '^manual_route_start()' /tmp/mnt/SANDISK/goshacrash/goshacrash.sh
-```
-
-Должна быть одна строка с определением функции.
-
-Проверить PATH:
-
-```sh
-gc doctor
-```
-
-В начале `goshacrash.sh` теперь сразу устанавливаются системные каталоги:
-
-```text
-/usr/sbin:/usr/bin:/sbin:/bin
-```
-
-ещё до первого `[`, `mkdir`, `dirname` или другой BusyBox-команды.
-
-
-## 3.8.5 — исправление `[: not found`
-
-На некоторых stock ASUSWRT BusyBox содержит applet `[`, но прошивка не предоставляет отдельную команду `/bin/[`.
-
-3.8.5 больше от этого не зависит.
-
-До первого `[ ... ]` GoshaCrash создаёт:
-
-```text
-/tmp/goshacrash-compat/[
-```
-
-который выполняет:
-
-```sh
-/bin/busybox '[' "$@"
-```
-
-При установке дополнительно создаётся постоянный wrapper:
-
-```text
-/jffs/scripts/[
-```
-
-Проверить:
-
-```sh
-command -v '['
-/bin/busybox '[' -n "ok" ']'
-echo "BRACKET_RC=$?"
-```
-
-Диагностика:
-
-```sh
-gc doctor
-```
-
-должна показать:
-
-```text
-shell [: OK
-```
-
-
-## 3.8.6 — исправление shell compatibility
-
-В 3.8.5 preflight ошибочно проверял `command -v '['`. На старом stock ASUSWRT/ash
-это не является надёжной проверкой внешнего wrapper-файла. Кроме того, сам installer
-успевал использовать `[ ... ]` до установки wrapper.
-
-В 3.8.6 installer использует builtin `test` для собственных проверок, а совместимость
-проверяется прямым запуском:
-
-```sh
-/bin/busybox '[' -n "goshacrash" ']'
-/jffs/scripts/'[' -n "goshacrash" ']'
-```
-
-Проверка после установки:
-
-```sh
-gc version
-/bin/busybox '[' -n "ok" ']'; echo "BUSYBOX=$?"
-/jffs/scripts/'[' -n "ok" ']'; echo "WRAPPER=$?"
-gc doctor
-gc status
-```
-
-
-## 3.8.7 — восстановление payload Optware
-
-`ipkg list_installed` больше не считается доказательством, что программа реально
-существует. После reboot Download Master может оставить запись о пакете, но потерять
-файл под `/opt`.
-
-Для `nano`, `unzip` и `openssh-sftp-server` используется правило:
-
-```text
-бинарник есть -> OK
-пакет зарегистрирован, бинарника нет -> remove -> update -> install -> повторная проверка файла
-пакета нет -> install -> проверка файла
-```
-
-Проверяемые файлы:
-
-```text
-/opt/bin/nano
-/opt/bin/unzip или /opt/bin/unzip-unzip
-/opt/libexec/sftp-server
-```
-
-`gc edit` теперь сам восстанавливает физический `nano`, если база ipkg говорит, что
-пакет установлен, а `/opt/bin/nano` отсутствует.
-
-
-## 3.8.8 — Optware хранится на USB
-
-Пакеты Download Master не должны жить в `/tmp`. `/tmp` используется только для
-временной ссылки `/tmp/opt`.
-
-Постоянное хранилище:
-
-```text
-/tmp/mnt/<USB>/asusware.*
-```
-
-На RT-AC68U с флешкой SANDISK это:
-
-```text
-/tmp/mnt/SANDISK/asusware.arm
-```
-
-После установки физически проверяются:
-
-```sh
-ls -l /tmp/mnt/SANDISK/asusware.arm/bin/nano
-ls -l /tmp/mnt/SANDISK/asusware.arm/bin/unzip-unzip
-ls -l /tmp/mnt/SANDISK/asusware.arm/libexec/sftp-server
-```
-
-После reboot GoshaCrash не должен скачивать эти пакеты заново. Он ждёт USB и
-восстанавливает только:
-
-```text
-/opt -> /tmp/opt -> /tmp/mnt/SANDISK/asusware.arm
-```
-
-Переустановка пакета выполняется только если его реальный файл на USB отсутствует.
-
-
-## 3.8.9 — BusyBox `test` bootstrap
-
-На части старых stock ASUSWRT отсутствуют не только `/bin/[`, но и команда
-`test`, хотя оба applet присутствуют внутри `/bin/busybox`.
-
-Installer теперь до первой условной проверки создаёт временные команды:
-
-```text
-/tmp/goshacrash-bootstrap/test
-/tmp/goshacrash-bootstrap/[
-```
-
-Они напрямую вызывают:
-
-```sh
-/bin/busybox test "$@"
-/bin/busybox '[' "$@"
-```
-
-После установки постоянные wrappers находятся в:
-
-```text
-/jffs/scripts/test
-/jffs/scripts/[
-```
-
-Это происходит до установки и проверки Optware, поэтому `nano`, `unzip` и SFTP
-больше не зависят от отсутствующих symlink-команд stock ASUSWRT.
-
-
-## 3.8.10 — bootstrap PATH и прогресс Optware
-
-3.8.9 создавал `/tmp/goshacrash-bootstrap/test`, но затем `prepare_path()` строил PATH
-заново и терял этот каталог. Поэтому на старом stock ASUSWRT снова появлялось:
-
-```text
-test: not found
-```
-
-3.8.10 сохраняет bootstrap во всех PATH:
-
-```text
-/tmp/goshacrash-bootstrap
-```
-
-Перед работой с пакетами installer отдельно проверяет:
-
-```text
-Shell bootstrap: test + [ OK
-```
-
-Для долгих операций Optware теперь выводится текущий шаг:
-
-```text
-Optware: обновляю индекс пакетов
-Optware: remove nano
-Optware: install nano
-Optware: повторный install nano
-```
-
-То есть во время старого `ipkg update` больше не выглядит так, будто installer завис.
-
-
-## 3.8.11 — быстрая установка Optware
-
-Installer больше не выполняет `ipkg update` для каждого пакета.
-
-Алгоритм:
-
-```text
-payload уже есть на USB
-  -> ничего не скачивать
-
-payload отсутствует
-  -> попробовать install/reinstall с текущим локальным индексом
-
-install не удался
-  -> один ipkg update за весь запуск installer
-  -> повторить только неудавшийся пакет
-```
-
-Поэтому при повторной установке исправные `nano`, `unzip` и
-`openssh-sftp-server` проходят без сетевых операций Optware.
-
-Полное обновление всех пакетов Optware по-прежнему выполняется вручную:
-
-```sh
-/tmp/mnt/SANDISK/asusware.arm/bin/ipkg update
-/tmp/mnt/SANDISK/asusware.arm/bin/ipkg upgrade
-```
-
-
-## 3.8.12 — убраны лишние задержки Optware
-
-Удалены два старых медленных шага:
-
-```text
-restart_download_master_env
-ранний ipkg update перед проверкой пакетов
-```
-
-Теперь:
-
-```text
-файл есть на USB -> мгновенно пропустить
-файла нет -> install/reinstall по локальному индексу
-только реальный failure -> один ipkg update -> повторить
-```
-
-SFTP тоже больше не инициирует `ipkg update` только ради поиска пакета в feed.
-
-
-## 3.9.0 — стабильный Optware на TFAT
-
-Причина прошлых проблем найдена: старый ASUS Optware рассчитывает на SONAME-ссылки
-в `/opt/lib`, а TFAT не сохраняет этот layout надёжно. В итоге оставались только
-versioned-файлы вроде:
-
-```text
-libipkg.so.0.0.0
-libuClibc-<version>.so
-```
-
-а `ipkg` требовал:
-
-```text
-libipkg.so.0
-libc.so.0
-ld-uClibc.so.0
-```
-
-3.9.0 восстанавливает необходимые ABI-алиасы как обычные файлы на USB, а не symlink.
-
-Порядок установки теперь жёсткий:
-
-```text
-USB
--> /tmp/opt
--> repair Optware ABI
--> ipkg self-test
--> nano/unzip/SFTP
--> physical USB payload check
--> Mihomo
-```
-
-На reboot:
-
-```text
-USB
--> /tmp/opt
--> repair ABI aliases
--> запуск GoshaCrash
-```
-
-Без `ipkg update`, без package reinstall и без Download Master restart.
-
-Проверка вручную:
-
-```sh
-gc packages-repair
-gc doctor
-
-DM=/tmp/mnt/SANDISK/asusware.arm
-ls -l "$DM/lib/libipkg.so.0"
-ls -l "$DM/lib/libc.so.0"
-ls -l "$DM/lib/ld-uClibc.so.0"
-ls -l "$DM/bin/nano"
-ls -l "$DM/libexec/sftp-server"
-```
-
-
-## 3.9.1 — универсальное восстановление SONAME
-
-3.9.0 восстанавливал только заранее перечисленные библиотеки. Этого оказалось
-недостаточно: `nano` требует `libncurses.so.5`, а на TFAT мог сохраниться только
-versioned-файл, например:
-
-```text
-libncurses.so.5.7
-```
-
-3.9.1 проходит все библиотеки вида:
-
-```text
-lib*.so.X.Y...
-```
-
-и при отсутствии major SONAME создаёт обычную копию:
-
-```text
-libncurses.so.5.7  -> libncurses.so.5
-libstdc++.so.6.0.2 -> libstdc++.so.6
-libipkg.so.0.0.0   -> libipkg.so.0
-```
-
-Это делается и при установке, и после reboot.
-
-`nano` теперь считается исправным только если реально выполняется:
-
-```sh
-nano --version
-```
-
-а не просто если файл `/opt/bin/nano` существует.
-
-
-## USB-флешка: какой формат использовать
-
-Для GoshaCrash вместе со старым ASUS Download Master / Optware рекомендуется
-**EXT3**.
-
-Почему EXT3:
-
-- это Linux-файловая система с нормальной поддержкой Unix permissions и symbolic links;
-- старый Optware использует SONAME-ссылки библиотек (`libncurses.so.5`,
-  `libipkg.so.0` и другие);
-- на FAT/TFAT такие структуры могут сохраняться некорректно;
-- EXT3 консервативнее для старых stock ASUSWRT и старого ядра, чем выбор более
-  новой файловой системы только ради новизны.
-
-RT-AC68U официально поддерживает USB-файловые системы EXT2, EXT3 и EXT4.
-Для этого проекта рекомендуется именно **один раздел EXT3**.
-
-### Чистая установка
-
-1. Сохранить нужные файлы с флешки, особенно `goshacrash/config.yaml`.
-2. Удалить Download Master с флешки через ASUSWRT, если это необходимо перед форматированием.
-3. Отформатировать флешку на компьютере как **EXT3**, один основной раздел.
-4. Подключить флешку к роутеру.
-5. Проверить:
-
-```sh
-mount | grep '/tmp/mnt/'
-```
-
-Ожидается `type ext3`, а не `type tfat`.
-
-6. Через ASUSWRT установить Download Master на эту флешку.
-7. Запустить установщик GoshaCrash.
-8. Проверить:
-
-```sh
-gc doctor
-gc status
-nano --version
-gc edit
-```
-
-После перезагрузки:
-
-```sh
-mount | grep '/tmp/mnt/'
-gc status
-nano --version
-gc edit
-```
-
-### FAT/TFAT
-
-GoshaCrash не запрещает установку на FAT/TFAT, но выводит предупреждение и
-использует compatibility ABI repair. Для постоянной установки с Download Master
-это резервный режим, а не рекомендуемый вариант.
-
-
-# GoshaCrash 3.10.0 — FAT/TFAT + постоянный Optware
-
-Форматировать USB в EXT3 **не требуется**. FAT/TFAT поддерживается как основной
-вариант для stock ASUSWRT + Download Master.
-
-Пакеты `nano`, `unzip` и `openssh-sftp-server` устанавливаются через Optware
-**один раз** и физически остаются в `asusware.arm` на USB.
-
-Проблема FAT/TFAT состоит не в удалении пакетов, а в Unix SONAME symlink'ах
-динамических библиотек. Поэтому GoshaCrash больше не пытается копировать
-SONAME-файлы на FAT и не переустанавливает пакеты после reboot.
-
-После каждой загрузки выполняются только локальные операции:
-
-```text
-USB / asusware.arm
-        |
-        +--> восстановить /tmp/opt
-        |
-        +--> создать /tmp/goshacrash-opt/lib
-                |
-                +--> временные Unix symlink'и на библиотеки USB
-```
-
-Никакого `ipkg update`, скачивания или повторной установки пакетов на boot нет.
+Watchdog постоянно проверяет состояние WAN/runtime.
 
 Проверка:
 
 ```sh
-gc packages-repair
-gc doctor
-nano --version
-gc edit
+gc status
 ```
 
-RAM overlay можно посмотреть:
+или:
 
 ```sh
-ls -la /tmp/goshacrash-opt/lib
+WPID="$(cat /tmp/mnt/*/goshacrash/run/watchdog.pid 2>/dev/null)"
+echo "$WPID"
 ```
 
-После reboot:
+На старом BusyBox `ps | grep watchdog-loop` может не совпасть с отображаемой командой. Надёжнее проверять конкретный PID:
+
+```sh
+kill -0 "$WPID" 2>/dev/null && echo WATCHDOG_ALIVE
+```
+
+Проверенный сценарий:
+
+```text
+WAN online
+   ↓
+кабель WAN отключён
+   ↓
+external probe FAIL
+   ↓
+internet.state=offline
+   ↓
+Mihomo остановлен
+   ↓
+watchdog остаётся жив
+   ↓
+WAN возвращается
+   ↓
+internet.state=online
+   ↓
+Mihomo + DNS + TUN + routing восстановлены
+```
+
+Счётчики:
+
+```sh
+cat /tmp/mnt/*/goshacrash/state/internet.state
+cat /tmp/mnt/*/goshacrash/state/wan-fail-count
+cat /tmp/mnt/*/goshacrash/state/wan-ok-count
+```
+
+---
+
+# 7. SFTP
+
+GoshaCrash не заменяет штатный ASUS Dropbear.
+
+На legacy Optware устанавливается:
+
+```text
+openssh-sftp-server
+```
+
+Проверка:
+
+```sh
+gc sftp status
+```
+
+С ПК:
+
+```sh
+sftp admin@10.10.10.100
+```
+
+Проверенный тест:
+
+```text
+cd /tmp/mnt/GOSHACRASH
+put test.txt
+get test.txt
+rename test.txt test2.txt
+rm test2.txt
+```
+
+---
+
+# 8. Stop / Start / Restart
+
+Остановить Mihomo и вернуть обычный DIRECT:
+
+```sh
+gc stop
+```
+
+Запустить:
+
+```sh
+gc start
+```
+
+Перезапустить:
+
+```sh
+gc restart
+```
+
+---
+
+# 9. Autostart
+
+Проверка:
+
+```sh
+gc autostart status
+```
+
+На stock ASUSWRT используются JFFS hooks и USB mount bridge. После reboot USB должен сначала смонтироваться, после чего GoshaCrash восстанавливает runtime.
+
+---
+
+# 10. Диагностика
+
+Минимальный набор:
 
 ```sh
 gc status
-gc packages-repair
-nano --version
-gc edit
+gc doctor
+gc autostart status
+gc sftp status
 ```
 
-Настоящие пакеты при этом продолжают храниться на USB:
+Сеть:
 
 ```sh
-ls -l /tmp/mnt/SANDISK/asusware.arm/bin/nano
-ls -l /tmp/mnt/SANDISK/asusware.arm/libexec/sftp-server
+ifconfig tun0
+route -n
+iptables -t nat -L -n
+iptables -t mangle -L -n
 ```
 
+WAN:
 
-## 3.10.1 — Optware environment scoped per process
+```sh
+nvram get wan0_state_t
+nvram get wan0_sbstate_t
+nvram get wan0_auxstate_t
+/bin/ping -c 3 1.1.1.1
+```
 
-3.10.0 ошибочно экспортировал `LD_LIBRARY_PATH` глобально. На старом RT-AC68U
-это заставляло даже системный `/bin/sh` загружать Optware-библиотеки и приводило к:
+DNS:
+
+```sh
+nslookup ya.ru 127.0.0.1
+```
+
+Логи находятся в:
 
 ```text
-/bin/sh: can't resolve symbol '__aeabi_uidivmod'
+<USB>/goshacrash/logs/
 ```
 
-3.10.1 никогда не экспортирует Optware library path глобально.
+---
 
-Только конкретный Optware ELF запускается так:
+# 11. Файловая система USB
+
+Для legacy Download Master / Optware рекомендуются:
+
+- EXT3 — основной проверенный вариант для RT-AC68U;
+- EXT2/EXT4 могут поддерживаться прошивкой, но этот RC валидировался именно на EXT3.
+
+Не рекомендуется использовать TFAT/FAT для Optware.
+
+Причина — отсутствие Unix symlink.
+
+---
+
+# 12. Источники компонентов
+
+Текущий RC всё ещё использует:
+
+```sh
+REPO=goshamarat/GoshaCrash
+BRANCH=main
+```
+
+для внутренних загрузок/release assets. Перед публичным стабильным релизом необходимо разделить:
+
+- источник runtime-файлов;
+- immutable release ref/tag;
+- источник legacy Mihomo release asset.
+
+Это нужно, чтобы старый release installer никогда не подтягивал будущий `main`.
+
+---
+
+# 13. Статус платформ
+
+## Проверено
+
+**ASUS RT-AC68U**
+
+- Linux 2.6.36.4brcmarm
+- `armv7l`
+- legacy ARMv5 + gVisor core
+- EXT3
+- Download Master / Optware
+- manual routing
+
+## Планируется
+
+Современные ASUS ARM64, включая ZenWiFi BT10, требуют отдельного полного acceptance-test. Не считайте legacy-тест подтверждением ARM64.
+
+---
+
+# Release checklist
+
+Перед stable release:
 
 ```text
-LD_LIBRARY_PATH=/tmp/goshacrash-opt/lib:<asusware>/lib:/lib:/usr/lib <program>
+[ ] чистая EXT3
+[ ] Download Master
+[ ] install
+[ ] gc doctor
+[ ] reboot
+[ ] gc stop/start
+[ ] kill Mihomo → watchdog recovery
+[ ] WAN unplug → offline
+[ ] WAN plug → recovery
+[ ] nano
+[ ] SFTP upload/download/rename/delete
+[ ] manual routing
+[ ] auto routing
+[ ] runtime pinned to release tag, не main
 ```
-
-Системные BusyBox-команды (`sh`, `cp`, `grep`, `mount`, `iptables`) работают в
-обычном системном окружении.
-
-`nano` и `ipkg` запускаются через scoped runner. Для SFTP сохраняется реальный
-`sftp-server.real`, а штатный путь `/opt/libexec/sftp-server` становится маленьким
-shell-wrapper, который задаёт library path только перед `exec` реального SFTP.

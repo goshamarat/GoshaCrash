@@ -1,0 +1,12 @@
+# GoshaCrash 3.10.2-rc3
+
+Изменения относительно rc2:
+- обычный `sh install.sh` после определения legacy-профиля сам проверяет filesystem,
+  на котором реально находится Download Master/Optware;
+- EXT3 проходит preflight автоматически;
+- TFAT/FAT/NTFS/другая ФС останавливает установку до изменения runtime;
+- сообщение сразу предлагает `sh install.sh --prepare-usb`;
+- `--prepare-usb` остаётся отдельным безопасным мастером MBR + EXT3 + symlink-test.
+
+Перед stable release всё ещё нужно закрепить runtime-файлы на immutable release tag,
+а не на `main`.

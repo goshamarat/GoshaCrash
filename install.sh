@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.1"
+INSTALLER_VERSION="3.10.2-rc3"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -125,6 +125,266 @@ verify_asuswrt(){
     test -r /proc/version || { fail "/proc/version не найден: среда Linux не готова"; return 1; }
     find_nvram || warn "Утилита nvram не найдена; модель роутера будет определена по архитектуре и ядру"
 }
+
+
+find_tool_basic(){
+    name="$1"
+    for p in "/usr/sbin/$name" "/usr/bin/$name" "/sbin/$name" "/bin/$name"; do
+        test -x "$p" && { printf '%s\n' "$p"; return 0; }
+    done
+    command -v "$name" 2>/dev/null || return 1
+}
+
+usb_disk_size_mb(){
+    dev="$1"
+    name="${dev#/dev/}"
+    blocks="$(awk -v n="$name" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
+    case "$blocks" in
+        ''|*[!0-9]*) echo "?"; return 0 ;;
+    esac
+    echo $((blocks / 1024))
+}
+
+usb_disk_model(){
+    dev="$1"
+    name="${dev#/dev/}"
+    model="$(cat "/sys/block/$name/device/model" 2>/dev/null)"
+    vendor="$(cat "/sys/block/$name/device/vendor" 2>/dev/null)"
+    model="$(printf '%s %s' "$vendor" "$model" | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')"
+    test -n "$model" && printf '%s\n' "$model" || printf '%s\n' "USB disk"
+}
+
+usb_disk_is_mounted(){
+    dev="$1"
+    grep -q "^${dev}[0-9]* " /proc/mounts 2>/dev/null
+}
+
+usb_list_disks(){
+    found=0
+    for sys in /sys/block/sd*; do
+        test -d "$sys" || continue
+        name="${sys##*/}"
+        dev="/dev/$name"
+        test -b "$dev" || continue
+        found=$((found + 1))
+        size_mb="$(usb_disk_size_mb "$dev")"
+        model="$(usb_disk_model "$dev")"
+        mounted="нет"
+        usb_disk_is_mounted "$dev" && mounted="да"
+        printf ' [%s] %s | %s | %s MB | mounted: %s\n' "$found" "$dev" "$model" "$size_mb" "$mounted"
+        eval "GC_USB_DEV_$found='$dev'"
+    done
+    GC_USB_COUNT="$found"
+}
+
+usb_wait_partition(){
+    part="$1"
+    n=0
+    while test "$n" -lt 15; do
+        test -b "$part" && return 0
+        sleep 1
+        n=$((n + 1))
+    done
+    return 1
+}
+
+usb_symlink_test(){
+    mountpoint="$1"
+    testdir="$mountpoint/.goshacrash-symlink-test.$$"
+    rm -rf "$testdir" 2>/dev/null || true
+    mkdir -p "$testdir" || return 1
+    : > "$testdir/target" || { rm -rf "$testdir"; return 1; }
+    ln -s target "$testdir/link" 2>/dev/null || { rm -rf "$testdir"; return 1; }
+    test -L "$testdir/link" || { rm -rf "$testdir"; return 1; }
+    rm -rf "$testdir" 2>/dev/null || true
+    return 0
+}
+
+
+mount_fs_for_path(){
+    target="$1"
+    best_mp=""
+    best_fs=""
+    while read dev mp fs rest; do
+        case "$target" in
+            "$mp"|"$mp"/*)
+                if test ${#mp} -gt ${#best_mp}; then
+                    best_mp="$mp"
+                    best_fs="$fs"
+                fi
+                ;;
+        esac
+    done < /proc/mounts
+    test -n "$best_mp" || return 1
+    printf '%s|%s\n' "$best_mp" "$best_fs"
+}
+
+legacy_usb_fs_check(){
+    # DM_ROOT is already known here, so inspect the actual filesystem that
+    # backs Download Master/Optware rather than guessing from a device name.
+    candidate="${DM_ROOT:-${USB_MOUNT:-}}"
+    test -n "$candidate" || return 0
+
+    info="$(mount_fs_for_path "$candidate" 2>/dev/null)" || {
+        warn "Не удалось определить filesystem для $candidate"
+        return 0
+    }
+
+    mp="${info%%|*}"
+    fs="${info#*|}"
+
+    case "$fs" in
+        ext3)
+            ok "USB filesystem: EXT3 ($mp)"
+            return 0
+            ;;
+        *)
+            echo
+            warn "USB filesystem: $fs"
+            warn "Mount: $mp"
+            echo
+            echo "Для legacy RT-AC68U + Download Master/Optware нужна EXT3."
+            echo "Текущая файловая система '$fs' не подходит для проверенной legacy-схемы."
+            echo
+            echo "Почему:"
+            echo "  Optware использует Unix symlink, например:"
+            echo "  libipkg.so.0 -> libipkg.so.0.0.0"
+            echo "  На TFAT/FAT такие ссылки не создаются; в результате ломаются ipkg, nano и SFTP."
+            echo
+            echo "Подготовить флешку можно этим же установщиком:"
+            echo
+            echo "  sh install.sh --prepare-usb"
+            echo
+            echo "После форматирования:"
+            echo "  1. переподключи флешку;"
+            echo "  2. установи Download Master на неё заново;"
+            echo "  3. снова запусти: sh install.sh"
+            echo
+            fail "Установка остановлена до внесения изменений: требуется EXT3"
+            return 1
+            ;;
+    esac
+}
+
+prepare_usb_wizard(){
+    verify_asuswrt || return 1
+
+    FDISK_BIN="$(find_tool_basic fdisk 2>/dev/null)"
+    MKFS_BIN="$(find_tool_basic mkfs.ext3 2>/dev/null)"
+    test -n "$FDISK_BIN" || { fail "fdisk не найден в прошивке"; return 1; }
+    test -n "$MKFS_BIN" || { fail "mkfs.ext3 не найден в прошивке"; return 1; }
+
+    echo
+    echo "GoshaCrash — подготовка USB в EXT3"
+    echo "=================================="
+    echo
+    echo "Найдены USB-диски:"
+    usb_list_disks
+    test "${GC_USB_COUNT:-0}" -gt 0 || { fail "USB-диски /dev/sdX не найдены"; return 1; }
+    echo
+    echo " [0] Отмена"
+    printf 'Выберите диск [0-%s]: ' "$GC_USB_COUNT"
+    read choice
+    case "$choice" in
+        0|'') say "Форматирование отменено"; return 0 ;;
+        *[!0-9]*) fail "Некорректный выбор"; return 1 ;;
+    esac
+    test "$choice" -ge 1 2>/dev/null && test "$choice" -le "$GC_USB_COUNT" 2>/dev/null || {
+        fail "Некорректный номер диска"
+        return 1
+    }
+
+    eval "USB_DEV=\${GC_USB_DEV_$choice}"
+    test -b "$USB_DEV" || { fail "Устройство исчезло: $USB_DEV"; return 1; }
+
+    model="$(usb_disk_model "$USB_DEV")"
+    size_mb="$(usb_disk_size_mb "$USB_DEV")"
+    part="${USB_DEV}1"
+
+    echo
+    echo "ВНИМАНИЕ: ВСЕ ДАННЫЕ НА $USB_DEV БУДУТ УДАЛЕНЫ."
+    echo "Устройство: $USB_DEV"
+    echo "Модель:     $model"
+    echo "Размер:     $size_mb MB"
+    echo
+    echo "Будет создано:"
+    echo "  DOS/MBR partition table"
+    echo "  ${part} — один Linux-раздел на весь диск"
+    echo "  EXT3, label=GOSHACRASH"
+    echo
+    printf 'Для продолжения введите точно: FORMAT %s\n> ' "$USB_DEV"
+    read confirm
+    test "$confirm" = "FORMAT $USB_DEV" || { say "Форматирование отменено"; return 0; }
+
+    say "[1/6] Размонтирование разделов $USB_DEV"
+    awk -v d="$USB_DEV" '$1 ~ ("^" d "[0-9]+$") {print $2}' /proc/mounts 2>/dev/null | while read mp; do
+        test -n "$mp" && umount "$mp" 2>/dev/null || true
+    done
+    sync
+
+    say "[2/6] Создание MBR и одного primary-раздела"
+    # Stock ASUSWRT fdisk is old BusyBox/util-linux style. Feed the same
+    # sequence that is used interactively: new DOS label, primary #1,
+    # default first/last cylinder, write.
+    {
+        echo o
+        echo n
+        echo p
+        echo 1
+        echo
+        echo
+        echo w
+    } | "$FDISK_BIN" "$USB_DEV" >> "$TMP_LOG" 2>&1 || {
+        fail "fdisk завершился с ошибкой. См. $TMP_LOG"
+        return 1
+    }
+    sync
+
+    say "[3/6] Ожидание $part"
+    usb_wait_partition "$part" || {
+        warn "$part не появился автоматически."
+        warn "Вынь и вставь флешку, затем повтори: sh install.sh --prepare-usb"
+        return 1
+    }
+
+    say "[4/6] Форматирование EXT3"
+    umount "$part" 2>/dev/null || true
+    "$MKFS_BIN" -F -L GOSHACRASH "$part" >> "$TMP_LOG" 2>&1 || {
+        fail "mkfs.ext3 завершился с ошибкой. См. $TMP_LOG"
+        return 1
+    }
+    sync
+
+    say "[5/6] Тестовое монтирование"
+    TEST_MOUNT="/tmp/goshacrash-usb-test.$$"
+    mkdir -p "$TEST_MOUNT" || return 1
+    mount -t ext3 "$part" "$TEST_MOUNT" 2>/dev/null || {
+        rmdir "$TEST_MOUNT" 2>/dev/null || true
+        fail "Не удалось тестово смонтировать $part как EXT3"
+        return 1
+    }
+
+    say "[6/6] Проверка symlink"
+    if ! usb_symlink_test "$TEST_MOUNT"; then
+        umount "$TEST_MOUNT" 2>/dev/null || true
+        rmdir "$TEST_MOUNT" 2>/dev/null || true
+        fail "EXT3 создан, но symlink-тест не прошёл"
+        return 1
+    fi
+    umount "$TEST_MOUNT" 2>/dev/null || true
+    rmdir "$TEST_MOUNT" 2>/dev/null || true
+
+    echo
+    ok "USB подготовлен: $part, EXT3, label=GOSHACRASH, symlink=OK"
+    echo
+    echo "Следующий шаг:"
+    echo "  1. Вынь и вставь флешку (или перезагрузи роутер), чтобы ASUSWRT смонтировал её."
+    echo "  2. Установи Download Master через веб-интерфейс ASUS на эту флешку."
+    echo "  3. Запусти обычную установку: sh install.sh"
+    echo
+    return 0
+}
+
 
 tool_path(){
     if test "$1" = "unzip"; then
@@ -1712,7 +1972,32 @@ normalize_legacy_optware_unzip() {
 
 main(){
     : > "$TMP_LOG"
-    test "$#" -eq 0 || { fail "install.sh запускается без аргументов"; return 1; }
+
+    case "${1:-}" in
+        --prepare-usb)
+            test "$#" -eq 1 || { fail "Использование: sh install.sh --prepare-usb"; return 1; }
+            acquire_lock || return 1
+            prepare_usb_wizard
+            return $?
+            ;;
+        --help|-h)
+            echo "GoshaCrash installer $INSTALLER_VERSION"
+            echo
+            echo "Использование:"
+            echo "  sh install.sh                установить GoshaCrash"
+            echo "  sh install.sh --prepare-usb  безопасный мастер подготовки USB в EXT3"
+            echo "  sh install.sh --help         эта справка"
+            return 0
+            ;;
+        '')
+            ;;
+        *)
+            fail "Неизвестный аргумент: $1. Используй --help"
+            return 1
+            ;;
+    esac
+
+    test "$#" -eq 0 || return 1
     acquire_lock || return 1
 
     verify_asuswrt || return 1
@@ -1731,6 +2016,9 @@ main(){
     # the controlled switchover.
 
     detect_platform || return 1
+    if test "${PLATFORM:-}" = "legacy"; then
+        legacy_usb_fs_check || return 1
+    fi
     choose_routing_mode || return 1
     model_name="$(nvram_get productid)"; test -n "$model_name" || model_name="$(hostname 2>/dev/null)"; test -n "$model_name" || model_name="ASUSWRT"
     say "Роутер: $model_name, архитектура $(uname -m 2>/dev/null), ядро $(uname -r 2>/dev/null)"
