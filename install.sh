@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc9"
+INSTALLER_VERSION="3.10.2-rc10"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -362,7 +362,7 @@ prepare_usb_wizard(){
 
     disk_blocks="$(awk -v n="$devname" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
     fdisk_line="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print; exit}')"
-    fdisk_blocks="$(printf '%s\n' "$fdisk_line" | awk '{print $5}')"
+    fdisk_blocks="$(printf '%s\n' "$fdisk_line" | awk '{print $4}')"
     fdisk_type="$(printf '%s\n' "$fdisk_line" | awk '{print $(NF-1)}')"
     kernel_blocks="$(awk -v n="${target_part#/dev/}" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
     part_count="$(awk -v d="$devname" '$4 ~ ("^" d "[0-9]+$") {c++} END {print c+0}' /proc/partitions 2>/dev/null)"
@@ -421,11 +421,11 @@ prepare_usb_wizard(){
             echo
             warn "MBR записан, но старое ядро ASUSWRT ещё не создало $target_part."
             echo "Сделай reboot, снова скачай install.sh и повтори --prepare-usb."
-            echo "rc8 распознает готовую MBR и fdisk повторно запускать не будет."
+            echo "rc10 распознает готовую MBR и fdisk повторно запускать не будет."
             return 2
         fi
 
-        fdisk_blocks="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print $5; exit}')"
+        fdisk_blocks="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print $4; exit}')"
         kernel_blocks="$(awk -v n="${target_part#/dev/}" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
 
         if test -n "$fdisk_blocks" && test -n "$kernel_blocks" && test "$fdisk_blocks" != "$kernel_blocks"; then
@@ -439,12 +439,12 @@ prepare_usb_wizard(){
             echo "После загрузки снова:"
             echo "  sh /tmp/install.sh --prepare-usb"
             echo
-            echo "rc8 увидит совпавшую геометрию и ПРОПУСТИТ fdisk."
+            echo "rc10 увидит совпавшую геометрию и ПРОПУСТИТ fdisk."
             return 2
         fi
     fi
 
-    fdisk_blocks="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print $5; exit}')"
+    fdisk_blocks="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print $4; exit}')"
     kernel_blocks="$(awk -v n="${target_part#/dev/}" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
     if test -z "$fdisk_blocks" || test -z "$kernel_blocks" || test "$fdisk_blocks" != "$kernel_blocks"; then
         fail "Перед mkfs геометрия $target_part не подтверждена. mkfs НЕ запускается."

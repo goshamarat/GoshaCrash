@@ -1,12 +1,14 @@
-# GoshaCrash 3.10.2-rc9
+# GoshaCrash 3.10.2-rc10
 
-Fixes rc8 resume detection on 32-bit BusyBox ash.
+Critical fix for USB resume/stale geometry detection.
 
-Root cause:
-disk_blocks * 98 overflowed 32-bit shell arithmetic for the 123 GB USB disk.
+BusyBox fdisk output on RT-AC68U:
+  /dev/sda1  1  14959  120158136  83  Linux
 
-Fix:
-convert block counts to MiB first, then calculate the 98% threshold.
+Field 4 = Blocks.
+Field 5 = partition Id (83).
 
-Added Resume check diagnostics showing:
-part count, MBR type, fdisk blocks, kernel blocks.
+rc8/rc9 incorrectly parsed field 5 as fdisk_blocks, producing fdisk_blocks=83
+and forcing a false stale-geometry result every time.
+
+rc10 uses field 4 consistently in all fdisk geometry comparisons.
