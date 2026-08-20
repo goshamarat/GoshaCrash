@@ -1,14 +1,17 @@
-# GoshaCrash 3.10.2-rc10
+# GoshaCrash 3.10.2-rc11
 
-Critical fix for USB resume/stale geometry detection.
+Fixes package bootstrap on RT-AC68U EXT3.
 
-BusyBox fdisk output on RT-AC68U:
-  /dev/sda1  1  14959  120158136  83  Linux
+Observed rc10 failure:
+  sh: can't resolve symbol '__aeabi_uidivmod'
 
-Field 4 = Blocks.
-Field 5 = partition Id (83).
+Root cause:
+ipkg was forced through an Optware LD_LIBRARY_PATH overlay. Child firmware
+/bin/sh and wget inherited ancient Optware uClibc and failed.
 
-rc8/rc9 incorrectly parsed field 5 as fdisk_blocks, producing fdisk_blocks=83
-and forcing a false stale-geometry result every time.
-
-rc10 uses field 4 consistently in all fdisk geometry comparisons.
+rc11:
+- prefers ipkg with LD_LIBRARY_PATH unset;
+- uses the selected clean runtime for ipkg update/install/remove;
+- keeps ABI overlay only as compatibility fallback;
+- fixes USB filesystem detection that incorrectly returned rootfs for
+  /tmp/mnt/SANDISK.

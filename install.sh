@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc10"
+INSTALLER_VERSION="3.10.2-rc11"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -803,9 +803,34 @@ repair_optware_abi(){
     build_optware_overlay
 }
 
+OPTWARE_RUNTIME_MODE=""
+
 run_optware(){
     ldpath="$(optware_env)" || return 1
     LD_LIBRARY_PATH="$ldpath" "$@"
+}
+
+run_optware_clean(){
+    # Critical on old stock ASUSWRT: Optware's uClibc must NOT leak into
+    # firmware /bin/sh, wget, ls, etc.  A subshell keeps the caller clean too.
+    (
+        unset LD_LIBRARY_PATH
+        "$@"
+    )
+}
+
+run_pkg(){
+    case "$OPTWARE_RUNTIME_MODE" in
+        clean)
+            run_optware_clean "$@"
+            ;;
+        overlay)
+            run_optware "$@"
+            ;;
+        *)
+            run_optware_clean "$@"
+            ;;
+    esac
 }
 
 verify_ipkg_runtime(){
@@ -817,12 +842,27 @@ verify_ipkg_runtime(){
     err="$BASE/logs/ipkg-runtime.err"
     : > "$err"
 
+    # EXT3 keeps the real Optware symlinks, so first try ipkg with NO
+    # LD_LIBRARY_PATH.  This is the safe mode because child /bin/sh and wget
+    # then use the firmware libraries instead of ancient Optware uClibc.
+    run_optware_clean "$PKG" list_installed >/dev/null 2>"$err"
+    rc=$?
+    if test "$rc" -eq 0 && ! grep -Eq "can't (load library|resolve symbol)" "$err" 2>/dev/null; then
+        OPTWARE_RUNTIME_MODE="clean"
+        rm -f "$err" 2>/dev/null || true
+        say "Optware runtime: ipkg OK (clean environment)"
+        return 0
+    fi
+
+    # Compatibility fallback for old/broken layouts where ipkg itself really
+    # needs the temporary ABI overlay.  Package downloads may still be unsafe
+    # in this mode, but a healthy EXT3 Download Master should select clean.
+    : > "$err"
     run_optware "$PKG" list_installed >/dev/null 2>"$err"
     rc=$?
-
     if test "$rc" -eq 0 && ! grep -Eq "can't (load library|resolve symbol)" "$err" 2>/dev/null; then
-        rm -f "$err" 2>/dev/null || true
-        say "Optware runtime: ipkg OK (scoped RAM overlay)"
+        OPTWARE_RUNTIME_MODE="overlay"
+        warn "Optware runtime: используется ABI overlay; clean runtime недоступен"
         return 0
     fi
 
@@ -851,7 +891,7 @@ pkg_update_index_once(){
     test "$PKG_INDEX_REFRESHED" = "1" && return 0
     pkg_progress "обновляю индекс пакетов (один раз)"
     pkg_log "RUN: $PKG update"
-    run_optware "$PKG" update >> "$BASE/logs/packages.log" 2>&1 || return 1
+    run_pkg "$PKG" update >> "$BASE/logs/packages.log" 2>&1 || return 1
     PKG_INDEX_REFRESHED=1
     return 0
 }
@@ -872,7 +912,7 @@ pkg_install_one(){
     pkg_progress "install $name (локальный индекс)"
     pkg_log "RUN: $PKG install $name"
 
-    run_optware "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && {
+    run_pkg "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && {
         repair_optware_abi >/dev/null 2>&1 || true
         return 0
     }
@@ -880,14 +920,14 @@ pkg_install_one(){
     warn "install $name не удался с текущим индексом"
     pkg_update_index_once || true
     pkg_progress "повторный install $name"
-    run_optware "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
+    run_pkg "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
     rc=$?
     repair_optware_abi >/dev/null 2>&1 || true
     return "$rc"
 }
 
 pkg_is_installed(){
-    "$PKG" list_installed 2>/dev/null | grep -q "^$1[[:space:]]*-"
+    run_pkg "$PKG" list_installed 2>/dev/null | grep -q "^$1[[:space:]]*-"
 }
 
 pkg_reinstall_one(){
@@ -898,13 +938,13 @@ pkg_reinstall_one(){
 
     pkg_progress "remove $name"
     pkg_log "REINSTALL: $name"
-    run_optware "$PKG" remove "$name" >> "$BASE/logs/packages.log" 2>&1 || true
+    run_pkg "$PKG" remove "$name" >> "$BASE/logs/packages.log" 2>&1 || true
 
     repair_optware_abi >/dev/null 2>&1 || true
     verify_ipkg_runtime || return 1
 
     pkg_progress "install $name (локальный индекс)"
-    run_optware "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && {
+    run_pkg "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && {
         repair_optware_abi >/dev/null 2>&1 || true
         return 0
     }
@@ -912,7 +952,7 @@ pkg_reinstall_one(){
     warn "reinstall $name не удался с текущим индексом"
     pkg_update_index_once || true
     pkg_progress "повторный install $name"
-    run_optware "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
+    run_pkg "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
     rc=$?
     repair_optware_abi >/dev/null 2>&1 || true
     return "$rc"
@@ -1178,8 +1218,18 @@ install_optware_sftp(){
 detect_usb_fstype(){
     usb_mount="${USB_ROOT:-$DM_ROOT}"
     test -n "$usb_mount" || return 1
+
+    # `mount` output: device on MOUNTPOINT type FSTYPE (...)
+    # Match the mountpoint that actually contains usb_mount.  The old
+    # prefix test also matched "/" and therefore falsely returned rootfs.
     mount 2>/dev/null | awk -v p="$usb_mount" '
-        index(p,$3)==1 || index($3,p)==1 { print $5; exit }
+        {
+            m=$3
+            if (p == m || index(p, m "/") == 1) {
+                print $5
+                exit
+            }
+        }
     '
 }
 

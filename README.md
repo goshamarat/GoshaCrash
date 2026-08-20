@@ -4,7 +4,7 @@ GoshaCrash — установщик и контроллер Mihomo для ASUSWR
 
 Этот RC в первую очередь проверяется на **ASUS RT-AC68U** со старым ASUSWRT / Linux 2.6.36. Для legacy-профиля используется **Mihomo ARMv5 + gVisor**.
 
-> **Тестовая версия:** 3.10.2-rc10  
+> **Тестовая версия:** 3.10.2-rc11  
 > Не публикуйте её как универсально стабильную для всех ASUS до проверки новых ARM64-моделей.
 
 ## Что уже проверено на RT-AC68U
@@ -228,6 +228,25 @@ fdisk_blocks=83
 
 и всегда считал геометрию stale. rc10 читает blocks из поля 4 во всех
 resume/stale-проверках.
+
+
+### Исправление rc11: Optware без утечки `LD_LIBRARY_PATH`
+
+На рабочем EXT3 `ipkg list_installed` запускается штатно без подмены библиотек.
+В rc10 installer всё равно принудительно запускал `ipkg` через старые Optware-библиотеки.
+`ipkg` наследовал этот `LD_LIBRARY_PATH` в дочерний `/bin/sh`/`wget`, из-за чего firmware
+shell падал с:
+
+```text
+sh: can't resolve symbol '__aeabi_uidivmod'
+```
+
+rc11 сначала проверяет **clean runtime** (`LD_LIBRARY_PATH` unset). Если он работает,
+все `ipkg update/install/remove` выполняются в clean environment. ABI overlay оставлен
+только как fallback для старых повреждённых раскладок.
+
+Также исправлено повторное определение filesystem: `/tmp/mnt/SANDISK` больше не
+ошибочно определяется как `rootfs`; должен возвращаться `ext3`.
 
 ## Ручной способ
 
