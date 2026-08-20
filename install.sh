@@ -3,7 +3,13 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc11"
+INSTALLER_VERSION="3.10.2-rc12"
+
+# Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
+# Any Optware compatibility environment is applied only to the exact command
+# that needs it via run_pkg/run_optware below.
+unset LD_LIBRARY_PATH 2>/dev/null || true
+
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -1220,15 +1226,25 @@ detect_usb_fstype(){
     test -n "$usb_mount" || return 1
 
     # `mount` output: device on MOUNTPOINT type FSTYPE (...)
-    # Match the mountpoint that actually contains usb_mount.  The old
-    # prefix test also matched "/" and therefore falsely returned rootfs.
+    # Several parent mounts can match the same path:
+    #   /                  -> rootfs
+    #   /tmp               -> tmpfs
+    #   /tmp/mnt/SANDISK   -> ext3
+    # Always choose the longest matching mountpoint.
     mount 2>/dev/null | awk -v p="$usb_mount" '
         {
             m=$3
             if (p == m || index(p, m "/") == 1) {
-                print $5
-                exit
+                l=length(m)
+                if (l > bestlen) {
+                    bestlen=l
+                    bestfs=$5
+                }
             }
+        }
+        END {
+            if (bestfs != "")
+                print bestfs
         }
     '
 }

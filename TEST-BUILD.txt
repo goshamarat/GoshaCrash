@@ -1,17 +1,10 @@
-# GoshaCrash 3.10.2-rc11
+# GoshaCrash 3.10.2-rc12
 
-Fixes package bootstrap on RT-AC68U EXT3.
+Fixes after successful rc11 end-to-end installation on RT-AC68U:
 
-Observed rc10 failure:
-  sh: can't resolve symbol '__aeabi_uidivmod'
-
-Root cause:
-ipkg was forced through an Optware LD_LIBRARY_PATH overlay. Child firmware
-/bin/sh and wget inherited ancient Optware uClibc and failed.
-
-rc11:
-- prefers ipkg with LD_LIBRARY_PATH unset;
-- uses the selected clean runtime for ipkg update/install/remove;
-- keeps ABI overlay only as compatibility fallback;
-- fixes USB filesystem detection that incorrectly returned rootfs for
-  /tmp/mnt/SANDISK.
+1. Installer unsets inherited LD_LIBRARY_PATH at startup.
+   Manual `unset LD_LIBRARY_PATH` is no longer required before install.
+2. USB filesystem detection now selects the longest containing mountpoint.
+   /tmp/mnt/SANDISK correctly resolves to ext3 instead of tmpfs/rootfs.
+3. Legacy ARMv5 policy is documented as manual routing only + gVisor.
+4. Clean Optware runtime from rc11 is preserved.
