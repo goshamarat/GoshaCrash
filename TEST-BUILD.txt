@@ -1,20 +1,14 @@
-# GoshaCrash 3.10.2-rc7
+# GoshaCrash 3.10.2-rc8
 
-USB preparation now follows the exact RT-AC68U flow that was manually proven to
-survive reboot and be automounted by stock ASUSWRT:
+Fix: resume after old ASUSWRT BLKRRPART/stale-geometry reboot.
 
-1. unmount selected USB;
-2. recreate DOS/MBR;
-3. create one primary partition using the whole disk;
-4. mkfs.ext3 -L SANDISK /dev/sdX1;
-5. sync;
-6. reboot once;
-7. ASUSWRT should automount /tmp/mnt/SANDISK as ext3.
+Resume is accepted only when:
+- exactly one /dev/sdX1 exists;
+- partition type is 83 (Linux);
+- it occupies >=98% of the physical disk;
+- fdisk block count equals /proc/partitions block count.
 
-Important:
-- no reuse of the Rufus filesystem/partition as the final layout;
-- no test mount/unmount after mkfs;
-- no unplug/replug instruction after mkfs;
-- fdisk non-zero caused only by BLKRRPART is not blindly treated as fatal;
-- stale kernel partition geometry is detected before mkfs;
-- destructive formatting still requires exact FORMAT /dev/sdX confirmation.
+Then fdisk is skipped and installer continues directly to:
+mkfs.ext3 -L SANDISK /dev/sdX1
+
+This prevents the rc7 loop.

@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc7"
+INSTALLER_VERSION="3.10.2-rc8"
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-main}"
 
@@ -304,21 +304,20 @@ prepare_usb_wizard(){
     size_mb="$(usb_disk_size_mb "$USB_DEV")"
 
     echo
-    echo "ВНИМАНИЕ: ВСЕ ДАННЫЕ И ТЕКУЩАЯ РАЗМЕТКА НА ВЫБРАННОЙ ФЛЕШКЕ БУДУТ УДАЛЕНЫ."
+    echo "ВНИМАНИЕ: ВСЕ ДАННЫЕ НА ВЫБРАННОЙ ФЛЕШКЕ БУДУТ УДАЛЕНЫ."
     echo "Устройство: $USB_DEV"
     echo "Модель:     $model"
     echo "Размер:     $size_mb MB"
     echo
-    echo "Мастер создаст проверенную для старого ASUSWRT схему:"
+    echo "Целевая схема:"
     echo "  DOS/MBR -> один primary-раздел $target_part -> EXT3 label=SANDISK"
     echo
     printf 'Для продолжения введите точно: FORMAT %s\n> ' "$USB_DEV"
     IFS= read -r confirm
     test "$confirm" = "FORMAT $USB_DEV" || { say "Форматирование отменено"; return 0; }
 
-    say "[1/4] Остановка USB-приложений и размонтирование $USB_DEV"
+    say "[1/5] Остановка USB-приложений и размонтирование $USB_DEV"
 
-    # Stop GoshaCrash/Download Master if they happen to live on this USB.
     for mp in $(awk -v d="$USB_DEV" '$1 ~ ("^" d "[0-9]+$") {print $2}' /proc/mounts 2>/dev/null); do
         if test -x "$mp/goshacrash/goshacrash.sh"; then
             GOSHACRASH_BASE="$mp/goshacrash" "$mp/goshacrash/goshacrash.sh" stop >/dev/null 2>&1 || true
@@ -335,8 +334,6 @@ prepare_usb_wizard(){
     sync
     sleep 1
 
-    # ASUSWRT can keep a freshly inserted empty disk mounted. Retry unmount,
-    # but never start destructive work while any partition is still mounted.
     tries=0
     while test "$tries" -lt 8; do
         mounted_now=0
@@ -354,95 +351,130 @@ prepare_usb_wizard(){
 
     if awk -v d="$USB_DEV" '$1 ~ ("^" d "[0-9]+$") {found=1} END {exit found?0:1}' /proc/mounts 2>/dev/null; then
         echo
-        fail "ASUSWRT всё ещё держит раздел флешки смонтированным. Разметка НЕ изменена."
+        fail "ASUSWRT всё ещё держит раздел флешки смонтированным. Ничего destructive не выполнено."
         echo "В веб-интерфейсе ASUS нажми «Отсоединить» для USB-диска, не вынимай его физически,"
         echo "и снова запусти:"
         echo "  sh /tmp/install.sh --prepare-usb"
         return 1
     fi
 
-    say "[2/4] Создание новой DOS/MBR разметки и одного primary-раздела"
+    say "[2/5] Проверка текущей MBR-разметки / resume после reboot"
 
-    {
-        echo o
-        echo n
-        echo p
-        echo 1
-        echo
-        echo
-        echo w
-    } | "$FDISK_BIN" "$USB_DEV" >> "$TMP_LOG" 2>&1
-    fdisk_rc=$?
-    sync
+    disk_blocks="$(awk -v n="$devname" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
+    fdisk_line="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print; exit}')"
+    fdisk_blocks="$(printf '%s\n' "$fdisk_line" | awk '{print $5}')"
+    fdisk_type="$(printf '%s\n' "$fdisk_line" | awk '{print $(NF-1)}')"
+    kernel_blocks="$(awk -v n="${target_part#/dev/}" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
+    part_count="$(awk -v d="$devname" '$4 ~ ("^" d "[0-9]+$") {c++} END {print c+0}' /proc/partitions 2>/dev/null)"
 
-    # Old ASUSWRT fdisk may return non-zero only because BLKRRPART is busy even
-    # though the MBR was actually written. Therefore verify the real table
-    # instead of trusting fdisk's exit code alone.
-    if ! "$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | grep -q "^${target_part}[[:space:]]"; then
-        fail "Новая MBR-разметка не подтверждается через fdisk -l. См. $TMP_LOG"
+    resume_ready=0
+    if test "$part_count" -eq 1 \
+       && test -b "$target_part" \
+       && test -n "$disk_blocks" \
+       && test -n "$fdisk_blocks" \
+       && test -n "$kernel_blocks" \
+       && test "$fdisk_blocks" = "$kernel_blocks" \
+       && test "$fdisk_type" = "83"; then
+        min_blocks=$((disk_blocks * 98 / 100))
+        if test "$kernel_blocks" -ge "$min_blocks" 2>/dev/null; then
+            resume_ready=1
+        fi
+    fi
+
+    if test "$resume_ready" -eq 1; then
+        ok "MBR уже готова после reboot: $target_part, type 83, ${kernel_blocks} blocks"
+        say "[3/5] fdisk пропущен — продолжаем с mkfs.ext3"
+    else
+        say "[3/5] Создание новой DOS/MBR разметки и одного primary-раздела"
+
+        {
+            echo o
+            echo n
+            echo p
+            echo 1
+            echo
+            echo
+            echo w
+        } | "$FDISK_BIN" "$USB_DEV" >> "$TMP_LOG" 2>&1
+        sync
+
+        if ! "$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | grep -q "^${target_part}[[:space:]]"; then
+            fail "Новая MBR-разметка не подтверждается через fdisk -l. См. $TMP_LOG"
+            return 1
+        fi
+
+        n=0
+        while test "$n" -lt 5; do
+            test -b "$target_part" && break
+            sleep 1
+            n=$((n + 1))
+        done
+
+        if ! test -b "$target_part"; then
+            echo
+            warn "MBR записан, но старое ядро ASUSWRT ещё не создало $target_part."
+            echo "Сделай reboot, снова скачай install.sh и повтори --prepare-usb."
+            echo "rc8 распознает готовую MBR и fdisk повторно запускать не будет."
+            return 2
+        fi
+
+        fdisk_blocks="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print $5; exit}')"
+        kernel_blocks="$(awk -v n="${target_part#/dev/}" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
+
+        if test -n "$fdisk_blocks" && test -n "$kernel_blocks" && test "$fdisk_blocks" != "$kernel_blocks"; then
+            echo
+            warn "MBR записан, но kernel всё ещё показывает старую геометрию $target_part."
+            echo "mkfs НЕ запускается на stale mapping."
+            echo
+            echo "Сейчас:"
+            echo "  reboot"
+            echo
+            echo "После загрузки снова:"
+            echo "  sh /tmp/install.sh --prepare-usb"
+            echo
+            echo "rc8 увидит совпавшую геометрию и ПРОПУСТИТ fdisk."
+            return 2
+        fi
+    fi
+
+    fdisk_blocks="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print $5; exit}')"
+    kernel_blocks="$(awk -v n="${target_part#/dev/}" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
+    if test -z "$fdisk_blocks" || test -z "$kernel_blocks" || test "$fdisk_blocks" != "$kernel_blocks"; then
+        fail "Перед mkfs геометрия $target_part не подтверждена. mkfs НЕ запускается."
         return 1
     fi
 
-    # Wait briefly for the kernel's /dev/sdX1 view.
-    n=0
-    while test "$n" -lt 5; do
-        test -b "$target_part" && break
-        sleep 1
-        n=$((n + 1))
-    done
-
-    if ! test -b "$target_part"; then
-        echo
-        warn "MBR записан, но старое ядро ASUSWRT ещё не создало $target_part."
-        echo "Перезагрузи роутер и снова запусти --prepare-usb."
-        echo "Мастер повторно проверит диск перед форматированием."
-        return 2
-    fi
-
-    # Protect against formatting a stale kernel partition mapping after
-    # BLKRRPART busy. Compare the partition size seen on disk and by kernel.
-    fdisk_blocks="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print $5; exit}')"
-    kernel_blocks="$(awk -v n="${target_part#/dev/}" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
-    if test -n "$fdisk_blocks" && test -n "$kernel_blocks" && test "$fdisk_blocks" != "$kernel_blocks"; then
-        echo
-        warn "MBR записан, но kernel всё ещё показывает старую геометрию $target_part."
-        echo "mkfs НЕ запускается на stale mapping."
-        echo "Перезагрузи роутер и повтори --prepare-usb."
-        return 2
-    fi
-
-    # Final mount guard immediately before mkfs.
     if grep -q "^$target_part " /proc/mounts 2>/dev/null; then
         fail "$target_part снова смонтирован ASUSWRT; mkfs не запускаю"
         return 1
     fi
 
-    say "[3/4] Форматирование $target_part в EXT3 (label=SANDISK)"
+    say "[4/5] Форматирование $target_part в EXT3 (label=SANDISK)"
     "$MKFS_BIN" -L SANDISK "$target_part" >> "$TMP_LOG" 2>&1 || {
         fail "mkfs.ext3 завершился с ошибкой. См. $TMP_LOG"
         return 1
     }
     sync
 
-    say "[4/4] EXT3 создан. Финальное монтирование оставляем штатному ASUSWRT после reboot"
+    say "[5/5] EXT3 записан. Финальное монтирование оставляем штатному ASUSWRT"
 
     echo
     ok "USB подготовлен: DOS/MBR + $target_part + EXT3 label=SANDISK"
     echo
-    echo "ВАЖНО: сейчас не вынимай/вставляй флешку."
-    echo "Сделай один reboot роутера:"
+    echo "Не вынимай/вставляй флешку."
+    echo "Сделай один reboot:"
     echo "  reboot"
     echo
     echo "После загрузки проверь:"
     echo "  mount | grep '/dev/sd'"
+    echo "  df -h | grep '/tmp/mnt'"
     echo
     echo "Ожидается:"
     echo "  $target_part on /tmp/mnt/SANDISK type ext3 (...)"
     echo
-    echo "Затем:"
-    echo "  1. установи Download Master через веб-интерфейс ASUS;"
-    echo "  2. снова скачай/запусти install.sh;"
-    echo "  3. выполни обычную установку: sh /tmp/install.sh"
+    echo "Затем установи Download Master через веб-интерфейс ASUS"
+    echo "и запусти обычную установку GoshaCrash:"
+    echo "  sh /tmp/install.sh"
     echo
     return 0
 }
