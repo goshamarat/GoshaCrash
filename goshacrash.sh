@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc6"
-BUILD_ID="2026-08-20-rufus-layout-check-rc6"
+VERSION="3.10.2-rc7"
+BUILD_ID="2026-08-20-tested-asus-ext3-flow-rc7"
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.
