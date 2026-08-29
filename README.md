@@ -4,7 +4,7 @@ GoshaCrash — установщик и контроллер Mihomo для ASUSWR
 
 Этот RC в первую очередь проверяется на **ASUS RT-AC68U** со старым ASUSWRT / Linux 2.6.36. Для legacy-профиля используется **Mihomo ARMv5 + gVisor**.
 
-> **Тестовая версия:** 3.10.2-rc14  
+> **Тестовая версия:** 3.10.2-rc15  
 > Не публикуйте её как универсально стабильную для всех ASUS до проверки новых ARM64-моделей.
 
 ## Что уже проверено на RT-AC68U
@@ -724,3 +724,15 @@ BRANCH=main
 [ ] auto routing
 [ ] runtime pinned to release tag, не main
 ```
+
+
+### rc15: BT10 PATH/preflight fix
+
+На реальном BT10 `/usr/sbin/iptables` существовал, но rc14 запускал modern
+preflight до `prepare_path`, поэтому `command -v iptables` ложно сообщал, что
+iptables отсутствует.
+
+rc15:
+- запускает `prepare_path` до modern preflight;
+- ищет `modprobe`, `iptables` и `nft` также по абсолютным системным путям;
+- runtime `ensure_tun` тоже не зависит от PATH и грузит `/sbin/modprobe tun`.

@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc14"
+INSTALLER_VERSION="3.10.2-rc15"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -1550,11 +1550,16 @@ existing_routing_mode(){
 modern_tun_preflight(){
     test "${LEGACY:-0}" = 1 && return 0
 
-    if test ! -c /dev/net/tun; then
-        if command -v modprobe >/dev/null 2>&1; then
-            modprobe tun >/dev/null 2>&1 || true
-            sleep 1
-        fi
+    # Do not depend on the caller's interactive PATH. ASUSWRT commonly keeps
+    # modprobe/iptables in /sbin and /usr/sbin.
+    MODPROBE_BIN=""
+    for p in /sbin/modprobe /usr/sbin/modprobe /bin/modprobe /usr/bin/modprobe; do
+        test -x "$p" && { MODPROBE_BIN="$p"; break; }
+    done
+
+    if test ! -c /dev/net/tun && test -n "$MODPROBE_BIN"; then
+        "$MODPROBE_BIN" tun >/dev/null 2>&1 || true
+        sleep 1
     fi
 
     if test ! -c /dev/net/tun; then
@@ -1563,10 +1568,20 @@ modern_tun_preflight(){
     fi
 
     say "Modern TUN: /dev/net/tun OK"
-    if command -v nft >/dev/null 2>&1; then
-        say "Modern firewall backend: nft available"
-    elif command -v iptables >/dev/null 2>&1; then
-        say "Modern firewall backend: iptables ($(iptables --version 2>/dev/null | head -1))"
+
+    NFT_BIN=""
+    IPTABLES_BIN=""
+    for p in /usr/sbin/nft /sbin/nft /usr/bin/nft /bin/nft; do
+        test -x "$p" && { NFT_BIN="$p"; break; }
+    done
+    for p in /usr/sbin/iptables /sbin/iptables /usr/bin/iptables /bin/iptables; do
+        test -x "$p" && { IPTABLES_BIN="$p"; break; }
+    done
+
+    if test -n "$NFT_BIN"; then
+        say "Modern firewall backend: nft available ($NFT_BIN)"
+    elif test -n "$IPTABLES_BIN"; then
+        say "Modern firewall backend: iptables ($("$IPTABLES_BIN" --version 2>/dev/null | head -1))"
     else
         fail "Modern profile: не найден ни nft, ни iptables"
         return 1
@@ -2419,9 +2434,9 @@ main(){
     model_name="$(nvram_get productid)"; test -n "$model_name" || model_name="$(hostname 2>/dev/null)"; test -n "$model_name" || model_name="ASUSWRT"
     say "Роутер: $model_name, архитектура $(uname -m 2>/dev/null), ядро $(uname -r 2>/dev/null)"
     say "Профиль: $PLATFORM; routing=$ROUTING_MODE; tun.stack=$TUN_STACK"
-    modern_tun_preflight || return 1
 
     prepare_path
+    modern_tun_preflight || return 1
     "$GC_BOOTSTRAP_BIN/test" -n "goshacrash" >/dev/null 2>&1 || {
         fail "Bootstrap test потерян из PATH/runtime"
         return 1

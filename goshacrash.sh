@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc14"
-BUILD_ID="2026-08-29-bt10-real-hardware-fixes-rc14"
+VERSION="3.10.2-rc15"
+BUILD_ID="2026-08-30-bt10-path-preflight-fix-rc15"
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.
@@ -455,15 +455,28 @@ kill_mihomo(){
 
 ensure_tun(){
     [ -c /dev/net/tun ] || {
-        modprobe tun >/dev/null 2>&1 || true
+        modprobe_bin=""
+        for p in /sbin/modprobe /usr/sbin/modprobe /bin/modprobe /usr/bin/modprobe; do
+            [ -x "$p" ] && { modprobe_bin="$p"; break; }
+        done
+        [ -n "$modprobe_bin" ] && "$modprobe_bin" tun >/dev/null 2>&1 || true
+
+        insmod_bin=""
+        for p in /sbin/insmod /usr/sbin/insmod /bin/insmod /usr/bin/insmod; do
+            [ -x "$p" ] && { insmod_bin="$p"; break; }
+        done
         for m in "$BASE/modules/tun.ko" "/lib/modules/$(uname -r)/kernel/drivers/net/tun.ko" "/lib/modules/$(uname -r)/tun.ko"; do
             [ -c /dev/net/tun ] && break
-            [ -f "$m" ] && insmod "$m" >/dev/null 2>&1 || true
+            [ -n "$insmod_bin" ] && [ -f "$m" ] && "$insmod_bin" "$m" >/dev/null 2>&1 || true
         done
     }
     if [ ! -c /dev/net/tun ]; then
         mkdir -p /dev/net 2>/dev/null || true
-        mknod /dev/net/tun c 10 200 2>/dev/null || true
+        mknod_bin=""
+        for p in /bin/mknod /sbin/mknod /usr/bin/mknod /usr/sbin/mknod; do
+            [ -x "$p" ] && { mknod_bin="$p"; break; }
+        done
+        [ -n "$mknod_bin" ] && "$mknod_bin" /dev/net/tun c 10 200 2>/dev/null || true
         chmod 600 /dev/net/tun 2>/dev/null || true
     fi
     [ -c /dev/net/tun ] || return 1

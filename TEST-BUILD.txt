@@ -1,15 +1,7 @@
-# GoshaCrash 3.10.2-rc14
+# GoshaCrash 3.10.2-rc15
 
-Fixes from real ZenWiFi BT10 logs:
-- BT10 BusyBox fdisk '+' suffix normalized before geometry comparison;
-- BT10 armv7l accepted as confirmed target -> Mihomo armv7;
-- downloader diagnostics moved to stderr (no URL command-substitution pollution);
-- firmware curl/wget preferred over Optware;
-- firmware/bootstrap PATH precedes Optware PATH;
-- /bin/sh -n capability checked before syntax precheck;
-- private chmod-600 wget HSTS database;
-- auto-detect-interface no longer incorrectly tied to nft availability;
-- modern preflight validates /dev/net/tun and nft/iptables availability.
-
-Known BT10 firewall: iptables 1.4.12.2, nft absent. Mihomo auto-redirect is
-intended to use Linux iptables/nftables with auto-route.
+BT10 real-hardware fix:
+- rc14 modern preflight ran before prepare_path.
+- /usr/sbin/iptables therefore existed but could be invisible to command -v.
+- rc15 prepares PATH first and probes standard absolute ASUSWRT paths.
+- TUN runtime loading uses absolute modprobe/insmod paths as well.
