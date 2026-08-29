@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc13"
+INSTALLER_VERSION="3.10.2-rc14"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -272,6 +272,12 @@ legacy_usb_fs_check(){
     esac
 }
 
+fdisk_blocks_number(){
+    # BusyBox fdisk may print rounded block counts as e.g. "7566583+".
+    # Geometry comparisons must use digits only.
+    printf '%s\n' "$1" | sed 's/[^0-9].*$//'
+}
+
 prepare_usb_wizard(){
     verify_asuswrt || return 1
 
@@ -427,11 +433,12 @@ prepare_usb_wizard(){
             echo
             warn "MBR записан, но старое ядро ASUSWRT ещё не создало $target_part."
             echo "Сделай reboot, снова скачай install.sh и повтори --prepare-usb."
-            echo "rc10 распознает готовую MBR и fdisk повторно запускать не будет."
+            echo "rc14 распознает готовую MBR и fdisk повторно запускать не будет."
             return 2
         fi
 
-        fdisk_blocks="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print $4; exit}')"
+        fdisk_blocks_raw="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print $4; exit}')"
+        fdisk_blocks="$(fdisk_blocks_number "$fdisk_blocks_raw")"
         kernel_blocks="$(awk -v n="${target_part#/dev/}" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
 
         if test -n "$fdisk_blocks" && test -n "$kernel_blocks" && test "$fdisk_blocks" != "$kernel_blocks"; then
@@ -445,12 +452,13 @@ prepare_usb_wizard(){
             echo "После загрузки снова:"
             echo "  sh /tmp/install.sh --prepare-usb"
             echo
-            echo "rc10 увидит совпавшую геометрию и ПРОПУСТИТ fdisk."
+            echo "rc14 увидит совпавшую геометрию и ПРОПУСТИТ fdisk."
             return 2
         fi
     fi
 
-    fdisk_blocks="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print $4; exit}')"
+    fdisk_blocks_raw="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print $4; exit}')"
+    fdisk_blocks="$(fdisk_blocks_number "$fdisk_blocks_raw")"
     kernel_blocks="$(awk -v n="${target_part#/dev/}" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
     if test -z "$fdisk_blocks" || test -z "$kernel_blocks" || test "$fdisk_blocks" != "$kernel_blocks"; then
         fail "Перед mkfs геометрия $target_part не подтверждена. mkfs НЕ запускается."
@@ -693,11 +701,12 @@ ensure_optware_link(){
 prepare_path(){
     ensure_optware_link >/dev/null 2>&1 || true
 
-    # Keep installer bootstrap tools in PATH on old stock ASUSWRT.
-    PATH="$GC_BOOTSTRAP_BIN:/jffs/scripts"
-    test -n "$DM_ROOT" && PATH="$DM_ROOT/bin:$DM_ROOT/sbin:$PATH"
-    PATH="/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"
-    PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
+    # Firmware/bootstrap tools must win over ancient Optware commands.
+    # In particular do not let /opt/bin/sh, /opt/bin/test, curl, wget, etc.
+    # shadow stock ASUSWRT tools on modern firmware.
+    PATH="$GC_BOOTSTRAP_BIN:/jffs/scripts:/usr/sbin:/usr/bin:/sbin:/bin"
+    test -n "$DM_ROOT" && PATH="$PATH:$DM_ROOT/bin:$DM_ROOT/sbin"
+    PATH="$PATH:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin"
     export PATH
     hash -r 2>/dev/null || true
 }
@@ -1403,10 +1412,12 @@ wget_fetch(){
     done
     test -n "$w" || return 1
 
-    echo "--- wget: $url"
+    echo "--- wget: $url" >&2
     WGET_HOME="/tmp/goshacrash-wget"
     mkdir -p "$WGET_HOME" 2>/dev/null || true
     chmod 700 "$WGET_HOME" 2>/dev/null || true
+    : > "$WGET_HOME/.wget-hsts" 2>/dev/null || true
+    chmod 600 "$WGET_HOME/.wget-hsts" 2>/dev/null || true
     HOME="$WGET_HOME" "$w" --no-check-certificate -O "$out.part" "$url" && test -s "$out.part" && {
         mv -f "$out.part" "$out"
         return 0
@@ -1417,12 +1428,12 @@ wget_fetch(){
 curl_fetch(){
     url="$1"; out="$2"
     c=""
-    for p in "$DM_ROOT/bin/curl" /opt/bin/curl /tmp/opt/bin/curl /usr/bin/curl; do
+    for p in /usr/sbin/curl /usr/bin/curl /sbin/curl /bin/curl "$DM_ROOT/bin/curl" /opt/bin/curl /tmp/opt/bin/curl; do
         test -x "$p" && { c="$p"; break; }
     done
     test -n "$c" || return 1
 
-    echo "--- curl: $url"
+    echo "--- curl: $url" >&2
     # No connect timeout and no overall max-time: the transfer may continue as
     # long as the connection is alive. The progress bar remains visible.
     "$c" -k -fL --retry 3 --retry-delay 3 -# \
@@ -1514,8 +1525,15 @@ detect_platform(){
         *BT10*)
             say "ZenWiFi BT10 detected: modern profile, machine=$machine, mihomo=$MIHOMO_TARGET"
             case "$machine" in
-                aarch64|arm64) : ;;
-                *) warn "BT10 вернул неожиданную архитектуру uname -m=$machine; выбран core=$MIHOMO_TARGET" ;;
+                armv7l|armv7|arm32v7)
+                    say "BT10 architecture confirmed: ARMv7 -> Mihomo armv7"
+                    ;;
+                aarch64|arm64)
+                    say "BT10 architecture: ARM64 -> Mihomo arm64"
+                    ;;
+                *)
+                    warn "BT10 вернул неизвестную архитектуру uname -m=$machine; выбран core=$MIHOMO_TARGET"
+                    ;;
             esac
             ;;
     esac
@@ -1527,6 +1545,33 @@ existing_routing_mode(){
     mode="$( ( . "$f" 2>/dev/null; printf '%s\n' "${ROUTING_MODE:-}" ) 2>/dev/null )"
     case "$mode" in manual|auto) printf '%s\n' "$mode"; return 0;; esac
     return 1
+}
+
+modern_tun_preflight(){
+    test "${LEGACY:-0}" = 1 && return 0
+
+    if test ! -c /dev/net/tun; then
+        if command -v modprobe >/dev/null 2>&1; then
+            modprobe tun >/dev/null 2>&1 || true
+            sleep 1
+        fi
+    fi
+
+    if test ! -c /dev/net/tun; then
+        fail "Modern profile: /dev/net/tun отсутствует; TUN routing не сможет работать"
+        return 1
+    fi
+
+    say "Modern TUN: /dev/net/tun OK"
+    if command -v nft >/dev/null 2>&1; then
+        say "Modern firewall backend: nft available"
+    elif command -v iptables >/dev/null 2>&1; then
+        say "Modern firewall backend: iptables ($(iptables --version 2>/dev/null | head -1))"
+    else
+        fail "Modern profile: не найден ни nft, ни iptables"
+        return 1
+    fi
+    return 0
 }
 
 choose_routing_mode(){
@@ -1576,7 +1621,11 @@ install_controller(){
     tmp="$TMP_ROOT/goshacrash.sh"
     fetch_repo_file goshacrash.sh "$tmp" || { fail "Не удалось скачать goshacrash.sh"; return 1; }
     test "$(sed -n '1p' "$tmp" 2>/dev/null)" = '#!/bin/sh' || { fail "goshacrash.sh скачан неверно"; return 1; }
-    sh -n "$tmp" || { fail "Синтаксическая ошибка в goshacrash.sh"; return 1; }
+    if /bin/sh -n /dev/null >/dev/null 2>&1; then
+        /bin/sh -n "$tmp" || { fail "Синтаксическая ошибка в goshacrash.sh"; return 1; }
+    else
+        say "Firmware /bin/sh не поддерживает -n; syntax precheck пропущен"
+    fi
     test -f "$BASE/goshacrash.sh" && cp -f "$BASE/goshacrash.sh" "$BASE/backups/goshacrash.sh.previous" 2>/dev/null || true
     mv -f "$tmp" "$BASE/goshacrash.sh" || return 1
     chmod 755 "$BASE/goshacrash.sh" || return 1
@@ -1671,12 +1720,9 @@ configure_routing_in_config(){
         yaml_set_section_key "$file" tun stack "$TUN_STACK" || return 1
         yaml_set_section_key "$file" tun auto-route true || return 1
         yaml_set_section_key "$file" tun auto-redirect true || return 1
-        if command -v nft >/dev/null 2>&1; then
-            yaml_set_section_key "$file" tun auto-detect-interface true || return 1
-        else
-            yaml_set_section_key "$file" tun auto-detect-interface false || return 1
-            warn "nft не найден: auto-detect-interface выключен; auto-route/auto-redirect остаются включены"
-        fi
+        # Mihomo auto-redirect supports iptables or nftables on Linux.
+        # auto-detect-interface itself does not require nft.
+        yaml_set_section_key "$file" tun auto-detect-interface true || return 1
         yaml_remove_top_key "$file" routing-mark || return 1
     fi
 }
@@ -2373,6 +2419,7 @@ main(){
     model_name="$(nvram_get productid)"; test -n "$model_name" || model_name="$(hostname 2>/dev/null)"; test -n "$model_name" || model_name="ASUSWRT"
     say "Роутер: $model_name, архитектура $(uname -m 2>/dev/null), ядро $(uname -r 2>/dev/null)"
     say "Профиль: $PLATFORM; routing=$ROUTING_MODE; tun.stack=$TUN_STACK"
+    modern_tun_preflight || return 1
 
     prepare_path
     "$GC_BOOTSTRAP_BIN/test" -n "goshacrash" >/dev/null 2>&1 || {

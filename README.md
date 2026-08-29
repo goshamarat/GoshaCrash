@@ -4,7 +4,7 @@ GoshaCrash — установщик и контроллер Mihomo для ASUSWR
 
 Этот RC в первую очередь проверяется на **ASUS RT-AC68U** со старым ASUSWRT / Linux 2.6.36. Для legacy-профиля используется **Mihomo ARMv5 + gVisor**.
 
-> **Тестовая версия:** 3.10.2-rc13  
+> **Тестовая версия:** 3.10.2-rc14  
 > Не публикуйте её как универсально стабильную для всех ASUS до проверки новых ARM64-моделей.
 
 ## Что уже проверено на RT-AC68U
@@ -282,6 +282,28 @@ rc11 сначала проверяет **clean runtime** (`LD_LIBRARY_PATH` unse
 - `wget` получает отдельный writable HOME в `/tmp`, чтобы не засорять лог ошибкой
   `/root/.wget-hsts`.
 - Для модели BT10 installer печатает обнаруженные `uname -m` и выбранный Mihomo target.
+
+
+### rc14: исправления по реальному ZenWiFi BT10
+
+На живом BT10 подтверждено: `armv7l`, kernel `4.19.294`, classic
+`iptables 1.4.12.2`, `nft` отсутствует.
+
+Исправлено:
+
+- BusyBox `fdisk` на BT10 печатает размер вроде `7566583+`; `+` теперь удаляется
+  перед сравнением с `/proc/partitions`, поэтому resume после reboot не зацикливается.
+- `armv7l` для BT10 считается штатной архитектурой и выбирает Mihomo `armv7`.
+- Диагностический вывод `wget_fetch`/`curl_fetch` отправляется в stderr и больше не
+  попадает внутрь URL через command substitution.
+- Firmware `curl`/`wget` имеют приоритет над древними Optware-вариантами.
+- PATH больше не позволяет `/opt/bin/sh`/`test` затенять системные команды ASUSWRT.
+- Проверка `sh -n` выполняется только через `/bin/sh` и только если firmware shell
+  действительно поддерживает этот флаг.
+- `.wget-hsts` создаётся как private `0600`, чтобы убрать HSTS warning.
+- Для automatic routing `auto-detect-interface` снова включён независимо от наличия
+  `nft`: Mihomo `auto-redirect` на Linux умеет работать через iptables или nftables.
+- Modern install заранее проверяет `/dev/net/tun` и наличие `iptables`/`nft`.
 
 ## Ручной способ
 

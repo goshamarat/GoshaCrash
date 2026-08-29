@@ -1,13 +1,15 @@
-# GoshaCrash 3.10.2-rc13
+# GoshaCrash 3.10.2-rc14
 
-Modern/BT10 portability hardening:
-- modern core install no longer hard-depends on legacy Optware package payload;
-- firmware unzip/gzip/wget/curl are sufficient;
-- nano/SFTP/package manager optional on modern;
-- NVRAM USB hooks are now actually installed;
-- old ipkg USB bridge only when appropriate;
-- auto-detect-interface enabled only when nft exists;
-- wget uses private writable HOME to avoid HSTS-store noise;
-- BT10 detection logs uname architecture and selected Mihomo target.
+Fixes from real ZenWiFi BT10 logs:
+- BT10 BusyBox fdisk '+' suffix normalized before geometry comparison;
+- BT10 armv7l accepted as confirmed target -> Mihomo armv7;
+- downloader diagnostics moved to stderr (no URL command-substitution pollution);
+- firmware curl/wget preferred over Optware;
+- firmware/bootstrap PATH precedes Optware PATH;
+- /bin/sh -n capability checked before syntax precheck;
+- private chmod-600 wget HSTS database;
+- auto-detect-interface no longer incorrectly tied to nft availability;
+- modern preflight validates /dev/net/tun and nft/iptables availability.
 
-RT-AC68U legacy policy remains ARMv5 + gVisor + manual routing only.
+Known BT10 firewall: iptables 1.4.12.2, nft absent. Mihomo auto-redirect is
+intended to use Linux iptables/nftables with auto-route.
