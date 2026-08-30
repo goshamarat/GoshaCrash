@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc16"
-BUILD_ID="2026-08-30-bt10-cli-dm-packages-term-sftp-rc16"
+VERSION="3.10.2-rc17"
+BUILD_ID="2026-08-30-natural-download-master-ipkg-rc17"
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.
@@ -156,10 +156,9 @@ refresh_path(){
         PATH="/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"
         PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
     else
-        # Modern ASUSWRT: firmware commands must win over old DM/Optware.
-        PATH="$GC_COMPAT_BIN:/jffs/scripts:/usr/sbin:/usr/bin:/sbin:/bin"
+        PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin"
         [ -n "$DM_ROOT" ] && PATH="$PATH:$DM_ROOT/bin:$DM_ROOT/sbin"
-        PATH="$PATH:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin"
+        PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
     fi
     export PATH
     hash -r 2>/dev/null || true
@@ -1121,6 +1120,15 @@ find_editor(){
 }
 
 repair_nano_runtime(){
+    load_platform >/dev/null 2>&1 || true
+    refresh_path
+
+    if [ "${LEGACY:-0}" != 1 ]; then
+        find_editor >/dev/null 2>&1 && return 0
+        fail "nano из Download Master не найден. Повтори install.sh или выполни ipkg install nano"
+        return 1
+    fi
+
     find_editor >/dev/null 2>&1 && return 0
     repair_opt >/dev/null 2>&1 || true
     find_editor >/dev/null 2>&1 && return 0
@@ -1161,14 +1169,8 @@ edit_config(){
     }
     say "Резервная копия: $backup"
 
-    editor_term="${TERM:-xterm}"
-    case "$editor_term" in
-        xterm-256color) editor_term=xterm ;;
-        screen-256color) editor_term=screen ;;
-        tmux-256color|*-256color) editor_term=xterm ;;
-    esac
-    TERM="$editor_term" "$editor" "$CONFIG" || {
-        warn "Редактор завершился с ошибкой (TERM=$editor_term)"
+    "$editor" "$CONFIG" || {
+        warn "Редактор завершился с ошибкой (editor=$editor TERM=${TERM:-unset})"
         return 1
     }
 
@@ -1750,16 +1752,12 @@ doctor(){
         fi
         test -x "$DM_ROOT/libexec/sftp-server" && echo "  USB SFTP: OK" || echo "  USB SFTP: MISSING"
     fi
-    if /bin/busybox '[' -n "ok" ']' >/dev/null 2>&1; then
-        if test -x /jffs/scripts/'[' && /jffs/scripts/'[' -n "ok" ']' >/dev/null 2>&1; then
-            echo "  shell [: OK (/jffs/scripts/[)"
-        elif test -x "$GC_COMPAT_BIN/[" && "$GC_COMPAT_BIN/[" -n "ok" ']' >/dev/null 2>&1; then
-            echo "  shell [: OK ($GC_COMPAT_BIN/[)"
+    if [ "${LEGACY:-0}" = 1 ]; then
+        if /bin/busybox '[' -n "ok" ']' >/dev/null 2>&1; then
+            echo "  legacy shell [: OK"
         else
-            echo "  shell [: BusyBox OK, wrapper FAIL"
+            echo "  legacy shell [: FAIL"
         fi
-    else
-        echo "  shell [: FAIL"
     fi
 
     [ -x /bin/ping ] && echo "  firmware ping: /bin/ping" || echo "  firmware ping: NOT FOUND"

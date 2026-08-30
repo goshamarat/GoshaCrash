@@ -4,7 +4,7 @@ GoshaCrash — установщик и контроллер Mihomo для ASUSWR
 
 Этот RC в первую очередь проверяется на **ASUS RT-AC68U** со старым ASUSWRT / Linux 2.6.36. Для legacy-профиля используется **Mihomo ARMv5 + gVisor**.
 
-> **Тестовая версия:** 3.10.2-rc16  
+> **Тестовая версия:** 3.10.2-rc17  
 > Не публикуйте её как универсально стабильную для всех ASUS до проверки новых ARM64-моделей.
 
 ## Что уже проверено на RT-AC68U
@@ -750,3 +750,16 @@ rc15:
 - индекс DM обновляется один раз перед проверкой пользовательских пакетов;
 - SFTP installer повторно проверяет пакет после refresh индекса;
 - `gc sftp status` ищет бинарник также по физическому `DM_ROOT` и `/tmp/opt`, а не только `/opt`.
+
+
+### rc17: естественный Download Master / Optware
+
+На modern ASUSWRT обычные пакеты больше не оборачиваются compatibility-слоем.
+
+- Download Master / `ipkg` обязателен и является основным источником пользовательских пакетов.
+- Installer выполняет обычные `ipkg update` и `ipkg install`.
+- Через DM ставятся `nano`, `unzip`, `openssh-sftp-server`.
+- Для modern убраны ABI overlay, SONAME repair, SFTP wrapper и подмена `TERM`.
+- `gc edit` запускает настоящий `nano` из Download Master как есть.
+- Системные компоненты ASUSWRT (`/bin/sh`, `iptables`, `modprobe`, firmware wget/curl) не заменяются пакетами.
+- Legacy RT-AC68U в этом RC не меняется, чтобы не ломать уже проверенную установку.

@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc16"
+INSTALLER_VERSION="3.10.2-rc17"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -259,7 +259,7 @@ legacy_usb_fs_check(){
             echo
             echo "Подготовить флешку можно этим же установщиком:"
             echo
-            echo "  /bin//bin/sh install.sh --prepare-usb"
+            echo "  /bin/sh install.sh --prepare-usb"
             echo
             echo "После форматирования:"
             echo "  1. переподключи флешку;"
@@ -366,7 +366,7 @@ prepare_usb_wizard(){
         fail "ASUSWRT всё ещё держит раздел флешки смонтированным. Ничего destructive не выполнено."
         echo "В веб-интерфейсе ASUS нажми «Отсоединить» для USB-диска, не вынимай его физически,"
         echo "и снова запусти:"
-        echo "  /bin//bin/sh /tmp/install.sh --prepare-usb"
+        echo "  /bin/sh /tmp/install.sh --prepare-usb"
         return 1
     fi
 
@@ -450,7 +450,7 @@ prepare_usb_wizard(){
             echo "  reboot"
             echo
             echo "После загрузки снова:"
-            echo "  /bin//bin/sh /tmp/install.sh --prepare-usb"
+            echo "  /bin/sh /tmp/install.sh --prepare-usb"
             echo
             echo "rc14 увидит совпавшую геометрию и ПРОПУСТИТ fdisk."
             return 2
@@ -636,7 +636,7 @@ legacy_preflight_before_dm(){
             echo
             echo "Подготовить эту флешку можно самим install.sh:"
             echo
-            echo "  /bin//bin/sh /tmp/install.sh --prepare-usb"
+            echo "  /bin/sh /tmp/install.sh --prepare-usb"
             echo
             echo "ВНИМАНИЕ: форматирование удалит ВСЕ данные и Download Master."
             echo "После EXT3 установи Download Master через ASUS заново,"
@@ -846,6 +846,97 @@ run_pkg(){
             run_optware_clean "$@"
             ;;
     esac
+}
+
+verify_ipkg_natural(){
+    ensure_optware_link >/dev/null 2>&1 || {
+        fail "Download Master найден, но /tmp/opt не связан с $DM_ROOT"
+        return 1
+    }
+    test -n "$PKG" || find_pkg || {
+        fail "В Download Master не найден ipkg/opkg"
+        return 1
+    }
+
+    err="$BASE/logs/ipkg-runtime.err"
+    : > "$err"
+    (
+        unset LD_LIBRARY_PATH
+        "$PKG" list_installed
+    ) >/dev/null 2>"$err"
+    rc=$?
+    if test "$rc" -ne 0 || grep -Eq "can't (load library|resolve symbol)" "$err" 2>/dev/null; then
+        fail "Download Master ipkg не запускается штатно. См. $err"
+        return 1
+    fi
+    rm -f "$err" 2>/dev/null || true
+    say "Download Master ipkg: штатный runtime OK"
+    return 0
+}
+
+pkg_natural_update(){
+    pkg_progress "ipkg update"
+    pkg_log "RUN NATURAL: $PKG update"
+    (
+        unset LD_LIBRARY_PATH
+        "$PKG" update
+    ) >> "$BASE/logs/packages.log" 2>&1
+}
+
+pkg_natural_is_installed(){
+    name="$1"
+    (
+        unset LD_LIBRARY_PATH
+        "$PKG" list_installed
+    ) 2>/dev/null | grep -q "^$name[[:space:]]*-"
+}
+
+pkg_natural_install(){
+    name="$1"
+    if pkg_natural_is_installed "$name"; then
+        say "Download Master: $name уже установлен"
+        return 0
+    fi
+    pkg_progress "ipkg install $name"
+    pkg_log "RUN NATURAL: $PKG install $name"
+    (
+        unset LD_LIBRARY_PATH
+        "$PKG" install "$name"
+    ) >> "$BASE/logs/packages.log" 2>&1
+}
+
+verify_dm_payload_natural(){
+    missing=0
+
+    test -x "$DM_ROOT/bin/nano" || {
+        warn "После ipkg install nano бинарник $DM_ROOT/bin/nano не найден"
+        missing=1
+    }
+
+    if test ! -x "$DM_ROOT/bin/unzip" && test ! -x "$DM_ROOT/bin/unzip-unzip"; then
+        warn "После ipkg install unzip бинарник в $DM_ROOT/bin не найден"
+        missing=1
+    fi
+
+    sftp_bin="$(find_sftp_server 2>/dev/null)"
+    test -n "$sftp_bin" || {
+        warn "После ipkg install openssh-sftp-server бинарник sftp-server не найден"
+        missing=1
+    }
+
+    test "$missing" -eq 0 || return 1
+
+    mkdir -p "$BASE/state" 2>/dev/null || true
+    printf '%s\n' "$sftp_bin" > "$BASE/state/sftp-server.path" 2>/dev/null || true
+
+    say "Download Master payload: nano=$DM_ROOT/bin/nano"
+    if test -x "$DM_ROOT/bin/unzip"; then
+        say "Download Master payload: unzip=$DM_ROOT/bin/unzip"
+    else
+        say "Download Master payload: unzip=$DM_ROOT/bin/unzip-unzip"
+    fi
+    say "Download Master payload: sftp=$sftp_bin"
+    return 0
 }
 
 verify_ipkg_runtime(){
@@ -1235,7 +1326,9 @@ install_optware_sftp(){
     else
         warn "openssh-sftp-server зарегистрирован, но payload всё ещё отсутствует"
     fi
-    install_sftp_wrapper >/dev/null 2>&1 || true
+    if test "${LEGACY:-0}" = 1; then
+        install_sftp_wrapper >/dev/null 2>&1 || true
+    fi
 
     return 0
 }
@@ -1297,42 +1390,51 @@ prepare_packages_modern(){
     check_usb_filesystem
     refresh_tools
 
-    # Modern ASUSWRT uses firmware tools for system/network operations, but
-    # GoshaCrash keeps the same useful userland payload in Download Master:
-    # nano + unzip + openssh-sftp-server. Do not replace firmware sh/curl/wget.
-    if find_pkg; then
-        say "Менеджер пакетов Download Master: $PKG"
-        if verify_ipkg_runtime; then
-            # Refresh once so a newly installed DM does not silently use an
-            # empty/stale package index.
-            pkg_update_index_once || warn "Не удалось обновить индекс пакетов Download Master"
+    find_pkg || {
+        fail "Download Master установлен, но ipkg/opkg не найден"
+        return 1
+    }
+    say "Менеджер пакетов Download Master: $PKG"
+    verify_ipkg_natural || return 1
 
-            install_or_repair_persistent_package nano bin/nano || \
-                warn "nano через Download Master не установился"
+    pkg_natural_update || {
+        fail "ipkg update не удался. См. $BASE/logs/packages.log"
+        return 1
+    }
 
-            install_or_repair_persistent_package unzip bin/unzip bin/unzip-unzip || \
-                warn "unzip через Download Master не установился"
+    pkg_natural_install nano || {
+        fail "ipkg install nano не удался"
+        return 1
+    }
+    pkg_natural_install unzip || {
+        fail "ipkg install unzip не удался"
+        return 1
+    }
+    pkg_natural_install openssh-sftp-server || {
+        fail "ipkg install openssh-sftp-server не удался"
+        return 1
+    }
 
-            install_optware_sftp || true
-        else
-            warn "Пакетный менеджер Download Master недоступен; продолжаю с firmware tools"
-        fi
-    else
-        PKG=""
-        OPTWARE_RUNTIME_MODE=""
-        say "Пакетный менеджер Download Master не найден — modern core продолжит работу на firmware tools"
-    fi
-
+    ensure_optware_link >/dev/null 2>&1 || true
+    prepare_path
     refresh_tools
+    verify_dm_payload_natural || {
+        fail "Download Master установил пакеты не полностью. См. $BASE/logs/packages.log"
+        return 1
+    }
 
-    # Core runtime always prefers firmware tools on modern ASUSWRT.
-    UNZIP_BIN="$(tool_path unzip 2>/dev/null)"
-    test -n "$UNZIP_BIN" || { fail "На modern ASUSWRT не найден unzip"; return 1; }
-    test -x "$GZIP_BIN" || { fail "На modern ASUSWRT не найден gzip"; return 1; }
-    test -n "$DOWNLOADER" || { fail "На modern ASUSWRT не найден wget/curl"; return 1; }
+    UNZIP_BIN=""
+    if test -x "$DM_ROOT/bin/unzip"; then
+        UNZIP_BIN="$DM_ROOT/bin/unzip"
+    elif test -x "$DM_ROOT/bin/unzip-unzip"; then
+        UNZIP_BIN="$DM_ROOT/bin/unzip-unzip"
+    fi
+    NANO_BIN="$DM_ROOT/bin/nano"
 
-    NANO_BIN="$(find_nano 2>/dev/null)"
-    say "Modern tools: unzip=$UNZIP_BIN, gzip=$GZIP_BIN, downloader=$DOWNLOADER, nano=${NANO_BIN:-optional}"
+    test -x "$GZIP_BIN" || { fail "Штатный gzip ASUSWRT не найден"; return 1; }
+    test -n "$DOWNLOADER" || { fail "Штатный wget/curl ASUSWRT не найден"; return 1; }
+
+    say "Инструменты DM: nano=$NANO_BIN, unzip=$UNZIP_BIN, sftp=$(cat "$BASE/state/sftp-server.path" 2>/dev/null)"
     return 0
 }
 
@@ -2268,11 +2370,14 @@ exit 0
 HOOK
     chmod 755 /jffs/scripts/usb-umount-script || return 1
 
-    rm -f /jffs/scripts/gc "$DM_ROOT/bin/gc" /opt/bin/gc 2>/dev/null || true
-    write_test_wrapper /jffs/scripts/test || return 1
-    write_bracket_wrapper /jffs/scripts/'[' || return 1
+    rm -f /jffs/scripts/gc /jffs/scripts/nano "$DM_ROOT/bin/gc" /opt/bin/gc 2>/dev/null || true
+    if test "${LEGACY:-0}" = 1; then
+        write_test_wrapper /jffs/scripts/test || return 1
+        write_bracket_wrapper /jffs/scripts/'[' || return 1
+    else
+        rm -f /jffs/scripts/test /jffs/scripts/'[' 2>/dev/null || true
+    fi
     write_command_wrapper /jffs/scripts/gc || return 1
-    write_nano_wrapper /jffs/scripts/nano || return 1
     write_command_wrapper "$DM_ROOT/bin/gc" || return 1
     ensure_optware_link >/dev/null 2>&1 || true
     if test -d /opt/bin && test -w /opt/bin; then
@@ -2393,7 +2498,7 @@ main(){
 
     case "${1:-}" in
         --prepare-usb)
-            test "$#" -eq 1 || { fail "Использование: /bin//bin/sh install.sh --prepare-usb"; return 1; }
+            test "$#" -eq 1 || { fail "Использование: /bin/sh install.sh --prepare-usb"; return 1; }
             acquire_lock || return 1
             prepare_usb_wizard
             return $?
@@ -2403,7 +2508,7 @@ main(){
             echo
             echo "Использование:"
             echo "  /bin/sh install.sh                установить GoshaCrash"
-            echo "  /bin//bin/sh install.sh --prepare-usb  безопасный мастер подготовки USB в EXT3"
+            echo "  /bin/sh install.sh --prepare-usb  безопасный мастер подготовки USB в EXT3"
             echo "  /bin/sh install.sh --help         эта справка"
             return 0
             ;;
@@ -2450,15 +2555,17 @@ main(){
 
     prepare_path
     modern_tun_preflight || return 1
-    "$GC_BOOTSTRAP_BIN/test" -n "goshacrash" >/dev/null 2>&1 || {
-        fail "Bootstrap test потерян из PATH/runtime"
-        return 1
-    }
-    "$GC_BOOTSTRAP_BIN/[" -n "goshacrash" ']' >/dev/null 2>&1 || {
-        fail "Bootstrap [ не работает"
-        return 1
-    }
-    say "Shell bootstrap: test + [ OK"
+    if test "${LEGACY:-0}" = 1; then
+        "$GC_BOOTSTRAP_BIN/test" -n "goshacrash" >/dev/null 2>&1 || {
+            fail "Bootstrap test потерян из PATH/runtime"
+            return 1
+        }
+        "$GC_BOOTSTRAP_BIN/[" -n "goshacrash" ']' >/dev/null 2>&1 || {
+            fail "Bootstrap [ не работает"
+            return 1
+        }
+        say "Legacy shell bootstrap: test + [ OK"
+    fi
     prepare_packages || return 1
     install_controller || return 1
     install_network_helper || return 1
@@ -2469,11 +2576,9 @@ main(){
 
     if test "${LEGACY:-0}" = 1; then
         verify_persistent_optware || return 1
-    else
-        verify_persistent_optware >/dev/null 2>&1 || say "Modern profile: persistent Optware payload optional"
     fi
     install_hooks || return 1
-    verify_shell_compat || return 1
+    if test "${LEGACY:-0}" = 1; then verify_shell_compat || return 1; fi
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" check || return 1
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" restart || {
         fail "Первый запуск не удался. Проверь $BASE/logs/mihomo.log и команду gc logs"
