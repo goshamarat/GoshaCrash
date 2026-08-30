@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc15"
-BUILD_ID="2026-08-30-bt10-path-preflight-fix-rc15"
+VERSION="3.10.2-rc16"
+BUILD_ID="2026-08-30-bt10-cli-dm-packages-term-sftp-rc16"
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.
@@ -150,10 +150,17 @@ find_dm_root(){
 refresh_path(){
     find_dm_root >/dev/null 2>&1 || true
 
-    PATH="$GC_COMPAT_BIN:/jffs/scripts"
-    [ -n "$DM_ROOT" ] && PATH="$DM_ROOT/bin:$DM_ROOT/sbin:$PATH"
-    PATH="/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"
-    PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
+    if [ "${LEGACY:-0}" = 1 ]; then
+        PATH="$GC_COMPAT_BIN:/jffs/scripts"
+        [ -n "$DM_ROOT" ] && PATH="$DM_ROOT/bin:$DM_ROOT/sbin:$PATH"
+        PATH="/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"
+        PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
+    else
+        # Modern ASUSWRT: firmware commands must win over old DM/Optware.
+        PATH="$GC_COMPAT_BIN:/jffs/scripts:/usr/sbin:/usr/bin:/sbin:/bin"
+        [ -n "$DM_ROOT" ] && PATH="$PATH:$DM_ROOT/bin:$DM_ROOT/sbin"
+        PATH="$PATH:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin"
+    fi
     export PATH
     hash -r 2>/dev/null || true
 
@@ -1154,8 +1161,14 @@ edit_config(){
     }
     say "Резервная копия: $backup"
 
-    TERM="${TERM:-xterm}" "$editor" "$CONFIG" || {
-        warn "Редактор завершился с ошибкой"
+    editor_term="${TERM:-xterm}"
+    case "$editor_term" in
+        xterm-256color) editor_term=xterm ;;
+        screen-256color) editor_term=screen ;;
+        tmux-256color|*-256color) editor_term=xterm ;;
+    esac
+    TERM="$editor_term" "$editor" "$CONFIG" || {
+        warn "Редактор завершился с ошибкой (TERM=$editor_term)"
         return 1
     }
 
@@ -1658,20 +1671,34 @@ autostart_status(){
 }
 
 sftp_status(){
+    load_platform >/dev/null 2>&1 || true
+    find_dm_root >/dev/null 2>&1 || true
+
     echo "SFTP / Optware"
     p="$(cat "$STATE/sftp-server.path" 2>/dev/null)"
     v="$(cat "$STATE/sftp-server.version" 2>/dev/null)"
 
     if [ -n "$p" ] && [ -x "$p" ]; then
-        echo "  binary: OK"
-        echo "  path: $p"
-        [ -n "$v" ] && echo "  version: $v"
+        found="$p"
     else
         found=""
-        for x in /opt/libexec/sftp-server /opt/lib/openssh/sftp-server; do
-            [ -x "$x" ] && { found="$x"; break; }
+        for x in \
+            "$DM_ROOT/libexec/sftp-server" \
+            "$DM_ROOT/lib/openssh/sftp-server" \
+            /tmp/opt/libexec/sftp-server \
+            /tmp/opt/lib/openssh/sftp-server \
+            /opt/libexec/sftp-server \
+            /opt/lib/openssh/sftp-server; do
+            [ -n "$x" ] && [ -x "$x" ] && { found="$x"; break; }
         done
-        [ -n "$found" ] && echo "  path: $found" || echo "  binary: НЕ НАЙДЕН"
+    fi
+
+    if [ -n "$found" ]; then
+        echo "  binary: OK"
+        echo "  path: $found"
+        [ -n "$v" ] && echo "  version: $v"
+    else
+        echo "  binary: НЕ НАЙДЕН"
     fi
     echo "  SSH daemon: stock ASUS Dropbear не заменяется"
     echo "  Проверка с ПК: sftp admin@<IP роутера>"

@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc15"
+INSTALLER_VERSION="3.10.2-rc16"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -259,12 +259,12 @@ legacy_usb_fs_check(){
             echo
             echo "Подготовить флешку можно этим же установщиком:"
             echo
-            echo "  sh install.sh --prepare-usb"
+            echo "  /bin//bin/sh install.sh --prepare-usb"
             echo
             echo "После форматирования:"
             echo "  1. переподключи флешку;"
             echo "  2. установи Download Master на неё заново;"
-            echo "  3. снова запусти: sh install.sh"
+            echo "  3. снова запусти: /bin/sh install.sh"
             echo
             fail "Установка остановлена до внесения изменений: требуется EXT3"
             return 1
@@ -366,7 +366,7 @@ prepare_usb_wizard(){
         fail "ASUSWRT всё ещё держит раздел флешки смонтированным. Ничего destructive не выполнено."
         echo "В веб-интерфейсе ASUS нажми «Отсоединить» для USB-диска, не вынимай его физически,"
         echo "и снова запусти:"
-        echo "  sh /tmp/install.sh --prepare-usb"
+        echo "  /bin//bin/sh /tmp/install.sh --prepare-usb"
         return 1
     fi
 
@@ -450,7 +450,7 @@ prepare_usb_wizard(){
             echo "  reboot"
             echo
             echo "После загрузки снова:"
-            echo "  sh /tmp/install.sh --prepare-usb"
+            echo "  /bin//bin/sh /tmp/install.sh --prepare-usb"
             echo
             echo "rc14 увидит совпавшую геометрию и ПРОПУСТИТ fdisk."
             return 2
@@ -495,7 +495,7 @@ prepare_usb_wizard(){
     echo
     echo "Затем установи Download Master через веб-интерфейс ASUS"
     echo "и запусти обычную установку GoshaCrash:"
-    echo "  sh /tmp/install.sh"
+    echo "  /bin/sh /tmp/install.sh"
     echo
     return 0
 }
@@ -636,7 +636,7 @@ legacy_preflight_before_dm(){
             echo
             echo "Подготовить эту флешку можно самим install.sh:"
             echo
-            echo "  sh /tmp/install.sh --prepare-usb"
+            echo "  /bin//bin/sh /tmp/install.sh --prepare-usb"
             echo
             echo "ВНИМАНИЕ: форматирование удалит ВСЕ данные и Download Master."
             echo "После EXT3 установи Download Master через ASUS заново,"
@@ -1188,12 +1188,22 @@ install_optware_sftp(){
 
     if sftp_bin="$(find_sftp_server 2>/dev/null)"; then
         say "SFTP binary: $sftp_bin"
+        mkdir -p "$BASE/state" 2>/dev/null || true
+        printf '%s\n' "$sftp_bin" > "$BASE/state/sftp-server.path" 2>/dev/null || true
+        pkg_line="$(optware_sftp_package_line 2>/dev/null)"
+        pkg_ver="$(printf '%s\n' "$pkg_line" | awk '{print $3}')"
+        test -n "$pkg_ver" && printf '%s\n' "$pkg_ver" > "$BASE/state/sftp-server.version" 2>/dev/null || true
         return 0
     fi
 
     pkg_line="$(optware_sftp_package_line)"
     if test -z "$pkg_line"; then
-        warn "openssh-sftp-server отсутствует в локальном индексе Optware; пропускаю SFTP без ipkg update"
+        say "SFTP: openssh-sftp-server не найден в текущем индексе; обновляю индекс Download Master"
+        pkg_update_index_once || true
+        pkg_line="$(optware_sftp_package_line)"
+    fi
+    if test -z "$pkg_line"; then
+        warn "openssh-sftp-server отсутствует в репозитории Download Master; SFTP пропущен"
         return 0
     fi
 
@@ -1287,53 +1297,41 @@ prepare_packages_modern(){
     check_usb_filesystem
     refresh_tools
 
-    # On modern ASUSWRT the GoshaCrash core only requires unzip, gzip and a
-    # downloader. nano/SFTP and Download Master's package manager are optional.
-    # If ipkg/opkg exists, use it only to fill missing tools.
+    # Modern ASUSWRT uses firmware tools for system/network operations, but
+    # GoshaCrash keeps the same useful userland payload in Download Master:
+    # nano + unzip + openssh-sftp-server. Do not replace firmware sh/curl/wget.
     if find_pkg; then
-        say "Менеджер пакетов ASUS: $PKG"
-        verify_ipkg_runtime || warn "Пакетный менеджер недоступен; продолжаю с firmware tools"
+        say "Менеджер пакетов Download Master: $PKG"
+        if verify_ipkg_runtime; then
+            # Refresh once so a newly installed DM does not silently use an
+            # empty/stale package index.
+            pkg_update_index_once || warn "Не удалось обновить индекс пакетов Download Master"
+
+            install_or_repair_persistent_package nano bin/nano || \
+                warn "nano через Download Master не установился"
+
+            install_or_repair_persistent_package unzip bin/unzip bin/unzip-unzip || \
+                warn "unzip через Download Master не установился"
+
+            install_optware_sftp || true
+        else
+            warn "Пакетный менеджер Download Master недоступен; продолжаю с firmware tools"
+        fi
     else
         PKG=""
         OPTWARE_RUNTIME_MODE=""
-        say "Пакетный менеджер Download Master не найден — для modern-профиля это не блокирует установку"
+        say "Пакетный менеджер Download Master не найден — modern core продолжит работу на firmware tools"
     fi
 
     refresh_tools
 
-    # BusyBox unzip is sufficient here because Zashboard is validated by real
-    # extraction, not by Info-ZIP-only test flags.
+    # Core runtime always prefers firmware tools on modern ASUSWRT.
     UNZIP_BIN="$(tool_path unzip 2>/dev/null)"
-    if test -z "$UNZIP_BIN" && test -n "$PKG"; then
-        pkg_install_one unzip >/dev/null 2>&1 || true
-        refresh_tools
-        UNZIP_BIN="$(tool_path unzip 2>/dev/null)"
-    fi
-
-    if test ! -x "$GZIP_BIN" && test -n "$PKG"; then
-        pkg_install_one gzip >/dev/null 2>&1 || true
-        refresh_tools
-    fi
-
-    if test -z "$DOWNLOADER" && test -n "$PKG"; then
-        pkg_install_one wget >/dev/null 2>&1 || true
-        refresh_tools
-    fi
-
     test -n "$UNZIP_BIN" || { fail "На modern ASUSWRT не найден unzip"; return 1; }
     test -x "$GZIP_BIN" || { fail "На modern ASUSWRT не найден gzip"; return 1; }
     test -n "$DOWNLOADER" || { fail "На modern ASUSWRT не найден wget/curl"; return 1; }
 
-    # Convenience tools are best-effort on modern routers.
     NANO_BIN="$(find_nano 2>/dev/null)"
-    if test -z "$NANO_BIN" && test -n "$PKG"; then
-        pkg_install_one nano >/dev/null 2>&1 || true
-        NANO_BIN="$(find_nano 2>/dev/null)"
-    fi
-    if test -n "$PKG"; then
-        install_optware_sftp >/dev/null 2>&1 || true
-    fi
-
     say "Modern tools: unzip=$UNZIP_BIN, gzip=$GZIP_BIN, downloader=$DOWNLOADER, nano=${NANO_BIN:-optional}"
     return 0
 }
@@ -2002,13 +2000,14 @@ remove_legacy_hook_lines(){
 
 write_command_wrapper(){
     dst="$1"
+    mkdir -p "$(dirname "$dst")" 2>/dev/null || true
     cat > "$dst" <<'WRAP'
 #!/bin/sh
 BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
 test -n "$BASE" && test -x "$BASE/goshacrash.sh" || { echo "GoshaCrash не найден на USB" >&2; exit 1; }
 GOSHACRASH_BASE="$BASE"
 export GOSHACRASH_BASE
-exec "$BASE/goshacrash.sh" "$@"
+exec /bin/sh "$BASE/goshacrash.sh" "$@"
 WRAP
     chmod 755 "$dst"
 }
@@ -2040,7 +2039,16 @@ write_nano_wrapper(){
 BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
 DM_ROOT=""
 test -f "$BASE/state/platform.env" && . "$BASE/state/platform.env"
-for p in /opt/bin/nano /tmp/opt/bin/nano "$DM_ROOT/bin/nano" "$DM_ROOT/sbin/nano"; do
+
+case "${TERM:-}" in
+  xterm-256color) TERM=xterm ;;
+  screen-256color) TERM=screen ;;
+  tmux-256color|*-256color) TERM=xterm ;;
+  "") TERM=xterm ;;
+esac
+export TERM
+
+for p in "$DM_ROOT/bin/nano" /opt/bin/nano /tmp/opt/bin/nano "$DM_ROOT/sbin/nano"; do
   test -x "$p" && exec "$p" "$@"
 done
 echo "nano не найден. Установи nano через пакетный менеджер Download Master" >&2
@@ -2263,10 +2271,15 @@ HOOK
     rm -f /jffs/scripts/gc "$DM_ROOT/bin/gc" /opt/bin/gc 2>/dev/null || true
     write_test_wrapper /jffs/scripts/test || return 1
     write_bracket_wrapper /jffs/scripts/'[' || return 1
-    write_command_wrapper /jffs/scripts/gc
-    write_nano_wrapper /jffs/scripts/nano
-    write_command_wrapper "$DM_ROOT/bin/gc"
-    test -d /opt/bin && test -w /opt/bin && write_command_wrapper /opt/bin/gc 2>/dev/null || true
+    write_command_wrapper /jffs/scripts/gc || return 1
+    write_nano_wrapper /jffs/scripts/nano || return 1
+    write_command_wrapper "$DM_ROOT/bin/gc" || return 1
+    ensure_optware_link >/dev/null 2>&1 || true
+    if test -d /opt/bin && test -w /opt/bin; then
+        write_command_wrapper /opt/bin/gc 2>/dev/null || true
+    fi
+    test -x "$DM_ROOT/bin/gc" || { fail "Не удалось установить CLI wrapper gc в $DM_ROOT/bin"; return 1; }
+    say "CLI wrapper: $DM_ROOT/bin/gc"
     add_once /jffs/configs/profile.add 'export PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"'
 
     remove_pre3712_autostart
@@ -2380,7 +2393,7 @@ main(){
 
     case "${1:-}" in
         --prepare-usb)
-            test "$#" -eq 1 || { fail "Использование: sh install.sh --prepare-usb"; return 1; }
+            test "$#" -eq 1 || { fail "Использование: /bin//bin/sh install.sh --prepare-usb"; return 1; }
             acquire_lock || return 1
             prepare_usb_wizard
             return $?
@@ -2389,9 +2402,9 @@ main(){
             echo "GoshaCrash installer $INSTALLER_VERSION"
             echo
             echo "Использование:"
-            echo "  sh install.sh                установить GoshaCrash"
-            echo "  sh install.sh --prepare-usb  безопасный мастер подготовки USB в EXT3"
-            echo "  sh install.sh --help         эта справка"
+            echo "  /bin/sh install.sh                установить GoshaCrash"
+            echo "  /bin//bin/sh install.sh --prepare-usb  безопасный мастер подготовки USB в EXT3"
+            echo "  /bin/sh install.sh --help         эта справка"
             return 0
             ;;
         '')
@@ -2412,7 +2425,7 @@ main(){
             echo
             echo "EXT3 уже подходит, но Download Master не найден."
             echo "Установи Download Master через веб-интерфейс ASUS на эту флешку,"
-            echo "затем снова запусти: sh /tmp/install.sh"
+            echo "затем снова запусти: /bin/sh /tmp/install.sh"
         fi
         return 1
     }

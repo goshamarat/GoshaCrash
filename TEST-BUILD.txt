@@ -1,7 +1,10 @@
-# GoshaCrash 3.10.2-rc15
+# GoshaCrash 3.10.2-rc16
 
-BT10 real-hardware fix:
-- rc14 modern preflight ran before prepare_path.
-- /usr/sbin/iptables therefore existed but could be invisible to command -v.
-- rc15 prepares PATH first and probes standard absolute ASUSWRT paths.
-- TUN runtime loading uses absolute modprobe/insmod paths as well.
+Real BT10 bugfixes:
+- explicit /bin/sh for CLI wrapper and user-facing install commands;
+- modern runtime firmware-first PATH;
+- verified persistent gc wrapper;
+- DM/ipkg packages: nano, unzip, openssh-sftp-server;
+- one package-index refresh on modern DM;
+- xterm-256color fallback for old DM nano;
+- SFTP state/path detection fixed for physical DM_ROOT and /tmp/opt.
