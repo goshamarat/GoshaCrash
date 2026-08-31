@@ -1,17 +1,36 @@
 # GoshaCrash
 
+## rc25: consolidated cold-boot + installer build
 
-## rc24: clean install layout
+rc25 собирает в одну версию исправления BT10, меню и структуры каталогов, а также закрывает несколько проблем обновления:
 
-`rulesets/` and `proxies/` were removed from the directories created automatically by GoshaCrash.
-They were not referenced anywhere by the installer, controller, generated config, or runtime.
-If a custom Mihomo config needs local provider files, the user can create any desired directory explicitly.
+- lock-каталоги на USB теперь привязаны к **текущей загрузке Linux** через `/proc/sys/kernel/random/boot_id`; PID после полного power-cycle больше не может случайно сделать старый lock «живым»;
+- watchdog запускается в самом начале boot worker и после завершения boot-пути берёт recovery на себя; пока boot worker активен, watchdog не гоняет параллельный start;
+- `start.sh`, USB hook и Download Master bridge при каждой установке перезаписываются актуальной версией;
+- `gc autostart status` показывает реальную версию hook и MATCH/MISMATCH с controller;
+- online installer проверяет версию `goshacrash.sh` **на каждом зеркале** и не принимает устаревший файл из CDN/cache;
+- локальный release ZIP использует лежащие рядом `goshacrash.sh` и `assets/gcnet-armv5`, а не скачивает их повторно;
+- `rulesets/` и `proxies/` не создаются; старые пустые каталоги удаляются безопасным `rmdir`;
+- menu redraw без полного `clear` при стрелках сохранён.
+
+### Рекомендуемый online install
+
+На BT10 не нужно сначала сохранять `/tmp/install.sh` и потом делать `chmod`. Можно сразу передать полностью скачанный installer в `/bin/sh` через stdout — тогда исчезновение файла из `/tmp` между командами вообще исключено:
+
+```sh
+mkdir -p /tmp/goshacrash-wget
+chmod 700 /tmp/goshacrash-wget
+HOME=/tmp/goshacrash-wget /usr/sbin/wget --no-check-certificate -O - \
+  'https://raw.githubusercontent.com/goshamarat/GoshaCrash/refs/heads/main/install.sh' | /bin/sh
+```
+
+Перед online install в `main` должны быть одновременно загружены **оба** файла rc25: `install.sh` и `goshacrash.sh`. Если одно зеркало ещё отдаёт старый controller, installer попробует следующее; несовпадающая версия не устанавливается.
 
 GoshaCrash — установщик и контроллер Mihomo для ASUSWRT с Zashboard, TUN-маршрутизацией, watchdog, автозапуском и вспомогательными утилитами.
 
 Этот RC в первую очередь проверяется на **ASUS RT-AC68U** со старым ASUSWRT / Linux 2.6.36. Для legacy-профиля используется **Mihomo ARMv5 + gVisor**.
 
-> **Тестовая версия:** 3.10.2-rc24  
+> **Тестовая версия:** 3.10.2-rc25  
 > Не публикуйте её как универсально стабильную для всех ASUS до проверки новых ARM64-моделей.
 
 ## Что уже проверено на RT-AC68U
@@ -394,10 +413,19 @@ libipkg.so.0.0.0
 
 # 3. Установка GoshaCrash
 
-Запуск:
+Из распакованного release ZIP:
 
 ```sh
-sh install.sh
+/bin/sh install.sh
+```
+
+Из GitHub рекомендуется потоковый запуск без промежуточного `/tmp/install.sh`:
+
+```sh
+mkdir -p /tmp/goshacrash-wget
+chmod 700 /tmp/goshacrash-wget
+HOME=/tmp/goshacrash-wget /usr/sbin/wget --no-check-certificate -O - \
+  'https://raw.githubusercontent.com/goshamarat/GoshaCrash/refs/heads/main/install.sh' | /bin/sh
 ```
 
 Установщик:
@@ -877,5 +905,5 @@ rc23 закрывает класс ошибок, которые проявляю
 - Для запуска фоновых процессов сначала используются firmware `nohup` (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`), и только затем Optware.
 - Независимый trace `/jffs/addons/goshacrash/coldboot.log` фиксирует этапы `Download Master bridge -> usb-mount-script -> start.sh`. Он остаётся доступен даже если USB/runtime ещё не был готов.
 - `logs/boot.log` теперь показывает этапы `/opt`, default route, `/dev/net/tun`, стабильного физического uplink и результат запуска runtime.
-- Installer каждый раз перезаписывает hooks rc23 и проверяет, что версия скачанного `goshacrash.sh` точно совпадает с `install.sh`; смешанная установка rc21/rc22/rc23 останавливается с ошибкой.
+- Installer каждый раз перезаписывает актуальные hooks и проверяет, что версия скачанного `goshacrash.sh` точно совпадает с `install.sh`; смешанная установка разных версий останавливается с ошибкой.
 - Исправление меню без мерцания из rc22 сохранено.

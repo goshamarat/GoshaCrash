@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc24"
+INSTALLER_VERSION="3.10.2-rc25"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -1927,33 +1927,55 @@ choose_routing_mode(){
     say "Маршрутизация выбрана: $ROUTING_MODE"
 }
 
+controller_file_matches(){
+    file="$1"
+    test -s "$file" || return 1
+    test "$(sed -n '1p' "$file" 2>/dev/null)" = '#!/bin/sh' || return 1
+    version="$(awk -F'"' '/^VERSION="/ {print $2; exit}' "$file" 2>/dev/null)"
+    test "$version" = "$INSTALLER_VERSION"
+}
+
+fetch_matching_controller(){
+    out="$1"
+    for url in \
+        "https://raw.githubusercontent.com/$REPO/refs/heads/$BRANCH/goshacrash.sh" \
+        "https://github.com/$REPO/raw/refs/heads/$BRANCH/goshacrash.sh" \
+        "https://testingcf.jsdelivr.net/gh/$REPO@$BRANCH/goshacrash.sh" \
+        "https://cdn.jsdelivr.net/gh/$REPO@$BRANCH/goshacrash.sh"; do
+        say "Скачиваю goshacrash.sh"
+        rm -f "$out" "$out.part" 2>/dev/null || true
+        if fetch "$url" "$out"; then
+            if controller_file_matches "$out"; then
+                return 0
+            fi
+            got="$(awk -F'"' '/^VERSION="/ {print $2; exit}' "$out" 2>/dev/null)"
+            warn "Источник отдал другую версию goshacrash.sh: ${got:-unknown}; нужен $INSTALLER_VERSION"
+        else
+            warn "Источник недоступен: $url"
+        fi
+    done
+    rm -f "$out" "$out.part" 2>/dev/null || true
+    return 1
+}
+
 install_controller(){
     tmp="$TMP_ROOT/goshacrash.sh"
     rm -f "$tmp" 2>/dev/null || true
 
-    # When install.sh is run from an extracted release archive, prefer the
-    # sibling controller only if its version exactly matches this installer.
-    # A lone /tmp/install.sh therefore cannot accidentally pick up an older
-    # goshacrash.sh left from a previous test.
+    # Extracted release archives are self-contained. For an online bootstrap,
+    # every mirror is validated by VERSION so a stale GitHub/CDN cache cannot
+    # silently mix two release candidates.
     self_dir="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
     local_controller="$self_dir/goshacrash.sh"
-    local_version=""
-    if test -f "$local_controller"; then
-        local_version="$(awk -F'"' '/^VERSION="/ {print $2; exit}' "$local_controller" 2>/dev/null)"
-    fi
-    if test -n "$local_version" && test "$local_version" = "$INSTALLER_VERSION"; then
+    if controller_file_matches "$local_controller"; then
         cp -f "$local_controller" "$tmp" || return 1
         say "Использую goshacrash.sh из локальной сборки $INSTALLER_VERSION"
     else
-        fetch_repo_file goshacrash.sh "$tmp" || { fail "Не удалось скачать goshacrash.sh"; return 1; }
-    fi
-
-    test "$(sed -n '1p' "$tmp" 2>/dev/null)" = '#!/bin/sh' || { fail "goshacrash.sh получен неверно"; return 1; }
-    controller_version="$(awk -F'"' '/^VERSION="/ {print $2; exit}' "$tmp" 2>/dev/null)"
-    if test "$controller_version" != "$INSTALLER_VERSION"; then
-        fail "Несовпадение версии: install.sh=$INSTALLER_VERSION, goshacrash.sh=${controller_version:-unknown}"
-        fail "Обнови install.sh и goshacrash.sh одновременно и повтори установку"
-        return 1
+        fetch_matching_controller "$tmp" || {
+            fail "Не удалось получить goshacrash.sh версии $INSTALLER_VERSION"
+            fail "Загрузи install.sh и goshacrash.sh из одной сборки либо дождись обновления main на GitHub"
+            return 1
+        }
     fi
 
     if /bin/sh -n /dev/null >/dev/null 2>&1; then
@@ -1972,7 +1994,14 @@ install_network_helper(){
         return 0
     fi
     tmp="$TMP_ROOT/gcnet-armv5"
-    fetch_repo_file assets/gcnet-armv5 "$tmp" || { fail "Не удалось скачать legacy network helper gcnet"; return 1; }
+    self_dir="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
+    local_helper="$self_dir/assets/gcnet-armv5"
+    if test -s "$local_helper"; then
+        cp -f "$local_helper" "$tmp" || return 1
+        say "Использую gcnet из локальной сборки"
+    else
+        fetch_repo_file assets/gcnet-armv5 "$tmp" || { fail "Не удалось скачать legacy network helper gcnet"; return 1; }
+    fi
     test -s "$tmp" || { fail "gcnet скачан пустым"; return 1; }
     chmod 755 "$tmp" || return 1
     "$tmp" link-exists lo >/dev/null 2>&1 || { fail "gcnet не запускается на этом legacy-роутере"; return 1; }
@@ -2440,7 +2469,7 @@ install_stock_usb_mount_bridge(){
     mkdir -p "$DM_ROOT/etc/init.d" "$DM_ROOT/lib/ipkg/info" || return 1
     cat > "$DM_ROOT/etc/init.d/S50usb-mount-script" <<'HOOK'
 #!/bin/sh
-# GoshaCrash Download Master bridge 3.10.2-rc24
+# GoshaCrash Download Master bridge 3.10.2-rc25
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2530,7 +2559,7 @@ install_hooks(){
 
     cat > "$JFFS_DIR/start.sh" <<'HOOK'
 #!/bin/sh
-# GoshaCrash autostart hook 3.10.2-rc24
+# GoshaCrash autostart hook 3.10.2-rc25
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2540,7 +2569,18 @@ WAITED=0
 trace(){
   printf '[%s] [start.sh pid=%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$*" >> "$TRACE" 2>/dev/null || true
 }
-trace "entered"
+# Keep the persistent JFFS trace bounded; it is diagnostic, not a history DB.
+if test -f "$TRACE"; then
+  TRACE_SIZE="$(wc -c < "$TRACE" 2>/dev/null)"
+  case "$TRACE_SIZE" in ''|*[!0-9]*) TRACE_SIZE=0;; esac
+  if test "$TRACE_SIZE" -gt 131072; then
+    tail -n 200 "$TRACE" > "$TRACE.tmp.$$" 2>/dev/null && mv -f "$TRACE.tmp.$$" "$TRACE" 2>/dev/null || true
+    rm -f "$TRACE.tmp.$$" 2>/dev/null || true
+  fi
+fi
+BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
+UPTIME="$(cat /proc/uptime 2>/dev/null)"
+trace "entered boot_id=${BOOT_ID:-unknown} uptime=${UPTIME:-unknown}"
 BASE="$(cat "$BASE_FILE" 2>/dev/null)"
 while test -z "$BASE" || test ! -x "$BASE/goshacrash.sh"; do
   if test "$WAITED" -ge 300; then
@@ -2554,7 +2594,7 @@ done
 trace "controller ready after ${WAITED}s; base=$BASE"
 mkdir -p "$BASE/run" "$BASE/state" "$BASE/logs" 2>/dev/null || true
 date '+%Y-%m-%d %H:%M:%S' > "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-printf '[%s] autostart hook rc24: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
+printf '[%s] autostart hook rc25: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
 NOHUP=""
 for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup; do
   test -x "$p" && { NOHUP="$p"; break; }
@@ -2572,7 +2612,7 @@ HOOK
 
     cat > /jffs/scripts/usb-mount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB hook 3.10.2-rc24
+# GoshaCrash USB hook 3.10.2-rc25
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2609,7 +2649,7 @@ HOOK
 
     cat > /jffs/scripts/usb-umount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB unmount hook 3.10.2-rc24
+# GoshaCrash USB unmount hook 3.10.2-rc25
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2784,7 +2824,7 @@ main(){
     }
     BASE="${INSTALL_DIR:-$USB_MOUNT/goshacrash}"
     mkdir -p "$TMP_ROOT" "$BASE/bin" "$BASE/ui" "$BASE/logs" "$BASE/run" "$BASE/state" "$BASE/backups" || return 1
-    # rc24: these directories were never used by GoshaCrash. Remove legacy
+    # rc25: these directories were never used by GoshaCrash. Remove legacy
     # empty copies from older builds, but never delete user files.
     rmdir "$BASE/rulesets" "$BASE/proxies" 2>/dev/null || true
     save_install_log

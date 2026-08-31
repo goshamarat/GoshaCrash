@@ -1,42 +1,29 @@
-# GoshaCrash 3.10.2-rc24
+# GoshaCrash 3.10.2-rc25
 
-BT10 package-path fixes are now based on commands verified manually on the real router.
+Consolidated test build for ASUS RT-AC68U and ZenWiFi BT10.
 
-Confirmed manually before this build:
-- /dev/sda1 bind-mounted on /opt gives a writable full Optware root;
-- /opt/libexec, /opt/man/man1 and /opt/var can be created on USB;
-- plain ipkg reinstall then creates /opt/libexec/sftp-server successfully;
-- Optware-NG ncurses-base 5.7-7 can be unpacked with:
-    ipkg -o <staging-root> -force-depends install <ipk>
-- that staging payload contains x/xterm, x/xterm-256color and v/vt100;
-- copying only staging opt/share/terminfo to real /opt/share/terminfo makes nano open normally with TERM=xterm-256color.
+Key rc25 changes:
+- cold-boot locks are bound to the current Linux boot ID, not PID alone;
+- watchdog is launched early by boot() and skips recovery while the boot worker owns BOOT_LOCK;
+- stale USB lock directories from a previous power cycle are removed even if their old PID was reused;
+- controller/watchdog PID validation still checks /proc/PID/cmdline;
+- install hooks are always rewritten as rc25 and gc autostart status reports hook/controller MATCH or MISMATCH;
+- online controller download validates VERSION on every mirror and continues past stale CDN/cache responses;
+- extracted release archives use their matching local goshacrash.sh and local assets/gcnet-armv5;
+- rulesets/ and proxies/ are not created; old empty copies are removed with rmdir only;
+- rc22 incremental menu redraw is retained;
+- rc21 BT10 Optware namespace, SFTP libexec, and offline terminfo extraction path are retained.
 
-rc21 changes:
-- creates conventional top-level Optware dirs before package work;
-- uses the exact proven offline ipkg command (no -force-defaults);
-- never uses BusyBox find -type/-path in terminfo checks;
-- checks exact compiled terminfo files directly;
-- leaves ASUS ncurses-base 5.7-8 installed and copies only architecture-neutral terminfo data;
-- runtime recreates the same writable /opt layout after reboot;
-- gc doctor checks terminfo data directly instead of executing incompatible infocmp.
+Validation performed for this artifact:
+- bash -n install.sh + goshacrash.sh
+- dash -n install.sh + goshacrash.sh
+- BusyBox ash -n install.sh + goshacrash.sh
+- install.sh --help reports 3.10.2-rc25
+- goshacrash.sh version reports 3.10.2-rc25
+- boot-token/lock test verifies that a lock stamped with another boot ID is treated as stale and removed
+- no BusyBox-incompatible find -type or find -path in executable shell code
+- ZIP integrity tested with unzip -t
 
-Legacy RT-AC68U package/routing path remains unchanged when /opt already writes through to Download Master; rc23 only adds generic PID/lock/watchdog hardening shared by both profiles.
-
-
-rc22 changes:
-- interactive menu no longer clears/redraws the entire terminal on every Up/Down key press;
-- only the previously selected row and the newly selected row are repainted;
-- cursor is hidden while navigating and restored before actions/editors and on every exit path;
-- full-screen redraw remains only on initial menu entry and after an executed action.
-
-rc23 changes:
-- cold-boot runtime PID files are validated against /proc/<pid>/cmdline, so a stale watchdog.pid/boot.pid cannot be mistaken for an unrelated process after a power cycle;
-- boot is serialized with a persistent boot.lock whose owner PID is verified; duplicate USB hooks are ignored and stale locks are reclaimed;
-- start.lock/control.lock now carry an owner PID and stale locks are removed instead of blocking recovery forever;
-- watchdog logs its own launch/loop entry and runs the first recovery check immediately instead of sleeping first;
-- watchdog and Mihomo prefer firmware nohup paths before Optware paths;
-- /jffs/addons/goshacrash/coldboot.log records Download Master bridge -> USB hook -> start.sh even before USB boot.log is usable;
-- boot.log now records the main cold-boot stages (Optware, default route, TUN, stable physical uplink, runtime start result);
-- installer always rewrites rc23 hooks and refuses to mix install.sh with a goshacrash.sh of another version;
-- extracted release archives can use their matching sibling goshacrash.sh without fetching a different controller from main;
-- rc22 incremental menu redraw is retained.
+Real-router status:
+- RT-AC68U: rc12 lineage is the last fully end-to-end tested legacy baseline; rc25 keeps the same legacy package/routing model with generic lock hardening.
+- ZenWiFi BT10: package path, writable /opt bind, SFTP payload, terminfo/nano, ARMv7 Mihomo, TUN, and auto routing were proven manually. rc25 cold power-cycle behavior still requires a real-router power-off/power-on test before calling the build stable.

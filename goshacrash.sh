@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc24"
-BUILD_ID="2026-08-31-layout-cleanup-rc24"
+VERSION="3.10.2-rc25"
+BUILD_ID="2026-08-31-consolidated-coldboot-install-rc25"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -51,6 +51,7 @@ BOOT_LOCK="$RUN/boot.lock"
 START_LOCK="$RUN/start.lock"
 CONTROL_LOCK="$RUN/control.lock"
 MANUAL_STOP="$STATE/manual-stop"
+BOOT_TOKEN_FILE="/tmp/goshacrash-boot-token"
 
 MIHOMO_LOG="$LOGS/mihomo.log"
 INSTALL_LOG="$LOGS/install.log"
@@ -552,6 +553,49 @@ proc_cmdline(){
     p="$1"
     [ -n "$p" ] && [ -r "/proc/$p/cmdline" ] || return 1
     /bin/busybox tr '\000' ' ' < "/proc/$p/cmdline" 2>/dev/null
+}
+
+current_boot_token(){
+    # Linux exposes a per-boot UUID on both modern ASUSWRT and most 2.6 builds.
+    # It is the strongest way to distinguish persistent USB locks from the
+    # process that owned them before a hard power cut.
+    if [ -r /proc/sys/kernel/random/boot_id ]; then
+        token="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
+        [ -n "$token" ] && { printf '%s\n' "$token"; return 0; }
+    fi
+
+    # Fallback for old kernels: /tmp is recreated on every boot, so a token
+    # stored here cannot survive a power cycle even though run/ on USB does.
+    if [ ! -s "$BOOT_TOKEN_FILE" ]; then
+        token=""
+        if [ -r /dev/urandom ]; then
+            token="$(/bin/busybox od -An -N16 -tx1 /dev/urandom 2>/dev/null | /bin/busybox tr -d ' \n')"
+        fi
+        [ -n "$token" ] || token="$$-$(/bin/busybox awk '{print $1}' /proc/uptime 2>/dev/null)-$(uname -r 2>/dev/null)"
+        tmp="$BOOT_TOKEN_FILE.$$"
+        printf '%s\n' "$token" > "$tmp" 2>/dev/null || return 1
+        if [ ! -s "$BOOT_TOKEN_FILE" ]; then
+            mv -f "$tmp" "$BOOT_TOKEN_FILE" 2>/dev/null || true
+        fi
+        rm -f "$tmp" 2>/dev/null || true
+    fi
+    cat "$BOOT_TOKEN_FILE" 2>/dev/null
+}
+
+lock_stamp(){
+    dir="$1"
+    token="$(current_boot_token 2>/dev/null)" || return 1
+    [ -n "$token" ] || return 1
+    printf '%s\n' "$$" > "$dir/pid" 2>/dev/null || return 1
+    printf '%s\n' "$token" > "$dir/boot" 2>/dev/null || return 1
+}
+
+lock_is_current_boot(){
+    dir="$1"
+    [ -d "$dir" ] && [ -f "$dir/boot" ] || return 1
+    saved="$(cat "$dir/boot" 2>/dev/null)"
+    current="$(current_boot_token 2>/dev/null)" || return 1
+    [ -n "$saved" ] && [ "$saved" = "$current" ]
 }
 
 pid_matches(){
@@ -1089,6 +1133,7 @@ start_runtime(){
 
 start_lock_active(){
     [ -d "$START_LOCK" ] || return 1
+    lock_is_current_boot "$START_LOCK" || { rm -rf "$START_LOCK" 2>/dev/null || true; return 1; }
     p="$(cat "$START_LOCK/pid" 2>/dev/null)"
     if controller_pid_alive "$p"; then
         return 0
@@ -1111,7 +1156,7 @@ with_start_lock(){
             mkdir "$START_LOCK" 2>/dev/null || return 1
         fi
     fi
-    printf '%s\n' "$$" > "$START_LOCK/pid" 2>/dev/null || true
+    lock_stamp "$START_LOCK" || { rm -rf "$START_LOCK" 2>/dev/null || true; return 1; }
     "$@"
     rc=$?
     rm -rf "$START_LOCK" 2>/dev/null || true
@@ -1119,14 +1164,33 @@ with_start_lock(){
 }
 
 control_lock_set(){
-    mkdir -p "$CONTROL_LOCK" 2>/dev/null || return 1
-    printf '%s\n' "$$" > "$CONTROL_LOCK/pid" 2>/dev/null || true
+    if [ -d "$CONTROL_LOCK" ]; then
+        if control_lock_active; then
+            p="$(cat "$CONTROL_LOCK/pid" 2>/dev/null)"
+            [ "$p" = "$$" ] && return 0
+            n=0
+            while control_lock_active && [ "$n" -lt 20 ]; do
+                sleep 1
+                n=$((n + 1))
+            done
+            control_lock_active && return 1
+        fi
+        rm -rf "$CONTROL_LOCK" 2>/dev/null || true
+    fi
+    mkdir "$CONTROL_LOCK" 2>/dev/null || return 1
+    lock_stamp "$CONTROL_LOCK" || { rm -rf "$CONTROL_LOCK" 2>/dev/null || true; return 1; }
 }
 
-control_lock_clear(){ rm -rf "$CONTROL_LOCK" 2>/dev/null || true; }
+control_lock_clear(){
+    [ -d "$CONTROL_LOCK" ] || return 0
+    lock_is_current_boot "$CONTROL_LOCK" || { rm -rf "$CONTROL_LOCK" 2>/dev/null || true; return 0; }
+    p="$(cat "$CONTROL_LOCK/pid" 2>/dev/null)"
+    [ "$p" = "$$" ] && rm -rf "$CONTROL_LOCK" 2>/dev/null || true
+}
 
 control_lock_active(){
     [ -d "$CONTROL_LOCK" ] || return 1
+    lock_is_current_boot "$CONTROL_LOCK" || { rm -rf "$CONTROL_LOCK" 2>/dev/null || true; return 1; }
     p="$(cat "$CONTROL_LOCK/pid" 2>/dev/null)"
     if controller_pid_alive "$p"; then
         return 0
@@ -1148,18 +1212,28 @@ boot_pid(){
 
 boot_lock_acquire(){
     if mkdir "$BOOT_LOCK" 2>/dev/null; then
-        printf '%s\n' "$$" > "$BOOT_LOCK/pid" 2>/dev/null || true
+        lock_stamp "$BOOT_LOCK" || { rm -rf "$BOOT_LOCK" 2>/dev/null || true; return 1; }
         return 0
     fi
 
-    p="$(cat "$BOOT_LOCK/pid" 2>/dev/null)"
-    if pid_matches "$p" "$BASE/goshacrash.sh" " boot"; then
-        return 1
+    if lock_is_current_boot "$BOOT_LOCK"; then
+        p="$(cat "$BOOT_LOCK/pid" 2>/dev/null)"
+        if pid_matches "$p" "$BASE/goshacrash.sh" " boot"; then
+            return 1
+        fi
     fi
 
     rm -rf "$BOOT_LOCK" 2>/dev/null || true
     mkdir "$BOOT_LOCK" 2>/dev/null || return 1
-    printf '%s\n' "$$" > "$BOOT_LOCK/pid" 2>/dev/null || true
+    lock_stamp "$BOOT_LOCK" || { rm -rf "$BOOT_LOCK" 2>/dev/null || true; return 1; }
+    return 0
+}
+
+boot_lock_active(){
+    [ -d "$BOOT_LOCK" ] || return 1
+    lock_is_current_boot "$BOOT_LOCK" || { rm -rf "$BOOT_LOCK" 2>/dev/null || true; return 1; }
+    p="$(cat "$BOOT_LOCK/pid" 2>/dev/null)"
+    pid_matches "$p" "$BASE/goshacrash.sh" " boot" || { rm -rf "$BOOT_LOCK" 2>/dev/null || true; return 1; }
     return 0
 }
 
@@ -1180,17 +1254,21 @@ cleanup_stale_runtime_state(){
     start_lock_active >/dev/null 2>&1 || rm -rf "$START_LOCK" 2>/dev/null || true
     control_lock_active >/dev/null 2>&1 || rm -rf "$CONTROL_LOCK" 2>/dev/null || true
 
-    # A watchdog-start lock without a live controller owner is stale too.
+    # A watchdog-start lock from a previous boot is always stale, even if its
+    # PID has already been reused by another GoshaCrash process.
     if [ -d "$WATCHDOG_START_LOCK" ]; then
-        p="$(cat "$WATCHDOG_START_LOCK/pid" 2>/dev/null)"
-        controller_pid_alive "$p" || rm -rf "$WATCHDOG_START_LOCK" 2>/dev/null || true
+        if ! lock_is_current_boot "$WATCHDOG_START_LOCK"; then
+            rm -rf "$WATCHDOG_START_LOCK" 2>/dev/null || true
+        else
+            p="$(cat "$WATCHDOG_START_LOCK/pid" 2>/dev/null)"
+            controller_pid_alive "$p" || rm -rf "$WATCHDOG_START_LOCK" 2>/dev/null || true
+        fi
     fi
 }
 
 stop_runtime(){
     if [ "$ROUTING_MODE" = auto ]; then kill_mihomo; route_stop >/dev/null 2>&1 || true; else route_stop >/dev/null 2>&1 || true; kill_mihomo; fi
     rm -rf "$START_LOCK" 2>/dev/null || true
-    rm -f "$BOOT_PIDFILE" 2>/dev/null || true
 }
 
 watchdog_pid(){
@@ -1220,16 +1298,18 @@ watchdog_start(){
 
     if ! mkdir "$WATCHDOG_START_LOCK" 2>/dev/null; then
         watchdog_pid >/dev/null 2>&1 && return 0
-        p="$(cat "$WATCHDOG_START_LOCK/pid" 2>/dev/null)"
-        if controller_pid_alive "$p"; then
-            sleep 1
-            watchdog_pid >/dev/null 2>&1 && return 0
-            return 1
+        if lock_is_current_boot "$WATCHDOG_START_LOCK"; then
+            p="$(cat "$WATCHDOG_START_LOCK/pid" 2>/dev/null)"
+            if controller_pid_alive "$p"; then
+                sleep 1
+                watchdog_pid >/dev/null 2>&1 && return 0
+                return 1
+            fi
         fi
         rm -rf "$WATCHDOG_START_LOCK" 2>/dev/null || true
         mkdir "$WATCHDOG_START_LOCK" 2>/dev/null || return 1
     fi
-    printf '%s\n' "$$" > "$WATCHDOG_START_LOCK/pid" 2>/dev/null || true
+    lock_stamp "$WATCHDOG_START_LOCK" || { rm -rf "$WATCHDOG_START_LOCK" 2>/dev/null || true; return 1; }
 
     watchdog_pid >/dev/null 2>&1 && { rm -rf "$WATCHDOG_START_LOCK" 2>/dev/null || true; return 0; }
     rotate_log "$WATCHDOG_LOG" 1048576
@@ -1259,6 +1339,7 @@ watchdog_start(){
 
 watchdog_check(){
     [ -f "$MANUAL_STOP" ] && return 0
+    boot_lock_active && return 0
     control_lock_active && return 0
     start_lock_active && return 0
     watchdog_connectivity_step || true
@@ -1302,7 +1383,7 @@ start(){
     refresh_path
 
     rm -f "$MANUAL_STOP"
-    control_lock_set || true
+    control_lock_set || { fail "Другая операция GoshaCrash ещё выполняется"; return 1; }
 
     if internet_probe_once; then
         wan_mark_online
@@ -1328,7 +1409,8 @@ start(){
     return "$rc"
 }
 stop(){
-    ensure_dirs || return 1; load_platform || true; touch "$MANUAL_STOP"; control_lock_set || true
+    ensure_dirs || return 1; load_platform || true; touch "$MANUAL_STOP"
+    control_lock_set || { fail "Другая операция GoshaCrash ещё выполняется"; return 1; }
     watchdog_stop; stop_runtime; control_lock_clear; ok "Mihomo остановлен; обычный DIRECT восстановлен"
 }
 
@@ -1338,7 +1420,7 @@ service_stop(){
     # otherwise the next boot would intentionally skip autostart.
     ensure_dirs || return 1
     load_platform || true
-    control_lock_set || true
+    control_lock_set || { warn "service-stop: другая операция ещё выполняется"; return 1; }
     watchdog_stop
     stop_runtime
     control_lock_clear
@@ -1353,7 +1435,7 @@ restart(){
     backup_config >/dev/null 2>&1 || true
 
     rm -f "$MANUAL_STOP"
-    control_lock_set || true
+    control_lock_set || { fail "Другая операция GoshaCrash ещё выполняется"; return 1; }
     watchdog_stop
     stop_runtime
 
@@ -1417,8 +1499,13 @@ boot(){
     printf '%s\n' "$$" > "$BOOT_PIDFILE" 2>/dev/null || true
     trap 'boot_lock_release; exit 0' HUP INT TERM
 
-    printf '[%s] boot: entered pid=%s profile=%s\n' "$(now)" "$$" "${PLATFORM:-unknown}"
+    printf '[%s] boot: entered pid=%s profile=%s boot-token=%s\n' "$(now)" "$$" "${PLATFORM:-unknown}" "$(current_boot_token 2>/dev/null)"
     cleanup_stale_runtime_state
+
+    # Keep the recovery worker alive from the beginning of a cold boot.  It
+    # deliberately skips checks while BOOT_LOCK belongs to this boot worker,
+    # then takes over on the next interval if the primary start path fails.
+    watchdog_start || printf '[%s] boot: watchdog could not start yet; will retry later\n' "$(now)"
 
     repair_opt >/dev/null 2>&1 || {
         log_event ERROR boot "Optware namespace not ready"
@@ -2101,11 +2188,9 @@ autostart_status(){
     ensure_dirs >/dev/null 2>&1 || true; load_platform >/dev/null 2>&1 || true
     echo "Autostart (stock ASUSWRT)"
     [ -x /jffs/addons/goshacrash/start.sh ] && echo "  start.sh: OK" || echo "  start.sh: FAIL"
-    if grep -q 'GoshaCrash autostart hook 3.10.2-rc23' /jffs/addons/goshacrash/start.sh 2>/dev/null; then
-        echo "  start.sh version: rc23"
-    else
-        echo "  start.sh version: old/unknown"
-    fi
+    hook_version="$(sed -n 's/^# GoshaCrash autostart hook //p' /jffs/addons/goshacrash/start.sh 2>/dev/null | /bin/busybox head -n 1)"
+    [ -n "$hook_version" ] && echo "  start.sh version: $hook_version" || echo "  start.sh version: old/unknown"
+    [ "$hook_version" = "$VERSION" ] && echo "  hook/controller: MATCH" || echo "  hook/controller: MISMATCH"
     [ -x /jffs/scripts/usb-mount-script ] && echo "  usb-mount-script: OK" || echo "  usb-mount-script: FAIL"
     [ -x "$DM_ROOT/etc/init.d/S50usb-mount-script" ] && echo "  ASUS app bridge: OK" || echo "  ASUS app bridge: FAIL"
     [ -f "$STATE/autostart-hook-ran" ] && echo "  last hook: $(cat "$STATE/autostart-hook-ran" 2>/dev/null)" || echo "  last hook: never"
@@ -2227,7 +2312,7 @@ doctor(){
 }
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.10.2-rc23 — что буквально вводить в SSH
+GoshaCrash 3.10.2-rc25 — что буквально вводить в SSH
 
 КАТАЛОГ УСТАНОВКИ
   BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
