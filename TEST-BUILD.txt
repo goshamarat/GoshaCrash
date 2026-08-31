@@ -1,4 +1,4 @@
-# GoshaCrash 3.10.2-rc21
+# GoshaCrash 3.10.2-rc24
 
 BT10 package-path fixes are now based on commands verified manually on the real router.
 
@@ -20,4 +20,23 @@ rc21 changes:
 - runtime recreates the same writable /opt layout after reboot;
 - gc doctor checks terminfo data directly instead of executing incompatible infocmp.
 
-Legacy RT-AC68U path remains unchanged when /opt already writes through to Download Master.
+Legacy RT-AC68U package/routing path remains unchanged when /opt already writes through to Download Master; rc23 only adds generic PID/lock/watchdog hardening shared by both profiles.
+
+
+rc22 changes:
+- interactive menu no longer clears/redraws the entire terminal on every Up/Down key press;
+- only the previously selected row and the newly selected row are repainted;
+- cursor is hidden while navigating and restored before actions/editors and on every exit path;
+- full-screen redraw remains only on initial menu entry and after an executed action.
+
+rc23 changes:
+- cold-boot runtime PID files are validated against /proc/<pid>/cmdline, so a stale watchdog.pid/boot.pid cannot be mistaken for an unrelated process after a power cycle;
+- boot is serialized with a persistent boot.lock whose owner PID is verified; duplicate USB hooks are ignored and stale locks are reclaimed;
+- start.lock/control.lock now carry an owner PID and stale locks are removed instead of blocking recovery forever;
+- watchdog logs its own launch/loop entry and runs the first recovery check immediately instead of sleeping first;
+- watchdog and Mihomo prefer firmware nohup paths before Optware paths;
+- /jffs/addons/goshacrash/coldboot.log records Download Master bridge -> USB hook -> start.sh even before USB boot.log is usable;
+- boot.log now records the main cold-boot stages (Optware, default route, TUN, stable physical uplink, runtime start result);
+- installer always rewrites rc23 hooks and refuses to mix install.sh with a goshacrash.sh of another version;
+- extracted release archives can use their matching sibling goshacrash.sh without fetching a different controller from main;
+- rc22 incremental menu redraw is retained.

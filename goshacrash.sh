@@ -3,8 +3,11 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc22"
-BUILD_ID="2026-08-31-menu-incremental-redraw-rc22"
+VERSION="3.10.2-rc24"
+BUILD_ID="2026-08-31-layout-cleanup-rc24"
+
+# Never inherit an Optware/uClibc loader path into stock firmware tools.
+unset LD_LIBRARY_PATH 2>/dev/null || true
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.
@@ -42,7 +45,9 @@ PLATFORM_FILE="$STATE/platform.env"
 PIDFILE="$RUN/mihomo.pid"
 WATCHDOG_PIDFILE="$RUN/watchdog.pid"
 WATCHDOG_LOG="$LOGS/watchdog.log"
+WATCHDOG_START_LOCK="$RUN/watchdog-start.lock"
 BOOT_PIDFILE="$RUN/boot.pid"
+BOOT_LOCK="$RUN/boot.lock"
 START_LOCK="$RUN/start.lock"
 CONTROL_LOCK="$RUN/control.lock"
 MANUAL_STOP="$STATE/manual-stop"
@@ -107,7 +112,7 @@ IPTABLES=""
 IPT_WAIT=""
 NET_BACKEND=""
 
-ensure_dirs(){ mkdir -p "$BASE/bin" "$UI" "$RUN" "$LOGS" "$STATE" "$BACKUPS" "$ROUTE_STATE" "$BASE/proxies" "$BASE/rulesets"; }
+ensure_dirs(){ mkdir -p "$BASE/bin" "$UI" "$RUN" "$LOGS" "$STATE" "$BACKUPS" "$ROUTE_STATE"; }
 now(){ date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date; }
 
 rotate_log(){
@@ -189,6 +194,15 @@ tool_path(){
 }
 
 have(){ tool_path "$1" >/dev/null 2>&1; }
+
+find_nohup(){
+    refresh_path >/dev/null 2>&1 || true
+    for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup \
+        "$DM_ROOT/bin/nohup" /opt/bin/nohup /tmp/opt/bin/nohup; do
+        [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+    done
+    return 1
+}
 
 find_nvram(){
     [ -n "$NVRAM_BIN" ] && [ -x "$NVRAM_BIN" ] && return 0
@@ -534,12 +548,33 @@ yaml_section(){
 is_true(){ case "$1" in true|True|TRUE|yes|Yes|YES|1|on|On|ON) return 0;; *) return 1;; esac; }
 is_false(){ case "$1" in false|False|FALSE|no|No|NO|0|off|Off|OFF) return 0;; *) return 1;; esac; }
 
+proc_cmdline(){
+    p="$1"
+    [ -n "$p" ] && [ -r "/proc/$p/cmdline" ] || return 1
+    /bin/busybox tr '\000' ' ' < "/proc/$p/cmdline" 2>/dev/null
+}
+
+pid_matches(){
+    p="$1"; needle1="$2"; needle2="${3:-}"
+    case "$p" in ''|*[!0-9]*) return 1;; esac
+    kill -0 "$p" 2>/dev/null || return 1
+    cmd="$(proc_cmdline "$p" 2>/dev/null)" || return 1
+    case "$cmd" in *"$needle1"*) : ;; *) return 1;; esac
+    if [ -n "$needle2" ]; then
+        case "$cmd" in *"$needle2"*) : ;; *) return 1;; esac
+    fi
+    return 0
+}
+
+controller_pid_alive(){
+    pid_matches "$1" "$BASE/goshacrash.sh"
+}
+
 running_pid(){
     [ -f "$PIDFILE" ] || return 1
     p="$(cat "$PIDFILE" 2>/dev/null)"
-    case "$p" in ''|*[!0-9]*) return 1;; esac
-    kill -0 "$p" 2>/dev/null || { rm -f "$PIDFILE"; return 1; }
-    if [ -r "/proc/$p/cmdline" ]; then tr '\000' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q "$BIN" || return 1; fi
+    case "$p" in ''|*[!0-9]*) rm -f "$PIDFILE" 2>/dev/null || true; return 1;; esac
+    pid_matches "$p" "$BIN" || { rm -f "$PIDFILE" 2>/dev/null || true; return 1; }
     printf '%s\n' "$p"
 }
 
@@ -1036,8 +1071,9 @@ start_runtime(){
     kill_mihomo
     rotate_log "$MIHOMO_LOG" 2097152
     log_event INFO runtime "starting $BIN with $CONFIG"
-    if have nohup; then
-        GOGC="${GOGC:-50}" nohup "$BIN" -d "$BASE" -f "$CONFIG" </dev/null >> "$MIHOMO_LOG" 2>&1 &
+    nohup_bin="$(find_nohup 2>/dev/null)"
+    if [ -n "$nohup_bin" ]; then
+        GOGC="${GOGC:-50}" "$nohup_bin" "$BIN" -d "$BASE" -f "$CONFIG" </dev/null >> "$MIHOMO_LOG" 2>&1 &
     else
         GOGC="${GOGC:-50}" "$BIN" -d "$BASE" -f "$CONFIG" </dev/null >> "$MIHOMO_LOG" 2>&1 &
     fi
@@ -1051,13 +1087,104 @@ start_runtime(){
     ok "Mihomo запущен, PID=$p; profile=$PLATFORM"
 }
 
+start_lock_active(){
+    [ -d "$START_LOCK" ] || return 1
+    p="$(cat "$START_LOCK/pid" 2>/dev/null)"
+    if controller_pid_alive "$p"; then
+        return 0
+    fi
+    rm -rf "$START_LOCK" 2>/dev/null || true
+    return 1
+}
+
 with_start_lock(){
     if ! mkdir "$START_LOCK" 2>/dev/null; then
-        n=0; while [ -d "$START_LOCK" ] && [ "$n" -lt 20 ]; do sleep 1; n=$((n + 1)); done
-        [ -d "$START_LOCK" ] && { fail "Другой запуск GoshaCrash не завершился"; return 1; }
-        mkdir "$START_LOCK" 2>/dev/null || return 1
+        if ! start_lock_active; then
+            mkdir "$START_LOCK" 2>/dev/null || return 1
+        else
+            n=0
+            while start_lock_active && [ "$n" -lt 20 ]; do
+                sleep 1
+                n=$((n + 1))
+            done
+            start_lock_active && { fail "Другой запуск GoshaCrash не завершился"; return 1; }
+            mkdir "$START_LOCK" 2>/dev/null || return 1
+        fi
     fi
-    "$@"; rc=$?; rmdir "$START_LOCK" 2>/dev/null || true; return "$rc"
+    printf '%s\n' "$$" > "$START_LOCK/pid" 2>/dev/null || true
+    "$@"
+    rc=$?
+    rm -rf "$START_LOCK" 2>/dev/null || true
+    return "$rc"
+}
+
+control_lock_set(){
+    mkdir -p "$CONTROL_LOCK" 2>/dev/null || return 1
+    printf '%s\n' "$$" > "$CONTROL_LOCK/pid" 2>/dev/null || true
+}
+
+control_lock_clear(){ rm -rf "$CONTROL_LOCK" 2>/dev/null || true; }
+
+control_lock_active(){
+    [ -d "$CONTROL_LOCK" ] || return 1
+    p="$(cat "$CONTROL_LOCK/pid" 2>/dev/null)"
+    if controller_pid_alive "$p"; then
+        return 0
+    fi
+    rm -rf "$CONTROL_LOCK" 2>/dev/null || true
+    return 1
+}
+
+boot_pid(){
+    [ -f "$BOOT_PIDFILE" ] || return 1
+    p="$(cat "$BOOT_PIDFILE" 2>/dev/null)"
+    if pid_matches "$p" "$BASE/goshacrash.sh" " boot"; then
+        printf '%s\n' "$p"
+        return 0
+    fi
+    rm -f "$BOOT_PIDFILE" 2>/dev/null || true
+    return 1
+}
+
+boot_lock_acquire(){
+    if mkdir "$BOOT_LOCK" 2>/dev/null; then
+        printf '%s\n' "$$" > "$BOOT_LOCK/pid" 2>/dev/null || true
+        return 0
+    fi
+
+    p="$(cat "$BOOT_LOCK/pid" 2>/dev/null)"
+    if pid_matches "$p" "$BASE/goshacrash.sh" " boot"; then
+        return 1
+    fi
+
+    rm -rf "$BOOT_LOCK" 2>/dev/null || true
+    mkdir "$BOOT_LOCK" 2>/dev/null || return 1
+    printf '%s\n' "$$" > "$BOOT_LOCK/pid" 2>/dev/null || true
+    return 0
+}
+
+boot_lock_release(){
+    rm -f "$BOOT_PIDFILE" 2>/dev/null || true
+    rm -rf "$BOOT_LOCK" 2>/dev/null || true
+}
+
+cleanup_stale_runtime_state(){
+    # Files under run/ live on USB and survive a hard power cut.  A PID alone
+    # is not proof that it still belongs to GoshaCrash after the next boot.
+    running_pid >/dev/null 2>&1 || rm -f "$PIDFILE" 2>/dev/null || true
+    watchdog_pid >/dev/null 2>&1 || rm -f "$WATCHDOG_PIDFILE" 2>/dev/null || true
+    boot_pid >/dev/null 2>&1 || rm -f "$BOOT_PIDFILE" 2>/dev/null || true
+
+    # boot_lock serializes concurrent USB hooks, so these can only be stale
+    # leftovers from an interrupted controller action at this point.
+    start_lock_active >/dev/null 2>&1 || rm -rf "$START_LOCK" 2>/dev/null || true
+    control_lock_active >/dev/null 2>&1 || rm -rf "$CONTROL_LOCK" 2>/dev/null || true
+
+    # A watchdog-start lock without a live controller owner is stale too.
+    if [ -d "$WATCHDOG_START_LOCK" ]; then
+        p="$(cat "$WATCHDOG_START_LOCK/pid" 2>/dev/null)"
+        controller_pid_alive "$p" || rm -rf "$WATCHDOG_START_LOCK" 2>/dev/null || true
+    fi
 }
 
 stop_runtime(){
@@ -1066,23 +1193,74 @@ stop_runtime(){
     rm -f "$BOOT_PIDFILE" 2>/dev/null || true
 }
 
-watchdog_pid(){ [ -f "$WATCHDOG_PIDFILE" ] || return 1; p="$(cat "$WATCHDOG_PIDFILE" 2>/dev/null)"; case "$p" in ''|*[!0-9]*) return 1;; esac; kill -0 "$p" 2>/dev/null || { rm -f "$WATCHDOG_PIDFILE"; return 1; }; printf '%s\n' "$p"; }
-watchdog_stop(){ if p="$(watchdog_pid)"; then kill "$p" 2>/dev/null || true; sleep 1; kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true; fi; rm -f "$WATCHDOG_PIDFILE"; }
+watchdog_pid(){
+    [ -f "$WATCHDOG_PIDFILE" ] || return 1
+    p="$(cat "$WATCHDOG_PIDFILE" 2>/dev/null)"
+    if pid_matches "$p" "$BASE/goshacrash.sh" " watchdog-loop"; then
+        printf '%s\n' "$p"
+        return 0
+    fi
+    rm -f "$WATCHDOG_PIDFILE" 2>/dev/null || true
+    return 1
+}
+
+watchdog_stop(){
+    if p="$(watchdog_pid)"; then
+        kill "$p" 2>/dev/null || true
+        sleep 1
+        pid_matches "$p" "$BASE/goshacrash.sh" " watchdog-loop" && kill -9 "$p" 2>/dev/null || true
+    fi
+    rm -f "$WATCHDOG_PIDFILE" 2>/dev/null || true
+    rm -rf "$WATCHDOG_START_LOCK" 2>/dev/null || true
+}
+
 watchdog_start(){
     [ -f "$MANUAL_STOP" ] && return 0
     watchdog_pid >/dev/null 2>&1 && return 0
-    if have nohup; then
-      GOSHACRASH_BASE="$BASE" nohup "$BASE/goshacrash.sh" watchdog-loop </dev/null >/dev/null 2>&1 &
-    else
-      GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" watchdog-loop </dev/null >/dev/null 2>&1 &
+
+    if ! mkdir "$WATCHDOG_START_LOCK" 2>/dev/null; then
+        watchdog_pid >/dev/null 2>&1 && return 0
+        p="$(cat "$WATCHDOG_START_LOCK/pid" 2>/dev/null)"
+        if controller_pid_alive "$p"; then
+            sleep 1
+            watchdog_pid >/dev/null 2>&1 && return 0
+            return 1
+        fi
+        rm -rf "$WATCHDOG_START_LOCK" 2>/dev/null || true
+        mkdir "$WATCHDOG_START_LOCK" 2>/dev/null || return 1
     fi
-    p=$!; echo "$p" > "$WATCHDOG_PIDFILE"; sleep 1
-    kill -0 "$p" 2>/dev/null || { rm -f "$WATCHDOG_PIDFILE"; return 1; }
+    printf '%s\n' "$$" > "$WATCHDOG_START_LOCK/pid" 2>/dev/null || true
+
+    watchdog_pid >/dev/null 2>&1 && { rm -rf "$WATCHDOG_START_LOCK" 2>/dev/null || true; return 0; }
+    rotate_log "$WATCHDOG_LOG" 1048576
+    printf '[%s] watchdog: launch requested by pid=%s\n' "$(now)" "$$" >> "$WATCHDOG_LOG" 2>/dev/null || true
+
+    nohup_bin="$(find_nohup 2>/dev/null)"
+    if [ -n "$nohup_bin" ]; then
+        GOSHACRASH_BASE="$BASE" "$nohup_bin" /bin/sh "$BASE/goshacrash.sh" watchdog-loop </dev/null >> "$WATCHDOG_LOG" 2>&1 &
+    else
+        GOSHACRASH_BASE="$BASE" /bin/sh "$BASE/goshacrash.sh" watchdog-loop </dev/null >> "$WATCHDOG_LOG" 2>&1 &
+    fi
+    p=$!
+    printf '%s\n' "$p" > "$WATCHDOG_PIDFILE" 2>/dev/null || true
+    sleep 1
+
+    if ! pid_matches "$p" "$BASE/goshacrash.sh" " watchdog-loop"; then
+        printf '[%s] watchdog: launch failed, pid=%s is not watchdog-loop\n' "$(now)" "$p" >> "$WATCHDOG_LOG" 2>/dev/null || true
+        test "$(cat "$WATCHDOG_PIDFILE" 2>/dev/null)" = "$p" && rm -f "$WATCHDOG_PIDFILE" 2>/dev/null || true
+        rm -rf "$WATCHDOG_START_LOCK" 2>/dev/null || true
+        return 1
+    fi
+
+    printf '[%s] watchdog: started pid=%s\n' "$(now)" "$p" >> "$WATCHDOG_LOG" 2>/dev/null || true
+    rm -rf "$WATCHDOG_START_LOCK" 2>/dev/null || true
+    return 0
 }
+
 watchdog_check(){
     [ -f "$MANUAL_STOP" ] && return 0
-    [ -d "$CONTROL_LOCK" ] && return 0
-    [ -d "$START_LOCK" ] && return 0
+    control_lock_active && return 0
+    start_lock_active && return 0
     watchdog_connectivity_step || true
     [ -f "$WAN_OFFLINE" ] && return 0
     if ! running_pid >/dev/null 2>&1; then
@@ -1102,11 +1280,20 @@ watchdog_check(){
       fi
     fi
 }
+
 watchdog_loop(){
     ensure_dirs || exit 1
-    echo "$$" > "$WATCHDOG_PIDFILE"
-    trap 'rm -f "$WATCHDOG_PIDFILE"; exit 0' HUP INT TERM
-    while :; do sleep "$WATCHDOG_INTERVAL"; watchdog_check; done
+    printf '%s\n' "$$" > "$WATCHDOG_PIDFILE" 2>/dev/null || exit 1
+    printf '[%s] watchdog: loop entered pid=%s interval=%ss\n' "$(now)" "$$" "$WATCHDOG_INTERVAL" >> "$WATCHDOG_LOG" 2>/dev/null || true
+    trap 'printf "[%s] watchdog: loop stopping pid=%s\n" "$(now)" "$$" >> "$WATCHDOG_LOG" 2>/dev/null || true; rm -f "$WATCHDOG_PIDFILE" 2>/dev/null || true; exit 0' HUP INT TERM
+
+    # Do not sleep first: after a hard power cut recovery must start as soon as
+    # the controller reaches the watchdog, not one interval later.
+    watchdog_check
+    while :; do
+        sleep "$WATCHDOG_INTERVAL"
+        watchdog_check
+    done
 }
 
 start(){
@@ -1115,7 +1302,7 @@ start(){
     refresh_path
 
     rm -f "$MANUAL_STOP"
-    mkdir "$CONTROL_LOCK" 2>/dev/null || true
+    control_lock_set || true
 
     if internet_probe_once; then
         wan_mark_online
@@ -1136,13 +1323,13 @@ start(){
         warn "WAN действительно недоступен: Mihomo остановлен, watchdog ждёт восстановления"
     fi
 
-    rmdir "$CONTROL_LOCK" 2>/dev/null || true
+    control_lock_clear
     watchdog_start
     return "$rc"
 }
 stop(){
-    ensure_dirs || return 1; load_platform || true; touch "$MANUAL_STOP"; mkdir "$CONTROL_LOCK" 2>/dev/null || true
-    watchdog_stop; stop_runtime; rmdir "$CONTROL_LOCK" 2>/dev/null || true; ok "Mihomo остановлен; обычный DIRECT восстановлен"
+    ensure_dirs || return 1; load_platform || true; touch "$MANUAL_STOP"; control_lock_set || true
+    watchdog_stop; stop_runtime; control_lock_clear; ok "Mihomo остановлен; обычный DIRECT восстановлен"
 }
 
 service_stop(){
@@ -1151,10 +1338,10 @@ service_stop(){
     # otherwise the next boot would intentionally skip autostart.
     ensure_dirs || return 1
     load_platform || true
-    mkdir "$CONTROL_LOCK" 2>/dev/null || true
+    control_lock_set || true
     watchdog_stop
     stop_runtime
-    rmdir "$CONTROL_LOCK" 2>/dev/null || true
+    control_lock_clear
     return 0
 }
 restart(){
@@ -1166,7 +1353,7 @@ restart(){
     backup_config >/dev/null 2>&1 || true
 
     rm -f "$MANUAL_STOP"
-    mkdir "$CONTROL_LOCK" 2>/dev/null || true
+    control_lock_set || true
     watchdog_stop
     stop_runtime
 
@@ -1186,7 +1373,7 @@ restart(){
         warn "WAN действительно недоступен: Mihomo оставлен остановленным; watchdog запустит его после восстановления"
     fi
 
-    rmdir "$CONTROL_LOCK" 2>/dev/null || true
+    control_lock_clear
     watchdog_start
 
     [ "$rc" -eq 0 ] && return 0
@@ -1218,22 +1405,31 @@ boot(){
     load_platform || return 1
     refresh_path
 
-    [ -f "$MANUAL_STOP" ] && return 0
-
-    if [ -f "$BOOT_PIDFILE" ]; then
-        old="$(cat "$BOOT_PIDFILE" 2>/dev/null)"
-        case "$old" in ''|*[!0-9]*) old="";; esac
-        [ -n "$old" ] && kill -0 "$old" 2>/dev/null && return 0
+    if [ -f "$MANUAL_STOP" ]; then
+        printf '[%s] boot: manual-stop present; autostart skipped\n' "$(now)"
+        return 0
     fi
 
-    echo "$$" > "$BOOT_PIDFILE"
+    if ! boot_lock_acquire; then
+        printf '[%s] boot: another valid boot worker is already running; duplicate hook ignored\n' "$(now)"
+        return 0
+    fi
+    printf '%s\n' "$$" > "$BOOT_PIDFILE" 2>/dev/null || true
+    trap 'boot_lock_release; exit 0' HUP INT TERM
+
+    printf '[%s] boot: entered pid=%s profile=%s\n' "$(now)" "$$" "${PLATFORM:-unknown}"
+    cleanup_stale_runtime_state
+
     repair_opt >/dev/null 2>&1 || {
         log_event ERROR boot "Optware namespace not ready"
-        rm -f "$BOOT_PIDFILE"
-        watchdog_start
+        printf '[%s] boot: Optware namespace not ready; watchdog fallback requested\n' "$(now)"
+        watchdog_start || true
+        boot_lock_release
+        trap - HUP INT TERM
         return 0
     }
     refresh_path
+    printf '[%s] boot: Optware namespace ready\n' "$(now)"
 
     waited=0
     while ! main_default_route; do
@@ -1241,24 +1437,50 @@ boot(){
         sleep 5
         waited=$((waited + 5))
     done
-
-    if [ "${LEGACY:-1}" = 0 ]; then
-        ensure_tun || log_event WARN boot "TUN device is not ready yet"
-        wait_modern_uplink "$BOOT_WAIT" || log_event WARN boot "modern uplink did not become stable within ${BOOT_WAIT}s"
+    if main_default_route; then
+        printf '[%s] boot: default route ready after %ss\n' "$(now)" "$waited"
+    else
+        printf '[%s] boot: default route still missing after %ss\n' "$(now)" "$waited"
     fi
 
-    rm -f "$BOOT_PIDFILE"
+    if [ "${LEGACY:-1}" = 0 ]; then
+        if ensure_tun; then
+            printf '[%s] boot: /dev/net/tun ready\n' "$(now)"
+        else
+            log_event WARN boot "TUN device is not ready yet"
+            printf '[%s] boot: TUN device not ready yet\n' "$(now)"
+        fi
+        if wait_modern_uplink "$BOOT_WAIT"; then
+            printf '[%s] boot: modern physical uplink stable\n' "$(now)"
+        else
+            log_event WARN boot "modern uplink did not become stable within ${BOOT_WAIT}s"
+            printf '[%s] boot: modern uplink not stable within %ss\n' "$(now)" "$BOOT_WAIT"
+        fi
+    fi
 
     if internet_probe_once || wan_nvram_up; then
         rm -f "$WAN_OFFLINE" 2>/dev/null || true
         set_wan_state checking
+        printf '[%s] boot: WAN available; starting runtime\n' "$(now)"
         start
-    else
-        wan_mark_offline
-        stop_runtime
-        watchdog_start
-        return 0
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            printf '[%s] boot: runtime start path completed\n' "$(now)"
+        else
+            printf '[%s] boot: runtime start returned rc=%s; watchdog left enabled\n' "$(now)" "$rc"
+        fi
+        boot_lock_release
+        trap - HUP INT TERM
+        return "$rc"
     fi
+
+    wan_mark_offline
+    stop_runtime
+    printf '[%s] boot: WAN unavailable; runtime kept DIRECT and watchdog enabled\n' "$(now)"
+    watchdog_start || true
+    boot_lock_release
+    trap - HUP INT TERM
+    return 0
 }
 firewall_reload(){
     load_platform || return 0
@@ -1879,9 +2101,15 @@ autostart_status(){
     ensure_dirs >/dev/null 2>&1 || true; load_platform >/dev/null 2>&1 || true
     echo "Autostart (stock ASUSWRT)"
     [ -x /jffs/addons/goshacrash/start.sh ] && echo "  start.sh: OK" || echo "  start.sh: FAIL"
+    if grep -q 'GoshaCrash autostart hook 3.10.2-rc23' /jffs/addons/goshacrash/start.sh 2>/dev/null; then
+        echo "  start.sh version: rc23"
+    else
+        echo "  start.sh version: old/unknown"
+    fi
     [ -x /jffs/scripts/usb-mount-script ] && echo "  usb-mount-script: OK" || echo "  usb-mount-script: FAIL"
     [ -x "$DM_ROOT/etc/init.d/S50usb-mount-script" ] && echo "  ASUS app bridge: OK" || echo "  ASUS app bridge: FAIL"
     [ -f "$STATE/autostart-hook-ran" ] && echo "  last hook: $(cat "$STATE/autostart-hook-ran" 2>/dev/null)" || echo "  last hook: never"
+    [ -f /jffs/addons/goshacrash/coldboot.log ] && echo "  coldboot trace: /jffs/addons/goshacrash/coldboot.log" || echo "  coldboot trace: not written yet"
     [ -f "$MANUAL_STOP" ] && echo "  manual-stop: YES" || echo "  manual-stop: no"
     return 0
 }
@@ -1999,7 +2227,7 @@ doctor(){
 }
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.10.2-rc22 — что буквально вводить в SSH
+GoshaCrash 3.10.2-rc23 — что буквально вводить в SSH
 
 КАТАЛОГ УСТАНОВКИ
   BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
@@ -2014,6 +2242,13 @@ GoshaCrash 3.10.2-rc22 — что буквально вводить в SSH
 
 ПОЛНАЯ ДИАГНОСТИКА
   gc doctor
+
+АВТОЗАПУСК / COLD BOOT
+  gc autostart status
+  cat /jffs/addons/goshacrash/coldboot.log
+  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  tail -n 100 "$BASE/logs/boot.log"
+  tail -n 100 "$BASE/logs/watchdog.log"
 
 ПРОВЕРИТЬ ТОЛЬКО INTERNET PROBE
   gc internet-probe

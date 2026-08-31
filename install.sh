@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc22"
+INSTALLER_VERSION="3.10.2-rc24"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -1929,8 +1929,33 @@ choose_routing_mode(){
 
 install_controller(){
     tmp="$TMP_ROOT/goshacrash.sh"
-    fetch_repo_file goshacrash.sh "$tmp" || { fail "Не удалось скачать goshacrash.sh"; return 1; }
-    test "$(sed -n '1p' "$tmp" 2>/dev/null)" = '#!/bin/sh' || { fail "goshacrash.sh скачан неверно"; return 1; }
+    rm -f "$tmp" 2>/dev/null || true
+
+    # When install.sh is run from an extracted release archive, prefer the
+    # sibling controller only if its version exactly matches this installer.
+    # A lone /tmp/install.sh therefore cannot accidentally pick up an older
+    # goshacrash.sh left from a previous test.
+    self_dir="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
+    local_controller="$self_dir/goshacrash.sh"
+    local_version=""
+    if test -f "$local_controller"; then
+        local_version="$(awk -F'"' '/^VERSION="/ {print $2; exit}' "$local_controller" 2>/dev/null)"
+    fi
+    if test -n "$local_version" && test "$local_version" = "$INSTALLER_VERSION"; then
+        cp -f "$local_controller" "$tmp" || return 1
+        say "Использую goshacrash.sh из локальной сборки $INSTALLER_VERSION"
+    else
+        fetch_repo_file goshacrash.sh "$tmp" || { fail "Не удалось скачать goshacrash.sh"; return 1; }
+    fi
+
+    test "$(sed -n '1p' "$tmp" 2>/dev/null)" = '#!/bin/sh' || { fail "goshacrash.sh получен неверно"; return 1; }
+    controller_version="$(awk -F'"' '/^VERSION="/ {print $2; exit}' "$tmp" 2>/dev/null)"
+    if test "$controller_version" != "$INSTALLER_VERSION"; then
+        fail "Несовпадение версии: install.sh=$INSTALLER_VERSION, goshacrash.sh=${controller_version:-unknown}"
+        fail "Обнови install.sh и goshacrash.sh одновременно и повтори установку"
+        return 1
+    fi
+
     if /bin/sh -n /dev/null >/dev/null 2>&1; then
         /bin/sh -n "$tmp" || { fail "Синтаксическая ошибка в goshacrash.sh"; return 1; }
     else
@@ -2415,11 +2440,16 @@ install_stock_usb_mount_bridge(){
     mkdir -p "$DM_ROOT/etc/init.d" "$DM_ROOT/lib/ipkg/info" || return 1
     cat > "$DM_ROOT/etc/init.d/S50usb-mount-script" <<'HOOK'
 #!/bin/sh
+# GoshaCrash Download Master bridge 3.10.2-rc24
+unset LD_LIBRARY_PATH 2>/dev/null || true
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 mount="$(df "$(readlink -f "$0")" | grep -v '^Filesystem' | head -n 1 | awk '{print $1, $6}')"
 device="$(echo "$mount" | awk '{print $1}')"
 mount="$(echo "$mount" | awk '{print $2}')"
 case "$1" in
   start)
+    printf '[%s] [dm-bridge pid=%s] start device=%s mount=%s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$device" "$mount" >> /jffs/addons/goshacrash/coldboot.log 2>/dev/null || true
     if test -x /jffs/scripts/usb-mount-script; then
       /jffs/scripts/usb-mount-script "$device" "$mount" &
     fi
@@ -2500,34 +2530,55 @@ install_hooks(){
 
     cat > "$JFFS_DIR/start.sh" <<'HOOK'
 #!/bin/sh
+# GoshaCrash autostart hook 3.10.2-rc24
+unset LD_LIBRARY_PATH 2>/dev/null || true
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 BASE_FILE=/jffs/addons/goshacrash/base
+TRACE=/jffs/addons/goshacrash/coldboot.log
 WAITED=0
+trace(){
+  printf '[%s] [start.sh pid=%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$*" >> "$TRACE" 2>/dev/null || true
+}
+trace "entered"
 BASE="$(cat "$BASE_FILE" 2>/dev/null)"
 while test -z "$BASE" || test ! -x "$BASE/goshacrash.sh"; do
-  test "$WAITED" -ge 300 && exit 0
+  if test "$WAITED" -ge 300; then
+    trace "timeout waiting for USB/controller; base=${BASE:-empty}"
+    exit 0
+  fi
   sleep 5
   WAITED=$((WAITED + 5))
   BASE="$(cat "$BASE_FILE" 2>/dev/null)"
 done
-mkdir -p "$BASE/run" "$BASE/state" 2>/dev/null || true
+trace "controller ready after ${WAITED}s; base=$BASE"
+mkdir -p "$BASE/run" "$BASE/state" "$BASE/logs" 2>/dev/null || true
 date '+%Y-%m-%d %H:%M:%S' > "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-mkdir -p "$BASE/logs" 2>/dev/null || true
-printf '[%s] autostart hook: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
+printf '[%s] autostart hook rc24: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
 NOHUP=""
 for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup; do
   test -x "$p" && { NOHUP="$p"; break; }
 done
 if test -n "$NOHUP"; then
-  GOSHACRASH_BASE="$BASE" "$NOHUP" "$BASE/goshacrash.sh" boot </dev/null >> "$BASE/logs/boot.log" 2>&1 &
+  GOSHACRASH_BASE="$BASE" "$NOHUP" /bin/sh "$BASE/goshacrash.sh" boot </dev/null >> "$BASE/logs/boot.log" 2>&1 &
 else
-  GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" boot </dev/null >> "$BASE/logs/boot.log" 2>&1 &
+  GOSHACRASH_BASE="$BASE" /bin/sh "$BASE/goshacrash.sh" boot </dev/null >> "$BASE/logs/boot.log" 2>&1 &
 fi
+child=$!
+trace "boot worker launched pid=$child"
+exit 0
 HOOK
     chmod 755 "$JFFS_DIR/start.sh" || return 1
 
     cat > /jffs/scripts/usb-mount-script <<'HOOK'
 #!/bin/sh
+# GoshaCrash USB hook 3.10.2-rc24
+unset LD_LIBRARY_PATH 2>/dev/null || true
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 MOUNT_POINT="$2"
+TRACE=/jffs/addons/goshacrash/coldboot.log
+printf '[%s] [usb-mount pid=%s] device=%s mount=%s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$1" "$MOUNT_POINT" >> "$TRACE" 2>/dev/null || true
 BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
 test -n "$BASE" || exit 0
 case "$BASE" in
@@ -2548,6 +2599,7 @@ case "$BASE" in
       fi
       touch "$DM/.asusrouter" 2>/dev/null || true
     fi
+    printf '[%s] [usb-mount pid=%s] dispatch start.sh base=%s dm=%s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$BASE" "${DM:-none}" >> "$TRACE" 2>/dev/null || true
     /jffs/addons/goshacrash/start.sh &
     ;;
 esac
@@ -2557,6 +2609,10 @@ HOOK
 
     cat > /jffs/scripts/usb-umount-script <<'HOOK'
 #!/bin/sh
+# GoshaCrash USB unmount hook 3.10.2-rc24
+unset LD_LIBRARY_PATH 2>/dev/null || true
+PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH
 MOUNT_POINT="$2"
 BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
 test -n "$BASE" || exit 0
@@ -2727,7 +2783,10 @@ main(){
         return 1
     }
     BASE="${INSTALL_DIR:-$USB_MOUNT/goshacrash}"
-    mkdir -p "$TMP_ROOT" "$BASE/bin" "$BASE/ui" "$BASE/logs" "$BASE/run" "$BASE/state" "$BASE/backups" "$BASE/rulesets" "$BASE/proxies" || return 1
+    mkdir -p "$TMP_ROOT" "$BASE/bin" "$BASE/ui" "$BASE/logs" "$BASE/run" "$BASE/state" "$BASE/backups" || return 1
+    # rc24: these directories were never used by GoshaCrash. Remove legacy
+    # empty copies from older builds, but never delete user files.
+    rmdir "$BASE/rulesets" "$BASE/proxies" 2>/dev/null || true
     save_install_log
 
     say "GoshaCrash installer $INSTALLER_VERSION"

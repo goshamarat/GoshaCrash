@@ -1,10 +1,17 @@
 # GoshaCrash
 
+
+## rc24: clean install layout
+
+`rulesets/` and `proxies/` were removed from the directories created automatically by GoshaCrash.
+They were not referenced anywhere by the installer, controller, generated config, or runtime.
+If a custom Mihomo config needs local provider files, the user can create any desired directory explicitly.
+
 GoshaCrash — установщик и контроллер Mihomo для ASUSWRT с Zashboard, TUN-маршрутизацией, watchdog, автозапуском и вспомогательными утилитами.
 
 Этот RC в первую очередь проверяется на **ASUS RT-AC68U** со старым ASUSWRT / Linux 2.6.36. Для legacy-профиля используется **Mihomo ARMv5 + gVisor**.
 
-> **Тестовая версия:** 3.10.2-rc21  
+> **Тестовая версия:** 3.10.2-rc24  
 > Не публикуйте её как универсально стабильную для всех ASUS до проверки новых ARM64-моделей.
 
 ## Что уже проверено на RT-AC68U
@@ -853,3 +860,22 @@ rc21 переносит в installer ровно ту последователь�
 - Из staging копируется только `opt/share/terminfo`. На реальном BT10 в нём подтверждены `x/xterm`, `x/xterm-256color` и `v/vt100`; после копирования обычный `nano` с `TERM=xterm-256color` запускается нормально.
 - В terminfo-проверках больше нет `find -type`/`find -path`: BusyBox 1.24.1 на BT10 этих predicates не поддерживает. Проверяются конкретные compiled entries.
 - Runtime после reboot создаёт тот же полный Optware layout, а `gc doctor` проверяет terminfo по файлам и не запускает несовместимый `infocmp`.
+
+
+### rc22: меню без мерцания
+
+Интерактивное меню больше не выполняет `ESC[2J` на каждое нажатие стрелки. При навигации перерисовываются только две строки: предыдущий и новый выбранный пункт. Полная перерисовка остаётся при первом входе в меню и после выполнения действия. Курсор скрывается на время навигации и обязательно восстанавливается перед запуском редактора/команды и при выходе.
+
+### rc23: cold-boot автозапуск и watchdog
+
+rc23 закрывает класс ошибок, которые проявляются именно после полного обесточивания роутера, когда файлы в `goshacrash/run` переживают старые процессы.
+
+- `watchdog.pid`, `mihomo.pid` и `boot.pid` больше не считаются валидными только по `kill -0`: PID сверяется с `/proc/<pid>/cmdline`. Повторное использование номера PID другим процессом после power-cycle не даёт ложный статус `Watchdog: работает`.
+- `boot` сериализован через `run/boot.lock`; owner PID проверяется, stale lock после жёсткого выключения удаляется, а параллельные USB hooks не запускают два boot worker одновременно.
+- `start.lock` и `control.lock` теперь содержат PID владельца. Watchdog автоматически выбрасывает stale lock вместо вечного пропуска recovery.
+- Watchdog пишет `launch requested`, `loop entered`, `started` и сразу выполняет первый health/recovery check, не ожидая первый 10-секундный интервал.
+- Для запуска фоновых процессов сначала используются firmware `nohup` (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`), и только затем Optware.
+- Независимый trace `/jffs/addons/goshacrash/coldboot.log` фиксирует этапы `Download Master bridge -> usb-mount-script -> start.sh`. Он остаётся доступен даже если USB/runtime ещё не был готов.
+- `logs/boot.log` теперь показывает этапы `/opt`, default route, `/dev/net/tun`, стабильного физического uplink и результат запуска runtime.
+- Installer каждый раз перезаписывает hooks rc23 и проверяет, что версия скачанного `goshacrash.sh` точно совпадает с `install.sh`; смешанная установка rc21/rc22/rc23 останавливается с ошибкой.
+- Исправление меню без мерцания из rc22 сохранено.
