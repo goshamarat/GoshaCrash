@@ -1,32 +1,31 @@
-# GoshaCrash 3.10.2-rc26
+# GoshaCrash 3.10.2-rc28
 
 Consolidated test build for ASUS RT-AC68U and ZenWiFi BT10.
 
-Key rc26 changes:
-- modern Mihomo pinned to v1.19.30; no mutable latest API selection;
-- pre-install ELF architecture guard for armv7/arm64/x86_64;
-- broken/wrong core cannot replace a working binary;
-- cold-boot locks are bound to the current Linux boot ID, not PID alone;
-- watchdog is launched early by boot() and skips recovery while the boot worker owns BOOT_LOCK;
-- stale USB lock directories from a previous power cycle are removed even if their old PID was reused;
-- controller/watchdog PID validation still checks /proc/PID/cmdline;
-- install hooks are always rewritten as rc26 and gc autostart status reports hook/controller MATCH or MISMATCH;
-- online controller download validates VERSION on every mirror and continues past stale CDN/cache responses;
-- extracted release archives use their matching local goshacrash.sh and local assets/gcnet-armv5;
-- rulesets/ and proxies/ are not created; old empty copies are removed with rmdir only;
-- rc22 incremental menu redraw is retained;
-- rc21 BT10 Optware namespace, SFTP libexec, and offline terminfo extraction path are retained.
+Key rc28 changes:
+- menu header uses MIHOMO: and TUN: labels; PROFILE MODERN is removed;
+- all menu rows are fixed to 45 visible columns; incremental arrow repaint is retained;
+- Edit config and Restart are fully separated: edit validates with Mihomo -t and never restarts;
+- invalid edits are backed up separately and the previous valid config is restored;
+- generated config.yaml is UTF-8 without BOM with Russian comments;
+- nano is launched with a scoped UTF-8 locale and the scoped Optware runtime library path;
+- persistent /jffs/addons/goshacrash is removed; runtime data/logs stay under the USB GoshaCrash directory;
+- standard ASUS /jffs/scripts hooks remain because firmware calls them;
+- modern Mihomo remains pinned to v1.19.30 with ELF architecture guard;
+- cold-boot boot-ID lock/watchdog hardening from rc25/rc26 is retained;
+- rulesets/ and proxies/ are not created; old empty copies are removed with rmdir only.
 
 Validation performed for this artifact:
-- bash -n install.sh + goshacrash.sh
-- dash -n install.sh + goshacrash.sh
-- BusyBox ash -n install.sh + goshacrash.sh
-- install.sh --help reports 3.10.2-rc26
-- goshacrash.sh version reports 3.10.2-rc26
-- boot-token/lock test verifies that a lock stamped with another boot ID is treated as stale and removed
+- bash -n, dash -n and BusyBox ash -n for install.sh and goshacrash.sh
+- generated USB mount, USB unmount and Download Master bridge hooks pass bash/dash/ash syntax checks
+- interactive menu render verified at exactly 45 visible columns on all 16 rows
+- edit-config harness verified that valid edits do not call restart
+- edit-config validation uses only a volatile /tmp rollback copy; no persistent backup is created
+- generated source files decode as UTF-8 and contain no UTF-8 BOM
+- install.sh --help and goshacrash.sh version report 3.10.2-rc28
 - no BusyBox-incompatible find -type or find -path in executable shell code
 - ZIP integrity tested with unzip -t
 
 Real-router status:
-- RT-AC68U: rc12 lineage is the last fully end-to-end tested legacy baseline; rc26 keeps the same legacy package/routing model with generic lock hardening.
-- ZenWiFi BT10: package path, writable /opt bind, SFTP payload, terminfo/nano, ARMv7 Mihomo, TUN, and auto routing were proven manually. rc26 cold power-cycle behavior still requires a real-router power-off/power-on test before calling the build stable.
+- RT-AC68U: rc12 lineage is the last fully end-to-end tested legacy baseline; rc28 keeps the same legacy package/routing model.
+- ZenWiFi BT10: package path, writable /opt bind, SFTP payload, terminfo/nano, ARMv7 Mihomo, TUN, and auto routing were proven manually. rc28 menu/edit/JFFS cleanup still requires real-router verification after install/reboot/power-cycle before calling the build stable.

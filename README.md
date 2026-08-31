@@ -1,22 +1,24 @@
 # GoshaCrash
 
-## rc26: pinned Mihomo + ELF architecture guard
+## rc28: меню, безопасное редактирование config.yaml и чистая структура
 
-- Modern Mihomo is pinned to immutable `v1.19.30` instead of GitHub `latest`.
-- BT10 `armv7l` accepts only a 32-bit ARM ELF before the core can replace the installed binary.
-- ARM64/x86_64 targets receive the corresponding ELF-class/machine guard.
-- A downloaded gzip/HTML/wrong-architecture payload is rejected before installation.
-- A broken current core is not copied into `backups/mihomo.previous`; the new core is staged and executed successfully before the atomic replacement.
-- Runtime reports an explicit architecture mismatch instead of the opaque BusyBox `line 1: syntax error`.
+- Верхняя строка меню теперь показывает `MIHOMO: ONLINE/OFFLINE` и `TUN: UP/DOWN`; двоеточия добавлены, `PROFILE MODERN` убран как неинформативный.
+- Все 16 строк рамки меню имеют одинаковую видимую ширину 45 колонок; правые вертикальные границы больше не съезжают.
+- Стрелки по-прежнему перерисовывают только старый и новый пункт без полного `clear`.
+- `Edit config` больше **не перезапускает Mihomo**. После выхода из nano выполняется штатная проверка `mihomo -t -d <base> -f config.yaml`, затем меню возвращается автоматически. Применение — отдельным пунктом `Restart`.
+- Если проверка не прошла, предыдущий `config.yaml` восстанавливается из временной копии в `/tmp`. Неудачная правка и постоянный backup не сохраняются.
+- Базовый `config.yaml` создаётся как UTF-8 без BOM, комментарии переведены на русский; nano запускается со scoped UTF-8 locale и scoped Optware library path.
+- Убран отдельный `/jffs/addons/goshacrash`: persistent state/логи остаются внутри каталога GoshaCrash. Снаружи остаются только стандартные ASUS hooks/wrappers в `/jffs/scripts` и PATH-строки в стандартных profile-файлах.
+- Modern Mihomo остаётся закреплён на `v1.19.30` с ELF-проверкой архитектуры из rc26.
 
 
 ## rc25 lineage: consolidated cold-boot + installer build
 
-rc26 собирает в одну версию исправления BT10, меню и структуры каталогов, а также закрывает несколько проблем обновления:
+rc28 собирает в одну версию исправления BT10, меню и структуры каталогов, а также закрывает несколько проблем обновления:
 
 - lock-каталоги на USB теперь привязаны к **текущей загрузке Linux** через `/proc/sys/kernel/random/boot_id`; PID после полного power-cycle больше не может случайно сделать старый lock «живым»;
 - watchdog запускается в самом начале boot worker и после завершения boot-пути берёт recovery на себя; пока boot worker активен, watchdog не гоняет параллельный start;
-- `start.sh`, USB hook и Download Master bridge при каждой установке перезаписываются актуальной версией;
+- USB hook и Download Master bridge при каждой установке перезаписываются актуальной версией;
 - `gc autostart status` показывает реальную версию hook и MATCH/MISMATCH с controller;
 - online installer проверяет версию `goshacrash.sh` **на каждом зеркале** и не принимает устаревший файл из CDN/cache;
 - локальный release ZIP использует лежащие рядом `goshacrash.sh` и `assets/gcnet-armv5`, а не скачивает их повторно;
@@ -34,13 +36,13 @@ HOME=/tmp/goshacrash-wget /usr/sbin/wget --no-check-certificate -O - \
   'https://raw.githubusercontent.com/goshamarat/GoshaCrash/refs/heads/main/install.sh' | /bin/sh
 ```
 
-Перед online install в `main` должны быть одновременно загружены **оба** файла rc26: `install.sh` и `goshacrash.sh`. Если одно зеркало ещё отдаёт старый controller, installer попробует следующее; несовпадающая версия не устанавливается.
+Перед online install в `main` должны быть одновременно загружены **оба** файла rc28: `install.sh` и `goshacrash.sh`. Если одно зеркало ещё отдаёт старый controller, installer попробует следующее; несовпадающая версия не устанавливается.
 
 GoshaCrash — установщик и контроллер Mihomo для ASUSWRT с Zashboard, TUN-маршрутизацией, watchdog, автозапуском и вспомогательными утилитами.
 
 Этот RC в первую очередь проверяется на **ASUS RT-AC68U** со старым ASUSWRT / Linux 2.6.36. Для legacy-профиля используется **Mihomo ARMv5 + gVisor**.
 
-> **Тестовая версия:** 3.10.2-rc26  
+> **Тестовая версия:** 3.10.2-rc28  
 > Не публикуйте её как универсально стабильную для всех ASUS до проверки новых ARM64-моделей.
 
 ## Что уже проверено на RT-AC68U
@@ -913,7 +915,12 @@ rc23 закрывает класс ошибок, которые проявляю
 - `start.lock` и `control.lock` теперь содержат PID владельца. Watchdog автоматически выбрасывает stale lock вместо вечного пропуска recovery.
 - Watchdog пишет `launch requested`, `loop entered`, `started` и сразу выполняет первый health/recovery check, не ожидая первый 10-секундный интервал.
 - Для запуска фоновых процессов сначала используются firmware `nohup` (`/usr/bin`, `/bin`, `/usr/sbin`, `/sbin`), и только затем Optware.
-- Независимый trace `/jffs/addons/goshacrash/coldboot.log` фиксирует этапы `Download Master bridge -> usb-mount-script -> start.sh`. Он остаётся доступен даже если USB/runtime ещё не был готов.
+- Cold-boot trace хранится внутри установки: `goshacrash/logs/coldboot.log`. Download Master bridge сначала пишет раннюю отметку в `/tmp`, а USB hook переносит её в постоянный лог на USB.
 - `logs/boot.log` теперь показывает этапы `/opt`, default route, `/dev/net/tun`, стабильного физического uplink и результат запуска runtime.
 - Installer каждый раз перезаписывает актуальные hooks и проверяет, что версия скачанного `goshacrash.sh` точно совпадает с `install.sh`; смешанная установка разных версий останавливается с ошибкой.
 - Исправление меню без мерцания из rc22 сохранено.
+
+
+## rc28: без постоянных backup-файлов
+
+GoshaCrash больше не создаёт `backups/`. Для безопасного отката во время проверки config/routing используется только временная копия в `/tmp`, которая удаляется сразу после операции. Пустой старый `backups/` от предыдущих RC удаляется при установке; непустой каталог автоматически не удаляется.

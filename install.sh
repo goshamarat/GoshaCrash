@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc26"
+INSTALLER_VERSION="3.10.2-rc28"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -1984,7 +1984,6 @@ install_controller(){
     else
         say "Firmware /bin/sh не поддерживает -n; syntax precheck пропущен"
     fi
-    test -f "$BASE/goshacrash.sh" && cp -f "$BASE/goshacrash.sh" "$BASE/backups/goshacrash.sh.previous" 2>/dev/null || true
     mv -f "$tmp" "$BASE/goshacrash.sh" || return 1
     chmod 755 "$BASE/goshacrash.sh" || return 1
 }
@@ -2106,19 +2105,22 @@ generate_base_config(){
     test -n "$secret" || { fail "Не удалось создать secret для Zashboard"; return 1; }
 
     cat > "$file" <<EOF
-# GoshaCrash base configuration.
-# Сгенерирован install.sh под текущую архитектуру роутера.
-# Это безопасная DIRECT-заглушка: VPN включится после добавления своих proxy/rules.
+# Базовая конфигурация GoshaCrash. Кодировка файла: UTF-8 без BOM.
+# Сгенерирована install.sh под текущую архитектуру и режим маршрутизации роутера.
+# По умолчанию трафик идёт напрямую (DIRECT). Добавь свои proxy / proxy-groups / rules.
 
+# Веб-интерфейс Zashboard и локальный API Mihomo.
 external-controller: 0.0.0.0:9090
 secret: "$secret"
 external-ui: ui
 external-ui-url: "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip"
 
+# Сохранять выбранные прокси и Fake-IP между перезапусками Mihomo.
 profile:
   store-selected: true
   store-fake-ip: true
 
+# Локальный mixed HTTP/SOCKS порт Mihomo.
 mixed-port: 7892
 allow-lan: true
 bind-address: "*"
@@ -2126,6 +2128,7 @@ mode: rule
 log-level: info
 ipv6: false
 
+# DNS Mihomo. Fake-IP используется для прозрачной маршрутизации клиентов.
 dns:
   enable: true
   listen: 127.0.0.1:1053
@@ -2139,6 +2142,7 @@ dns:
     - 1.1.1.1
     - 8.8.8.8
 
+# TUN-интерфейс. auto-route / auto-redirect ниже выставляет сам GoshaCrash.
 tun:
   enable: true
   stack: $TUN_STACK
@@ -2147,6 +2151,7 @@ tun:
     - any:53
     - tcp://any:53
 
+# Без пользовательских правил весь трафик остаётся DIRECT.
 rules:
   - MATCH,DIRECT
 EOF
@@ -2159,11 +2164,10 @@ EOF
 install_configs(){
     test -n "$ACTIVE_CONFIG" || ACTIVE_CONFIG="$BASE/config.yaml"
 
-    # Migration from GoshaCrash <= 3.5.x: legacy installations used
-    # config-legacy.yaml as the active file. Keep the user's configuration.
+    # Migration from GoshaCrash <= 3.5.x: move the old active config to the
+    # unified name instead of creating a second persistent copy.
     if test ! -f "$ACTIVE_CONFIG" && test -f "$BASE/config-legacy.yaml"; then
-        cp -f "$BASE/config-legacy.yaml" "$BASE/backups/config-legacy.yaml.before-3.6" 2>/dev/null || true
-        cp -f "$BASE/config-legacy.yaml" "$ACTIVE_CONFIG" || return 1
+        mv -f "$BASE/config-legacy.yaml" "$ACTIVE_CONFIG" || return 1
         say "Legacy-конфиг перенесён в единый $ACTIVE_CONFIG"
     fi
 
@@ -2172,12 +2176,19 @@ install_configs(){
         say "Базовый config.yaml создан install.sh для $PLATFORM (routing=$ROUTING_MODE, tun.stack=$TUN_STACK)"
         warn "VPN ещё не настроен: добавь свои proxy/rules и выполни gc restart"
     else
-        cp -f "$ACTIVE_CONFIG" "$BASE/backups/config.yaml.before-install" 2>/dev/null || true
+        config_tmp="$TMP_ROOT/config-before-routing.yaml"
+        cp -f "$ACTIVE_CONFIG" "$config_tmp" || return 1
         say "Существующий $ACTIVE_CONFIG сохранён; меняются только параметры выбранной маршрутизации"
-        configure_routing_in_config "$ACTIVE_CONFIG" || { fail "Не удалось применить routing=$ROUTING_MODE к конфигу"; return 1; }
+        if ! configure_routing_in_config "$ACTIVE_CONFIG"; then
+            cp -f "$config_tmp" "$ACTIVE_CONFIG" 2>/dev/null || true
+            fail "Не удалось применить routing=$ROUTING_MODE к конфигу"
+            return 1
+        fi
+        rm -f "$config_tmp" 2>/dev/null || true
         chmod 600 "$ACTIVE_CONFIG" 2>/dev/null || true
     fi
 }
+
 
 json_asset_urls(){
     file="$1"
@@ -2187,7 +2198,7 @@ json_asset_urls(){
 }
 
 latest_official_mihomo_url(){
-    # rc26 deliberately pins the modern core. A router install must not silently
+    # rc28 deliberately pins the modern core. A router install must not silently
     # switch CPU binary just because GitHub "latest" changed between runs.
     MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_VERSION"
     printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$OFFICIAL_MIHOMO_VERSION/mihomo-linux-$MIHOMO_TARGET-$OFFICIAL_MIHOMO_VERSION.gz"
@@ -2315,10 +2326,9 @@ install_mihomo(){
 
     if test -x "$BASE/bin/mihomo"; then
         existing_out="$("$BASE/bin/mihomo" -v 2>&1)"
-        if printf '%s\n' "$existing_out" | grep -qi 'mihomo'; then
-            cp -f "$BASE/bin/mihomo" "$BASE/backups/mihomo.previous" 2>/dev/null || true
-        else
-            warn "Старый Mihomo повреждён/несовместим; в mihomo.previous он не сохраняется"
+        if ! printf '%s
+' "$existing_out" | grep -qi 'mihomo'; then
+            warn "Старый Mihomo повреждён/несовместим; новый бинарник уже проверен и заменит его"
         fi
     fi
     mv -f "$newbin" "$BASE/bin/mihomo" || return 1
@@ -2411,89 +2421,37 @@ remove_legacy_hook_lines(){
 
 write_command_wrapper(){
     dst="$1"
-    cat > "$dst" <<'WRAP'
+    cat > "$dst" <<WRAP
 #!/bin/sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-test -n "$BASE" && test -x "$BASE/goshacrash.sh" || { echo "GoshaCrash не найден на USB" >&2; exit 1; }
-GOSHACRASH_BASE="$BASE"
+BASE='$BASE'
+/bin/busybox test -x "\$BASE/goshacrash.sh" || { echo "GoshaCrash не найден на USB" >&2; exit 1; }
+GOSHACRASH_BASE="\$BASE"
 export GOSHACRASH_BASE
-exec "$BASE/goshacrash.sh" "$@"
+exec /bin/sh "\$BASE/goshacrash.sh" "\$@"
 WRAP
     chmod 755 "$dst"
 }
 
-write_test_wrapper(){
-    target="$1"
-    mkdir -p "$(dirname "$target")" || return 1
-    cat > "$target" <<'WRAP'
-#!/bin/sh
-exec /bin/busybox test "$@"
-WRAP
-    chmod 755 "$target" || return 1
-}
-
-write_bracket_wrapper(){
-    target="$1"
-    mkdir -p "$(dirname "$target")" || return 1
-    cat > "$target" <<'WRAP'
-#!/bin/sh
-exec /bin/busybox '[' "$@"
-WRAP
-    chmod 755 "$target" || return 1
-}
-
 write_nano_wrapper(){
     dst="$1"
-    cat > "$dst" <<'WRAP'
+    cat > "$dst" <<WRAP
 #!/bin/sh
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+BASE='$BASE'
 DM_ROOT=""
-test -f "$BASE/state/platform.env" && . "$BASE/state/platform.env"
-for p in /opt/bin/nano /tmp/opt/bin/nano "$DM_ROOT/bin/nano" "$DM_ROOT/sbin/nano"; do
-  test -x "$p" && exec "$p" "$@"
+unset LC_ALL 2>/dev/null || true
+case "\${LC_CTYPE:-\${LANG:-}}" in
+  *UTF-8*|*utf8*|*UTF8*) : ;;
+  *) LANG=en_US.UTF-8; LC_CTYPE=en_US.UTF-8; export LANG LC_CTYPE ;;
+esac
+/bin/busybox test -f "\$BASE/state/platform.env" && . "\$BASE/state/platform.env"
+for p in /opt/bin/nano /tmp/opt/bin/nano "\$DM_ROOT/bin/nano" "\$DM_ROOT/sbin/nano"; do
+  /bin/busybox test -x "\$p" && exec "\$p" "\$@"
 done
 echo "nano не найден. Установи nano через пакетный менеджер Download Master" >&2
 exit 1
 WRAP
     chmod 755 "$dst"
 }
-
-rewrite_nvram_hook(){
-    key="$1"; begin="$2"; end="$3"; body="$4"
-    find_nvram || return 0
-    tmp="$TMP_ROOT/nvram-hook.$$"
-    old="$(nvram_get "$key")"
-    printf '%s\n' "$old" | awk -v b="$begin" -v e="$end" '
-      index($0,b) {skip=1; next}
-      index($0,e) {skip=0; next}
-      !skip {print}
-    ' > "$tmp" || return 1
-    {
-        cat "$tmp"
-        printf '%s\n' "$begin"
-        printf '%s\n' "$body"
-        printf '%s\n' "$end"
-    } > "$tmp.new" || return 1
-    value="$(cat "$tmp.new")"
-    nvram_set "$key" "$value" || { rm -f "$tmp" "$tmp.new"; return 1; }
-    rm -f "$tmp" "$tmp.new"
-}
-
-install_nvram_usb_hooks(){
-    find_nvram || { warn "nvram недоступен: stock USB hook пропущен; JFFS и Download Master hooks установлены"; return 0; }
-    rewrite_nvram_hook script_usbmount '# GOSHACRASH_USBMOUNT_BEGIN' '# GOSHACRASH_USBMOUNT_END' \
-      'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); test -x "$BASE/goshacrash.sh" && /jffs/addons/goshacrash/start.sh &' || warn "Не удалось записать USB-mount hook"
-    rewrite_nvram_hook script_usbumount '# GOSHACRASH_USBUMOUNT_BEGIN' '# GOSHACRASH_USBUMOUNT_END' \
-      'BASE=$(cat /jffs/addons/goshacrash/base 2>/dev/null); test -x "$BASE/goshacrash.sh" && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" service-stop >/dev/null 2>&1' || warn "Не удалось записать USB-unmount hook"
-    test "$(nvram_get jffs2_scripts)" = 1 || nvram_set jffs2_scripts 1 || true
-    nvram_commit || true
-    case "$(nvram_get script_usbmount)" in
-      *GOSHACRASH_USBMOUNT_BEGIN*) : ;;
-      *) warn "ASUSWRT удалил script_usbmount из NVRAM; используется Download Master S99goshacrash.1" ;;
-    esac
-}
-
-
 
 merge_ipkg_package_stanza(){
     src="$1"; dst="$2"; package="$3"
@@ -2521,7 +2479,7 @@ install_stock_usb_mount_bridge(){
     mkdir -p "$DM_ROOT/etc/init.d" "$DM_ROOT/lib/ipkg/info" || return 1
     cat > "$DM_ROOT/etc/init.d/S50usb-mount-script" <<'HOOK'
 #!/bin/sh
-# GoshaCrash Download Master bridge 3.10.2-rc26
+# GoshaCrash Download Master bridge 3.10.2-rc28
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2530,7 +2488,7 @@ device="$(echo "$mount" | awk '{print $1}')"
 mount="$(echo "$mount" | awk '{print $2}')"
 case "$1" in
   start)
-    printf '[%s] [dm-bridge pid=%s] start device=%s mount=%s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$device" "$mount" >> /jffs/addons/goshacrash/coldboot.log 2>/dev/null || true
+    printf '[%s] [dm-bridge pid=%s] start device=%s mount=%s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$device" "$mount" >> /tmp/goshacrash-coldboot.log 2>/dev/null || true
     if test -x /jffs/scripts/usb-mount-script; then
       /jffs/scripts/usb-mount-script "$device" "$mount" &
     fi
@@ -2605,23 +2563,38 @@ remove_pre3712_autostart(){
 }
 
 install_hooks(){
-    JFFS_DIR="/jffs/addons/goshacrash"
-    mkdir -p "$JFFS_DIR" /jffs/scripts /jffs/configs /jffs/etc "$DM_ROOT/bin" "$DM_ROOT/etc/init.d" || return 1
-    printf '%s\n' "$BASE" > "$JFFS_DIR/base" || return 1
+    # Keep GoshaCrash-owned persistent data inside $BASE. Outside it we leave
+    # only the standard ASUS hook/wrapper files that firmware actually calls.
+    mkdir -p /jffs/scripts /jffs/configs /jffs/etc "$DM_ROOT/bin" "$DM_ROOT/etc/init.d" || return 1
 
-    cat > "$JFFS_DIR/start.sh" <<'HOOK'
+    cat > /jffs/scripts/usb-mount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash autostart hook 3.10.2-rc26
+# GoshaCrash USB hook 3.10.2-rc28
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
-BASE_FILE=/jffs/addons/goshacrash/base
-TRACE=/jffs/addons/goshacrash/coldboot.log
+BASE="__GC_BASE__"
+MOUNT_POINT="$2"
+TRACE="$BASE/logs/coldboot.log"
+TMP_TRACE=/tmp/goshacrash-coldboot.log
 WAITED=0
+
 trace(){
-  printf '[%s] [start.sh pid=%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$*" >> "$TRACE" 2>/dev/null || true
+  printf '[%s] [usb-mount pid=%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$*" >> "$TRACE" 2>/dev/null || true
 }
-# Keep the persistent JFFS trace bounded; it is diagnostic, not a history DB.
+
+case "$BASE" in
+  "$MOUNT_POINT"/*) ;;
+  *) exit 0 ;;
+esac
+
+mkdir -p "$BASE/logs" "$BASE/run" "$BASE/state" 2>/dev/null || true
+if test -s "$TMP_TRACE"; then
+  cat "$TMP_TRACE" >> "$TRACE" 2>/dev/null || true
+  : > "$TMP_TRACE" 2>/dev/null || true
+fi
+
+# Keep the persistent trace bounded.
 if test -f "$TRACE"; then
   TRACE_SIZE="$(wc -c < "$TRACE" 2>/dev/null)"
   case "$TRACE_SIZE" in ''|*[!0-9]*) TRACE_SIZE=0;; esac
@@ -2630,23 +2603,41 @@ if test -f "$TRACE"; then
     rm -f "$TRACE.tmp.$$" 2>/dev/null || true
   fi
 fi
-BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
-UPTIME="$(cat /proc/uptime 2>/dev/null)"
-trace "entered boot_id=${BOOT_ID:-unknown} uptime=${UPTIME:-unknown}"
-BASE="$(cat "$BASE_FILE" 2>/dev/null)"
-while test -z "$BASE" || test ! -x "$BASE/goshacrash.sh"; do
+
+trace "entered device=$1 mount=$MOUNT_POINT"
+
+DM=""
+for d in "$MOUNT_POINT/asusware.arm" "$MOUNT_POINT/asusware.arm64" "$MOUNT_POINT/asusware"; do
+  test -d "$d" && { DM="$d"; break; }
+done
+if test -n "$DM" && test -d "$DM"; then
+  if test -L /tmp/opt; then
+    ln -snf "$DM" /tmp/opt 2>/dev/null || true
+  elif test -d /tmp/opt; then
+    if test ! -x /tmp/opt/bin/ipkg && test ! -x /tmp/opt/bin/opkg; then
+      rmdir /tmp/opt 2>/dev/null && ln -s "$DM" /tmp/opt 2>/dev/null || true
+    fi
+  elif test ! -e /tmp/opt; then
+    ln -s "$DM" /tmp/opt 2>/dev/null || true
+  fi
+  touch "$DM/.asusrouter" 2>/dev/null || true
+fi
+
+while test ! -x "$BASE/goshacrash.sh"; do
   if test "$WAITED" -ge 300; then
-    trace "timeout waiting for USB/controller; base=${BASE:-empty}"
+    trace "timeout waiting for controller"
     exit 0
   fi
   sleep 5
   WAITED=$((WAITED + 5))
-  BASE="$(cat "$BASE_FILE" 2>/dev/null)"
 done
-trace "controller ready after ${WAITED}s; base=$BASE"
-mkdir -p "$BASE/run" "$BASE/state" "$BASE/logs" 2>/dev/null || true
+
+BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
+UPTIME="$(cat /proc/uptime 2>/dev/null)"
+trace "controller ready after ${WAITED}s dm=${DM:-none} boot_id=${BOOT_ID:-unknown} uptime=${UPTIME:-unknown}"
 date '+%Y-%m-%d %H:%M:%S' > "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-printf '[%s] autostart hook rc26: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
+printf '[%s] autostart hook rc28: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
+
 NOHUP=""
 for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup; do
   test -x "$p" && { NOHUP="$p"; break; }
@@ -2656,61 +2647,24 @@ if test -n "$NOHUP"; then
 else
   GOSHACRASH_BASE="$BASE" /bin/sh "$BASE/goshacrash.sh" boot </dev/null >> "$BASE/logs/boot.log" 2>&1 &
 fi
-child=$!
-trace "boot worker launched pid=$child"
+trace "boot worker launched pid=$!"
 exit 0
 HOOK
-    chmod 755 "$JFFS_DIR/start.sh" || return 1
-
-    cat > /jffs/scripts/usb-mount-script <<'HOOK'
-#!/bin/sh
-# GoshaCrash USB hook 3.10.2-rc26
-unset LD_LIBRARY_PATH 2>/dev/null || true
-PATH="/usr/sbin:/usr/bin:/sbin:/bin"
-export PATH
-MOUNT_POINT="$2"
-TRACE=/jffs/addons/goshacrash/coldboot.log
-printf '[%s] [usb-mount pid=%s] device=%s mount=%s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$1" "$MOUNT_POINT" >> "$TRACE" 2>/dev/null || true
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-test -n "$BASE" || exit 0
-case "$BASE" in
-  "$MOUNT_POINT"/*)
-    DM=""
-    for d in "$MOUNT_POINT/asusware.arm" "$MOUNT_POINT/asusware.arm64" "$MOUNT_POINT/asusware"; do
-      test -d "$d" && { DM="$d"; break; }
-    done
-    if test -n "$DM" && test -d "$DM"; then
-      if test -L /tmp/opt; then
-        ln -snf "$DM" /tmp/opt 2>/dev/null || true
-      elif test -d /tmp/opt; then
-        if test ! -x /tmp/opt/bin/ipkg && test ! -x /tmp/opt/bin/opkg; then
-          rmdir /tmp/opt 2>/dev/null && ln -s "$DM" /tmp/opt 2>/dev/null || true
-        fi
-      elif test ! -e /tmp/opt; then
-        ln -s "$DM" /tmp/opt 2>/dev/null || true
-      fi
-      touch "$DM/.asusrouter" 2>/dev/null || true
-    fi
-    printf '[%s] [usb-mount pid=%s] dispatch start.sh base=%s dm=%s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$BASE" "${DM:-none}" >> "$TRACE" 2>/dev/null || true
-    /jffs/addons/goshacrash/start.sh &
-    ;;
-esac
-exit 0
-HOOK
+    hook_base_esc="$(printf '%s' "$BASE" | sed 's/[\\&#]/\\&/g')"
+    sed -i "s#__GC_BASE__#$hook_base_esc#g" /jffs/scripts/usb-mount-script || return 1
     chmod 755 /jffs/scripts/usb-mount-script || return 1
 
     cat > /jffs/scripts/usb-umount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB unmount hook 3.10.2-rc26
+# GoshaCrash USB unmount hook 3.10.2-rc28
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
+BASE="__GC_BASE__"
 MOUNT_POINT="$2"
-BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-test -n "$BASE" || exit 0
 case "$BASE" in
   "$MOUNT_POINT"/*)
-    test -x "$BASE/goshacrash.sh" && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" service-stop >/dev/null 2>&1 || true
+    test -x "$BASE/goshacrash.sh" && GOSHACRASH_BASE="$BASE" /bin/sh "$BASE/goshacrash.sh" service-stop >/dev/null 2>&1 || true
     if test -f /tmp/goshacrash-opt-bind.state; then
       OPTDM="$(cat /tmp/goshacrash-opt-bind.state 2>/dev/null)"
       case "$OPTDM" in
@@ -2728,43 +2682,37 @@ case "$BASE" in
 esac
 exit 0
 HOOK
+    sed -i "s#__GC_BASE__#$hook_base_esc#g" /jffs/scripts/usb-umount-script || return 1
     chmod 755 /jffs/scripts/usb-umount-script || return 1
 
-    rm -f /jffs/scripts/gc "$DM_ROOT/bin/gc" /opt/bin/gc 2>/dev/null || true
-    write_test_wrapper /jffs/scripts/test || return 1
-    write_bracket_wrapper /jffs/scripts/'[' || return 1
+    rm -f /jffs/scripts/gc /jffs/scripts/nano "$DM_ROOT/bin/gc" /opt/bin/gc 2>/dev/null || true
     write_command_wrapper /jffs/scripts/gc
     write_nano_wrapper /jffs/scripts/nano
     write_command_wrapper "$DM_ROOT/bin/gc"
     test -d /opt/bin && test -w /opt/bin && write_command_wrapper /opt/bin/gc 2>/dev/null || true
+
+    # Old rc23-rc26 used a custom /jffs/addons/goshacrash directory only to
+    # store base/start/trace. rc28 no longer needs it; remove our own residue.
+    rm -rf /jffs/addons/goshacrash 2>/dev/null || true
+    grep -Fq 'exec /bin/busybox test "$@"' /jffs/scripts/test 2>/dev/null && rm -f /jffs/scripts/test 2>/dev/null || true
+    grep -Fq "exec /bin/busybox '['" /jffs/scripts/'[' 2>/dev/null && rm -f /jffs/scripts/'[' 2>/dev/null || true
+
     add_once /jffs/etc/profile 'export PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"'
     add_once /jffs/configs/profile.add 'export PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"'
 
     remove_pre3712_autostart
     install_stock_usb_mount_bridge || return 1
-    rm -f "$BASE/logs/goshacrash.log" "$BASE/logs/watchdog.log" "$BASE/logs/boot.log" 2>/dev/null || true
-    ok "Автозапуск установлен для stock ASUSWRT"
+    rm -f "$BASE/logs/goshacrash.log" "$BASE/logs/watchdog.log" "$BASE/logs/boot.log" "$BASE/logs/coldboot.log" 2>/dev/null || true
+    ok "Автозапуск установлен для stock ASUSWRT; служебные данные остаются внутри $BASE"
 }
 
 verify_shell_compat(){
     busybox="/bin/busybox"
-    test_wrapper="/jffs/scripts/test"
-    bracket_wrapper="/jffs/scripts/["
 
     "$busybox" test -x "$busybox" >/dev/null 2>&1 || {
         fail "Shell compatibility: /bin/busybox недоступен"
         return 1
     }
-
-    "$busybox" test -x "$test_wrapper" >/dev/null 2>&1 || {
-        fail "Shell compatibility: $test_wrapper не создан"
-        return 1
-    }
-    "$busybox" test -x "$bracket_wrapper" >/dev/null 2>&1 || {
-        fail "Shell compatibility: $bracket_wrapper не создан"
-        return 1
-    }
-
     "$busybox" test -n "goshacrash" >/dev/null 2>&1 || {
         fail "Shell compatibility: BusyBox test applet не работает"
         return 1
@@ -2773,16 +2721,16 @@ verify_shell_compat(){
         fail "Shell compatibility: BusyBox [ applet не работает"
         return 1
     }
-    "$test_wrapper" -n "goshacrash" >/dev/null 2>&1 || {
-        fail "Shell compatibility: $test_wrapper не работает"
+    "$busybox" test -x /jffs/scripts/gc >/dev/null 2>&1 || {
+        fail "Shell compatibility: /jffs/scripts/gc не создан"
         return 1
     }
-    "$bracket_wrapper" -n "goshacrash" ']' >/dev/null 2>&1 || {
-        fail "Shell compatibility: $bracket_wrapper не работает"
+    GOSHACRASH_BASE="$BASE" /bin/sh "$BASE/goshacrash.sh" version >/dev/null 2>&1 || {
+        fail "Shell compatibility: controller не запускается через /bin/sh"
         return 1
     }
 
-    say "Shell compatibility: test + [ OK"
+    say "Shell compatibility: BusyBox test/[ + controller OK"
     return 0
 }
 
@@ -2875,10 +2823,10 @@ main(){
         return 1
     }
     BASE="${INSTALL_DIR:-$USB_MOUNT/goshacrash}"
-    mkdir -p "$TMP_ROOT" "$BASE/bin" "$BASE/ui" "$BASE/logs" "$BASE/run" "$BASE/state" "$BASE/backups" || return 1
-    # rc26: these directories were never used by GoshaCrash. Remove legacy
-    # empty copies from older builds, but never delete user files.
-    rmdir "$BASE/rulesets" "$BASE/proxies" 2>/dev/null || true
+    mkdir -p "$TMP_ROOT" "$BASE/bin" "$BASE/ui" "$BASE/logs" "$BASE/run" "$BASE/state" || return 1
+    # Keep the persistent tree minimal. Remove only empty legacy directories;
+    # never delete existing user files automatically.
+    rmdir "$BASE/rulesets" "$BASE/proxies" "$BASE/backups" 2>/dev/null || true
     save_install_log
 
     say "GoshaCrash installer $INSTALLER_VERSION"

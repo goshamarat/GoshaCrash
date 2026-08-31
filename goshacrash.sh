@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc26"
-BUILD_ID="2026-08-31-pinned-mihomo-elf-guard-rc26"
+VERSION="3.10.2-rc28"
+BUILD_ID="2026-09-01-no-persistent-backups-rc28"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -40,7 +40,6 @@ CONFIG="$BASE/config.yaml"
 RUN="$BASE/run"
 LOGS="$BASE/logs"
 STATE="$BASE/state"
-BACKUPS="$BASE/backups"
 PLATFORM_FILE="$STATE/platform.env"
 PIDFILE="$RUN/mihomo.pid"
 WATCHDOG_PIDFILE="$RUN/watchdog.pid"
@@ -56,9 +55,6 @@ BOOT_TOKEN_FILE="/tmp/goshacrash-boot-token"
 MIHOMO_LOG="$LOGS/mihomo.log"
 INSTALL_LOG="$LOGS/install.log"
 PACKAGES_LOG="$LOGS/packages.log"
-
-JFFS_DIR="/jffs/addons/goshacrash"
-JFFS_BASE_FILE="$JFFS_DIR/base"
 
 TUN_DEVICE="${GOSHACRASH_TUN_DEVICE:-tun0}"
 TUN_TABLE="${GOSHACRASH_TUN_TABLE:-2022}"
@@ -113,7 +109,7 @@ IPTABLES=""
 IPT_WAIT=""
 NET_BACKEND=""
 
-ensure_dirs(){ mkdir -p "$BASE/bin" "$UI" "$RUN" "$LOGS" "$STATE" "$BACKUPS" "$ROUTE_STATE"; }
+ensure_dirs(){ mkdir -p "$BASE/bin" "$UI" "$RUN" "$LOGS" "$STATE" "$ROUTE_STATE"; }
 now(){ date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date; }
 
 rotate_log(){
@@ -688,13 +684,13 @@ validate_binary_arch(){
     [ "$magic" = 7f454c46 ] || { fail "Mihomo повреждён: файл не является ELF (header=${hex:-empty})"; return 1; }
     case "$MIHOMO_TARGET" in
       armv5|armv7)
-        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку rc26"; return 1; }
+        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку rc28"; return 1; }
         ;;
       arm64|aarch64)
-        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку rc26"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку rc28"; return 1; }
         ;;
       amd64|amd64-compatible|x86_64)
-        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку rc26"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку rc28"; return 1; }
         ;;
     esac
     return 0
@@ -1165,7 +1161,6 @@ start_runtime(){
     wait_tun || { kill_mihomo; tail -n 80 "$MIHOMO_LOG" >&2; fail "Mihomo не создал $TUN_DEVICE"; return 1; }
     route_start || { kill_mihomo; route_stop >/dev/null 2>&1 || true; fail "Маршрутизация не поднялась; оставлен DIRECT"; return 1; }
     wait_route_ready || { kill_mihomo; route_stop >/dev/null 2>&1 || true; tail -n 80 "$MIHOMO_LOG" >&2; fail "Маршрутизация не стала рабочей после запуска; оставлен DIRECT"; return 1; }
-    cp -f "$CONFIG" "$BACKUPS/config.last-good.yaml" 2>/dev/null || true
     ok "Mihomo запущен, PID=$p; profile=$PLATFORM"
 }
 
@@ -1470,8 +1465,6 @@ restart(){
     refresh_path
 
     check_config || return 1
-    backup_config >/dev/null 2>&1 || true
-
     rm -f "$MANUAL_STOP"
     control_lock_set || { fail "Другая операция GoshaCrash ещё выполняется"; return 1; }
     watchdog_stop
@@ -1614,12 +1607,6 @@ firewall_reload(){
     if [ "$ROUTING_MODE" = manual ]; then route_start || return 1; else restart; fi
 }
 
-backup_config(){
-    [ -f "$CONFIG" ] || return 1
-    stamp="$(date '+%Y%m%d-%H%M%S' 2>/dev/null)"; [ -n "$stamp" ] || stamp="backup"
-    dst="$BACKUPS/config-$stamp.yaml"; cp -f "$CONFIG" "$dst" || return 1; printf '%s\n' "$dst"
-}
-
 find_editor(){
     repair_opt >/dev/null 2>&1 || true
     repair_optware_abi_runtime >/dev/null 2>&1 || true
@@ -1632,6 +1619,41 @@ find_editor(){
         return 0
     done
     return 1
+}
+
+editor_utf8_locale(){
+    # nano handles Unicode only when its wide-curses build sees a UTF-8 locale.
+    # Preserve a UTF-8 locale from the SSH client when present; otherwise use
+    # the conventional Optware locale name. The user may override it explicitly.
+    if test -n "${GOSHACRASH_EDITOR_LOCALE:-}"; then
+        printf '%s\n' "$GOSHACRASH_EDITOR_LOCALE"
+        return 0
+    fi
+    for loc in "${LC_CTYPE:-}" "${LANG:-}"; do
+        case "$loc" in
+            *UTF-8*|*utf8*|*UTF8*) printf '%s\n' "$loc"; return 0 ;;
+        esac
+    done
+    printf '%s\n' 'en_US.UTF-8'
+}
+
+run_editor_utf8(){
+    editor="$1"
+    shift
+    ldpath="$(optware_env_runtime)" || return 1
+    editor_locale="$(editor_utf8_locale)"
+    editor_term="${TERM:-xterm-256color}"
+    (
+        # LC_ALL would override LC_CTYPE and is commonly inherited as C from
+        # router hooks. Drop it only for nano; never change the router globally.
+        unset LC_ALL
+        LANG="$editor_locale"
+        LC_CTYPE="$editor_locale"
+        TERM="$editor_term"
+        LD_LIBRARY_PATH="$ldpath"
+        export LANG LC_CTYPE TERM LD_LIBRARY_PATH
+        exec "$editor" "$@"
+    )
 }
 
 repair_nano_runtime(){
@@ -1669,31 +1691,38 @@ edit_config(){
         }
     fi
 
-    backup="$(backup_config)" || {
-        fail "Не создана резервная копия config.yaml"
-        return 1
-    }
-    say "Резервная копия: $backup"
-
-    TERM="${TERM:-xterm}" "$editor" "$CONFIG" || {
-        warn "Редактор завершился с ошибкой"
+    # Только временная копия для отката невалидной правки. Она живёт в /tmp
+    # и удаляется сразу после проверки; постоянные backup-файлы не создаются.
+    original="/tmp/goshacrash-config-edit.$$"
+    rm -f "$original" 2>/dev/null || true
+    cp -f "$CONFIG" "$original" || {
+        fail "Не удалось подготовить временную копию config.yaml"
         return 1
     }
 
+    run_editor_utf8 "$editor" "$CONFIG" || {
+        cp -f "$original" "$CONFIG" 2>/dev/null || true
+        rm -f "$original" 2>/dev/null || true
+        warn "Редактор завершился с ошибкой; исходный config.yaml восстановлен"
+        return 1
+    }
+
+    say "Проверяю config.yaml встроенной проверкой Mihomo (-t)..."
     if ! check_config; then
-        cp -f "$backup" "$CONFIG"
-        fail "Конфиг некорректен; восстановлена предыдущая версия"
+        cp -f "$original" "$CONFIG" || {
+            rm -f "$original" 2>/dev/null || true
+            fail "Конфиг некорректен, и не удалось восстановить предыдущую версию"
+            return 1
+        }
+        rm -f "$original" 2>/dev/null || true
+        fail "Проверка не пройдена; предыдущий config.yaml восстановлен. Неудачная правка не сохранялась."
         return 1
     fi
 
-    if ! restart; then
-        cp -f "$backup" "$CONFIG"
-        warn "Новый конфиг не запустился; восстановлен старый"
-        restart || true
-        return 1
-    fi
-
-    ok "config.yaml сохранён и применён"
+    rm -f "$original" 2>/dev/null || true
+    ok "Синтаксис config.yaml: OK"
+    say "Конфиг сохранён. Mihomo НЕ перезапускался — для применения выбери Restart."
+    return 0
 }
 
 
@@ -1764,38 +1793,47 @@ set_routing_mode(){
     fi
 
     ensure_dirs || return 1
-    cfg_backup="$BACKUPS/$(basename "$CONFIG").routing-before-$(date '+%Y%m%d-%H%M%S' 2>/dev/null)"
-    state_backup="$BACKUPS/platform.env.routing-before-$$"
-    cp -f "$CONFIG" "$cfg_backup" || return 1
-    cp -f "$PLATFORM_FILE" "$state_backup" || return 1
+    cfg_snapshot="/tmp/goshacrash-routing-config.$$"
+    state_snapshot="/tmp/goshacrash-routing-platform.$$"
+    rm -f "$cfg_snapshot" "$state_snapshot" 2>/dev/null || true
+    cp -f "$CONFIG" "$cfg_snapshot" || return 1
+    cp -f "$PLATFORM_FILE" "$state_snapshot" || { rm -f "$cfg_snapshot"; return 1; }
 
     watchdog_stop
     stop_runtime
     if ! rewrite_config_for_routing "$mode"; then
-        cp -f "$cfg_backup" "$CONFIG"; return 1
+        cp -f "$cfg_snapshot" "$CONFIG" 2>/dev/null || true
+        rm -f "$cfg_snapshot" "$state_snapshot" 2>/dev/null || true
+        return 1
     fi
     stack="system"; [ "$MIHOMO_TARGET" = armv5 ] && stack="gvisor"
-    platform_set ROUTING_MODE "$mode" || { cp -f "$cfg_backup" "$CONFIG"; cp -f "$state_backup" "$PLATFORM_FILE"; return 1; }
-    platform_set TUN_STACK "$stack" || { cp -f "$cfg_backup" "$CONFIG"; cp -f "$state_backup" "$PLATFORM_FILE"; return 1; }
-    load_platform || return 1
+    if ! platform_set ROUTING_MODE "$mode" || ! platform_set TUN_STACK "$stack" || ! load_platform; then
+        cp -f "$cfg_snapshot" "$CONFIG" 2>/dev/null || true
+        cp -f "$state_snapshot" "$PLATFORM_FILE" 2>/dev/null || true
+        rm -f "$cfg_snapshot" "$state_snapshot" 2>/dev/null || true
+        load_platform >/dev/null 2>&1 || true
+        return 1
+    fi
 
     if check_config && with_start_lock start_runtime; then
         rm -f "$MANUAL_STOP"
         watchdog_start
-        cp -f "$CONFIG" "$BACKUPS/config.last-good.yaml" 2>/dev/null || true
+        rm -f "$cfg_snapshot" "$state_snapshot" 2>/dev/null || true
         ok "Маршрутизация переключена на $mode"
         return 0
     fi
 
     warn "Новый режим не запустился; возвращаю предыдущую конфигурацию"
     stop_runtime >/dev/null 2>&1 || true
-    cp -f "$cfg_backup" "$CONFIG"
-    cp -f "$state_backup" "$PLATFORM_FILE"
+    cp -f "$cfg_snapshot" "$CONFIG" 2>/dev/null || true
+    cp -f "$state_snapshot" "$PLATFORM_FILE" 2>/dev/null || true
+    rm -f "$cfg_snapshot" "$state_snapshot" 2>/dev/null || true
     load_platform >/dev/null 2>&1 || true
     with_start_lock start_runtime >/dev/null 2>&1 || true
     watchdog_start >/dev/null 2>&1 || true
     return 1
 }
+
 
 routing_status(){
     load_platform || return 1
@@ -1877,7 +1915,7 @@ status(){
     if p="$(running_pid 2>/dev/null)"; then echo "Mihomo: работает, PID=$p"; else echo "Mihomo: не запущен"; fi
     if [ -f "$WAN_OFFLINE" ]; then echo "Интернет: OFFLINE"; else state="$(cat "$WAN_STATE" 2>/dev/null)"; [ -n "$state" ] || state=unknown; echo "Интернет: $state"; fi
     if p="$(watchdog_pid 2>/dev/null)"; then echo "Watchdog: работает, PID=$p"; else echo "Watchdog: не запущен"; fi
-    if [ "${LEGACY:-0}" = 1 ]; then echo "Профиль: legacy"; [ "${MIHOMO_TARGET:-}" = armv5 ] && echo "Ядро: закреплено для legacy ARMv5"; else echo "Профиль: modern"; fi
+    if [ "${LEGACY:-0}" = 1 ] && [ "${MIHOMO_TARGET:-}" = armv5 ]; then echo "Совместимость: legacy ARMv5 + gVisor"; fi
     echo "Режим маршрутизации: $ROUTING_MODE"
     echo "Конфиг: $CONFIG"
     net_link_exists "$TUN_DEVICE" && echo "TUN: $TUN_DEVICE работает" || echo "TUN: $TUN_DEVICE не найден"
@@ -1987,14 +2025,6 @@ menu_state_tun(){
     fi
 }
 
-menu_profile_name(){
-    if [ "${LEGACY:-1}" = 1 ]; then
-        printf 'LEGACY'
-    else
-        printf 'MODERN'
-    fi
-}
-
 menu_print_state(){
     value="$1"
     width="$2"
@@ -2054,25 +2084,24 @@ menu_repaint_selection(){
 
 menu_draw(){
     selected="$1"
-    # Hide cursor before clearing so the initial/full refresh itself is cleaner.
-    # Full refresh is only used on menu entry and after executing an action.
+    # Every visible row is exactly 45 terminal columns wide. Keeping the same
+    # width is important over SSH: otherwise the right border appears to jump.
     printf '\033[?25l\033[2J\033[H'
     printf '\033[1;36m'
     printf '┌───────────────────────────────────────────┐\n'
-    printf '│               G O S H A C R A S H         │\n'
-    printf '│              ROUTER CONTROLLER            │\n'
+    printf '│             G O S H A C R A S H           │\n'
+    printf '│            ROUTER CONTROLLER              │\n'
     printf '├───────────────────────────────────────────┤\n'
     printf '\033[0m'
     core_state="$(menu_state_core)"
     tun_state="$(menu_state_tun)"
-    profile_state="$(menu_profile_name)"
     routing_state="$(printf '%s' "${ROUTING_MODE:-unknown}" | tr '[:lower:]' '[:upper:]')"
     printf '│  MIHOMO: '
-    menu_print_state "$core_state" 12
-    printf ' TUN: '
-    menu_print_state "$tun_state" 10
-    printf ' │\n'
-    printf '│  PROFILE %-10s       ROUTING %-8s │\n' "$profile_state" "$routing_state"
+    menu_print_state "$core_state" 10
+    printf '  TUN: '
+    menu_print_state "$tun_state" 6
+    printf '          │\n'
+    printf '│  ROUTING: %-8s                        │\n' "$routing_state"
     printf '\033[1;36m'
     printf '├───────────────────────────────────────────┤\n'
     printf '\033[0m'
@@ -2085,7 +2114,7 @@ menu_draw(){
     printf '\033[1;36m'
     printf '├───────────────────────────────────────────┤\n'
     printf '\033[0m'
-    printf '│  \033[2m↑/↓ Navigate    Enter Select    Q Quit\033[0m     │\n'
+    printf '│  \033[2m↑/↓ Navigate   Enter Select   Q Quit\033[0m     │\n'
     printf '\033[1;36m'
     printf '└───────────────────────────────────────────┘\n'
     printf '\033[0m'
@@ -2132,8 +2161,8 @@ menu_basic(){
     while :; do
         load_platform >/dev/null 2>&1 || true
         printf '\n=== GoshaCrash ===\n'
-        printf 'Mihomo: %s | TUN: %s | Profile: %s | Routing: %s\n\n' \
-            "$(menu_state_core)" "$(menu_state_tun)" "$(menu_profile_name)" "${ROUTING_MODE:-unknown}"
+        printf 'MIHOMO: %s | TUN: %s | ROUTING: %s\n\n' \
+            "$(menu_state_core)" "$(menu_state_tun)" "${ROUTING_MODE:-unknown}"
         echo "  1) Status"
         echo "  2) Edit config"
         echo "  3) Restart"
@@ -2144,7 +2173,11 @@ menu_basic(){
         IFS= read -r choice || return 0
         case "$choice" in
             1) status ;;
-            2) edit_config ;;
+            2)
+                edit_config
+                sleep 2
+                continue
+                ;;
             3) restart ;;
             4) stop ;;
             5) menu_logs ;;
@@ -2204,7 +2237,7 @@ menu(){
                 printf '\033[?25h\033[2J\033[H'
                 case "$selected" in
                     1) status; menu_pause ;;
-                    2) edit_config; menu_pause ;;
+                    2) edit_config; sleep 2 ;;
                     3) restart; menu_pause ;;
                     4) stop; menu_pause ;;
                     5) menu_logs ;;
@@ -2225,14 +2258,16 @@ menu(){
 autostart_status(){
     ensure_dirs >/dev/null 2>&1 || true; load_platform >/dev/null 2>&1 || true
     echo "Autostart (stock ASUSWRT)"
-    [ -x /jffs/addons/goshacrash/start.sh ] && echo "  start.sh: OK" || echo "  start.sh: FAIL"
-    hook_version="$(sed -n 's/^# GoshaCrash autostart hook //p' /jffs/addons/goshacrash/start.sh 2>/dev/null | /bin/busybox head -n 1)"
-    [ -n "$hook_version" ] && echo "  start.sh version: $hook_version" || echo "  start.sh version: old/unknown"
-    [ "$hook_version" = "$VERSION" ] && echo "  hook/controller: MATCH" || echo "  hook/controller: MISMATCH"
     [ -x /jffs/scripts/usb-mount-script ] && echo "  usb-mount-script: OK" || echo "  usb-mount-script: FAIL"
+    hook_version="$(sed -n 's/^# GoshaCrash USB hook //p' /jffs/scripts/usb-mount-script 2>/dev/null | /bin/busybox head -n 1)"
+    [ -n "$hook_version" ] && echo "  USB hook version: $hook_version" || echo "  USB hook version: old/unknown"
+    [ "$hook_version" = "$VERSION" ] && echo "  hook/controller: MATCH" || echo "  hook/controller: MISMATCH"
     [ -x "$DM_ROOT/etc/init.d/S50usb-mount-script" ] && echo "  ASUS app bridge: OK" || echo "  ASUS app bridge: FAIL"
+    bridge_version="$(sed -n 's/^# GoshaCrash Download Master bridge //p' "$DM_ROOT/etc/init.d/S50usb-mount-script" 2>/dev/null | /bin/busybox head -n 1)"
+    [ -n "$bridge_version" ] && echo "  bridge version: $bridge_version" || echo "  bridge version: old/unknown"
     [ -f "$STATE/autostart-hook-ran" ] && echo "  last hook: $(cat "$STATE/autostart-hook-ran" 2>/dev/null)" || echo "  last hook: never"
-    [ -f /jffs/addons/goshacrash/coldboot.log ] && echo "  coldboot trace: /jffs/addons/goshacrash/coldboot.log" || echo "  coldboot trace: not written yet"
+    [ -f "$LOGS/coldboot.log" ] && echo "  coldboot trace: $LOGS/coldboot.log" || echo "  coldboot trace: not written yet"
+    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall rc28)" || echo "  legacy JFFS dir: clean"
     [ -f "$MANUAL_STOP" ] && echo "  manual-stop: YES" || echo "  manual-stop: no"
     return 0
 }
@@ -2350,11 +2385,10 @@ doctor(){
 }
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.10.2-rc26 — что буквально вводить в SSH
+GoshaCrash 3.10.2-rc28 — что буквально вводить в SSH
 
 КАТАЛОГ УСТАНОВКИ
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  BASE="$(gc base)"
   echo "$BASE"
 
 МЕНЮ
@@ -2368,8 +2402,8 @@ GoshaCrash 3.10.2-rc26 — что буквально вводить в SSH
 
 АВТОЗАПУСК / COLD BOOT
   gc autostart status
-  cat /jffs/addons/goshacrash/coldboot.log
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
+  BASE="$(gc base)"
+  cat "$BASE/logs/coldboot.log"
   tail -n 100 "$BASE/logs/boot.log"
   tail -n 100 "$BASE/logs/watchdog.log"
 
@@ -2386,8 +2420,7 @@ GoshaCrash 3.10.2-rc26 — что буквально вводить в SSH
   echo "PING_RC=$?"
 
 СБРОСИТЬ ЛОЖНЫЙ OFFLINE
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  BASE="$(gc base)"
   rm -f "$BASE/state/wan-offline" "$BASE/state/wan-fail-count" "$BASE/state/wan-ok-count"
   echo online > "$BASE/state/internet.state"
   gc restart
@@ -2397,25 +2430,12 @@ GoshaCrash 3.10.2-rc26 — что буквально вводить в SSH
   gc edit
 
 ОТКРЫТЬ CONFIG ВРУЧНУЮ
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  BASE="$(gc base)"
   /jffs/scripts/nano "$BASE/config.yaml"
 
-BACKUP CONFIG
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
-  cp "$BASE/config.yaml" "$BASE/backups/config-manual.yaml"
-
 ПРОВЕРИТЬ CONFIG
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  BASE="$(gc base)"
   "$BASE/bin/mihomo" -t -d "$BASE" -f "$BASE/config.yaml"
-
-ВЕРНУТЬ BACKUP
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
-  cp "$BASE/backups/config-manual.yaml" "$BASE/config.yaml"
-  gc restart
 
 ПЕРЕЗАПУСТИТЬ VPN
   gc restart
@@ -2436,31 +2456,26 @@ LIVE MIHOMO
   gc logs live mihomo 100
 
 ЛОГ MIHOMO ВРУЧНУЮ
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  BASE="$(gc base)"
   tail -n 100 "$BASE/logs/mihomo.log"
 
 LIVE ВРУЧНУЮ
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  BASE="$(gc base)"
   tail -f "$BASE/logs/mihomo.log"
 
 ЛОГ УСТАНОВКИ
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  BASE="$(gc base)"
   tail -n 200 "$BASE/logs/install.log"
 
 ЛОГ ПАКЕТОВ
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  BASE="$(gc base)"
   tail -n 200 "$BASE/logs/packages.log"
 
 ПРОЦЕСС MIHOMO
   ps | grep '[m]ihomo'
 
 PID MIHOMO
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  BASE="$(gc base)"
   cat "$BASE/run/mihomo.pid" 2>/dev/null
 
 TUN
@@ -2495,15 +2510,13 @@ RT-AC68U / LEGACY
   gc routing manual
 
 WATCHDOG
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  BASE="$(gc base)"
   cat "$BASE/run/watchdog.pid" 2>/dev/null
   PID="$(cat "$BASE/run/watchdog.pid" 2>/dev/null)"
   [ -n "$PID" ] && kill -0 "$PID" && echo "watchdog OK"
 
 СОСТОЯНИЕ INTERNET WATCHDOG
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  BASE="$(gc base)"
   cat "$BASE/state/internet.state" 2>/dev/null
   ls -l "$BASE/state/wan-offline" 2>/dev/null
 
@@ -2512,11 +2525,10 @@ WATCHDOG
 
 HOOK AUTOSTART
   ls -l /jffs/scripts/usb-mount-script
-  ls -l /jffs/addons/goshacrash/start.sh
+  ls -l /tmp/opt/etc/init.d/S50usb-mount-script
 
 СРАБОТАЛ ЛИ AUTOSTART ПОСЛЕ REBOOT
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  BASE="$(gc base)"
   cat "$BASE/state/autostart-hook-ran" 2>/dev/null
 
 ПРОВЕРИТЬ /opt ПОСЛЕ REBOOT
@@ -2569,20 +2581,18 @@ SFTP ЧЕРЕЗ IPKG
   "$IPKG" install openssh-sftp-server
 
 SFTP С WINDOWS
-  sftp admin@10.10.10.100
+  sftp admin@<IP_РОУТЕРА>
 
 ZASHBOARD
   gc dashboard
 
 CONTROLLER И SECRET
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  BASE="$(gc base)"
   grep '^external-controller:' "$BASE/config.yaml"
   grep '^secret:' "$BASE/config.yaml"
 
 РУЧНОЙ RESTART ТОЛЬКО MIHOMO
-  BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
-  [ -n "$BASE" ] || BASE=/tmp/mnt/SANDISK/goshacrash
+  BASE="$(gc base)"
   PID="$(cat "$BASE/run/mihomo.pid" 2>/dev/null)"
   [ -n "$PID" ] && kill "$PID"
   rm -f "$BASE/run/mihomo.pid"
@@ -2625,6 +2635,7 @@ case "${1:-menu}" in
     status) status;;
     edit) edit_config;;
     dashboard) dashboard_url;;
+    base) printf '%s\n' "$BASE";;
     autostart)
         shift
         case "${1:-status}" in
