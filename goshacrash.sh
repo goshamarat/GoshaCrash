@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc17"
-BUILD_ID="2026-08-30-natural-download-master-ipkg-rc17"
+VERSION="3.10.2-rc18"
+BUILD_ID="2026-08-31-common-dm-optware-path-rc18"
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.
@@ -150,16 +150,10 @@ find_dm_root(){
 refresh_path(){
     find_dm_root >/dev/null 2>&1 || true
 
-    if [ "${LEGACY:-0}" = 1 ]; then
-        PATH="$GC_COMPAT_BIN:/jffs/scripts"
-        [ -n "$DM_ROOT" ] && PATH="$DM_ROOT/bin:$DM_ROOT/sbin:$PATH"
-        PATH="/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"
-        PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
-    else
-        PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin"
-        [ -n "$DM_ROOT" ] && PATH="$PATH:$DM_ROOT/bin:$DM_ROOT/sbin"
-        PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
-    fi
+    PATH="$GC_COMPAT_BIN:/jffs/scripts"
+    [ -n "$DM_ROOT" ] && PATH="$DM_ROOT/bin:$DM_ROOT/sbin:$PATH"
+    PATH="/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"
+    PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
     export PATH
     hash -r 2>/dev/null || true
 
@@ -1120,15 +1114,6 @@ find_editor(){
 }
 
 repair_nano_runtime(){
-    load_platform >/dev/null 2>&1 || true
-    refresh_path
-
-    if [ "${LEGACY:-0}" != 1 ]; then
-        find_editor >/dev/null 2>&1 && return 0
-        fail "nano из Download Master не найден. Повтори install.sh или выполни ipkg install nano"
-        return 1
-    fi
-
     find_editor >/dev/null 2>&1 && return 0
     repair_opt >/dev/null 2>&1 || true
     find_editor >/dev/null 2>&1 && return 0
@@ -1169,8 +1154,8 @@ edit_config(){
     }
     say "Резервная копия: $backup"
 
-    "$editor" "$CONFIG" || {
-        warn "Редактор завершился с ошибкой (editor=$editor TERM=${TERM:-unset})"
+    TERM="${TERM:-xterm}" "$editor" "$CONFIG" || {
+        warn "Редактор завершился с ошибкой"
         return 1
     }
 
@@ -1673,34 +1658,20 @@ autostart_status(){
 }
 
 sftp_status(){
-    load_platform >/dev/null 2>&1 || true
-    find_dm_root >/dev/null 2>&1 || true
-
     echo "SFTP / Optware"
     p="$(cat "$STATE/sftp-server.path" 2>/dev/null)"
     v="$(cat "$STATE/sftp-server.version" 2>/dev/null)"
 
     if [ -n "$p" ] && [ -x "$p" ]; then
-        found="$p"
-    else
-        found=""
-        for x in \
-            "$DM_ROOT/libexec/sftp-server" \
-            "$DM_ROOT/lib/openssh/sftp-server" \
-            /tmp/opt/libexec/sftp-server \
-            /tmp/opt/lib/openssh/sftp-server \
-            /opt/libexec/sftp-server \
-            /opt/lib/openssh/sftp-server; do
-            [ -n "$x" ] && [ -x "$x" ] && { found="$x"; break; }
-        done
-    fi
-
-    if [ -n "$found" ]; then
         echo "  binary: OK"
-        echo "  path: $found"
+        echo "  path: $p"
         [ -n "$v" ] && echo "  version: $v"
     else
-        echo "  binary: НЕ НАЙДЕН"
+        found=""
+        for x in /opt/libexec/sftp-server /opt/lib/openssh/sftp-server; do
+            [ -x "$x" ] && { found="$x"; break; }
+        done
+        [ -n "$found" ] && echo "  path: $found" || echo "  binary: НЕ НАЙДЕН"
     fi
     echo "  SSH daemon: stock ASUS Dropbear не заменяется"
     echo "  Проверка с ПК: sftp admin@<IP роутера>"

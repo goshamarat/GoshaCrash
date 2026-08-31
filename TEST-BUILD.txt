@@ -1,11 +1,18 @@
-# GoshaCrash 3.10.2-rc17
+# GoshaCrash 3.10.2-rc18
 
-Natural modern package model:
-- Download Master/ipkg required;
-- normal `ipkg update`;
-- normal `ipkg install nano unzip openssh-sftp-server`;
-- no modern ABI overlay;
-- no modern TERM rewrite;
-- no modern SFTP wrapper;
-- DM-installed binaries are verified directly.
-Legacy RT-AC68U path intentionally unchanged in this RC.
+Goal: BT10 differs from RT-AC68U only where platform/routing requires it.
+
+Common path restored from the proven rc12/RT-AC68U implementation:
+- Download Master / Optware package preparation;
+- ipkg runtime handling;
+- nano/unzip handling;
+- openssh-sftp-server handling;
+- /opt-based CLI/hooks;
+- gc edit behavior (no BT10-specific TERM rewrite).
+
+Modern-only pieces retained:
+- BT10 armv7 Mihomo;
+- system TUN;
+- auto-route + auto-redirect;
+- modern TUN/firewall preflight;
+- BT10/fdisk fixes from later RCs.

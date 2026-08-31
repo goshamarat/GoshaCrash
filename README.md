@@ -4,7 +4,7 @@ GoshaCrash — установщик и контроллер Mihomo для ASUSWR
 
 Этот RC в первую очередь проверяется на **ASUS RT-AC68U** со старым ASUSWRT / Linux 2.6.36. Для legacy-профиля используется **Mihomo ARMv5 + gVisor**.
 
-> **Тестовая версия:** 3.10.2-rc17  
+> **Тестовая версия:** 3.10.2-rc18  
 > Не публикуйте её как универсально стабильную для всех ASUS до проверки новых ARM64-моделей.
 
 ## Что уже проверено на RT-AC68U
@@ -763,3 +763,20 @@ rc15:
 - `gc edit` запускает настоящий `nano` из Download Master как есть.
 - Системные компоненты ASUSWRT (`/bin/sh`, `iptables`, `modprobe`, firmware wget/curl) не заменяются пакетами.
 - Legacy RT-AC68U в этом RC не меняется, чтобы не ломать уже проверенную установку.
+
+
+### rc18: один Download Master / Optware путь для всех ASUS
+
+В этой версии modern-профиль больше не имеет отдельной логики установки
+`nano`, `unzip`, SFTP и обычных Optware-пакетов.
+
+Для RT-AC68U и BT10 используется один и тот же проверенный путь Download Master:
+`/opt` -> `ipkg` -> пакеты -> CLI/hooks.
+
+Разница modern-профиля теперь только там, где она реально нужна:
+- архитектура Mihomo (`armv7` на BT10);
+- `tun.stack: system`;
+- automatic routing (`auto-route + auto-redirect`) либо manual;
+- modern TUN/firewall capability checks.
+
+Никаких специальных xterm/TERM-подмен для BT10 в package path нет.

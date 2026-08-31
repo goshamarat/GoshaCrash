@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc17"
+INSTALLER_VERSION="3.10.2-rc18"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -701,12 +701,11 @@ ensure_optware_link(){
 prepare_path(){
     ensure_optware_link >/dev/null 2>&1 || true
 
-    # Firmware/bootstrap tools must win over ancient Optware commands.
-    # In particular do not let /opt/bin/sh, /opt/bin/test, curl, wget, etc.
-    # shadow stock ASUSWRT tools on modern firmware.
-    PATH="$GC_BOOTSTRAP_BIN:/jffs/scripts:/usr/sbin:/usr/bin:/sbin:/bin"
-    test -n "$DM_ROOT" && PATH="$PATH:$DM_ROOT/bin:$DM_ROOT/sbin"
-    PATH="$PATH:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin"
+    # Keep installer bootstrap tools in PATH on old stock ASUSWRT.
+    PATH="$GC_BOOTSTRAP_BIN:/jffs/scripts"
+    test -n "$DM_ROOT" && PATH="$DM_ROOT/bin:$DM_ROOT/sbin:$PATH"
+    PATH="/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"
+    PATH="$PATH:/usr/sbin:/usr/bin:/sbin:/bin"
     export PATH
     hash -r 2>/dev/null || true
 }
@@ -1279,22 +1278,12 @@ install_optware_sftp(){
 
     if sftp_bin="$(find_sftp_server 2>/dev/null)"; then
         say "SFTP binary: $sftp_bin"
-        mkdir -p "$BASE/state" 2>/dev/null || true
-        printf '%s\n' "$sftp_bin" > "$BASE/state/sftp-server.path" 2>/dev/null || true
-        pkg_line="$(optware_sftp_package_line 2>/dev/null)"
-        pkg_ver="$(printf '%s\n' "$pkg_line" | awk '{print $3}')"
-        test -n "$pkg_ver" && printf '%s\n' "$pkg_ver" > "$BASE/state/sftp-server.version" 2>/dev/null || true
         return 0
     fi
 
     pkg_line="$(optware_sftp_package_line)"
     if test -z "$pkg_line"; then
-        say "SFTP: openssh-sftp-server не найден в текущем индексе; обновляю индекс Download Master"
-        pkg_update_index_once || true
-        pkg_line="$(optware_sftp_package_line)"
-    fi
-    if test -z "$pkg_line"; then
-        warn "openssh-sftp-server отсутствует в репозитории Download Master; SFTP пропущен"
+        warn "openssh-sftp-server отсутствует в локальном индексе Optware; пропускаю SFTP без ipkg update"
         return 0
     fi
 
@@ -1326,9 +1315,7 @@ install_optware_sftp(){
     else
         warn "openssh-sftp-server зарегистрирован, но payload всё ещё отсутствует"
     fi
-    if test "${LEGACY:-0}" = 1; then
-        install_sftp_wrapper >/dev/null 2>&1 || true
-    fi
+    install_sftp_wrapper >/dev/null 2>&1 || true
 
     return 0
 }
@@ -1439,11 +1426,6 @@ prepare_packages_modern(){
 }
 
 prepare_packages(){
-    if test "${LEGACY:-0}" != 1; then
-        prepare_packages_modern
-        return $?
-    fi
-
     prepare_path
     check_usb_filesystem
     find_pkg || { fail "В Download Master не найден ipkg/opkg"; return 1; }
@@ -2102,14 +2084,13 @@ remove_legacy_hook_lines(){
 
 write_command_wrapper(){
     dst="$1"
-    mkdir -p "$(dirname "$dst")" 2>/dev/null || true
     cat > "$dst" <<'WRAP'
 #!/bin/sh
 BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
 test -n "$BASE" && test -x "$BASE/goshacrash.sh" || { echo "GoshaCrash не найден на USB" >&2; exit 1; }
 GOSHACRASH_BASE="$BASE"
 export GOSHACRASH_BASE
-exec /bin/sh "$BASE/goshacrash.sh" "$@"
+exec "$BASE/goshacrash.sh" "$@"
 WRAP
     chmod 755 "$dst"
 }
@@ -2141,16 +2122,7 @@ write_nano_wrapper(){
 BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
 DM_ROOT=""
 test -f "$BASE/state/platform.env" && . "$BASE/state/platform.env"
-
-case "${TERM:-}" in
-  xterm-256color) TERM=xterm ;;
-  screen-256color) TERM=screen ;;
-  tmux-256color|*-256color) TERM=xterm ;;
-  "") TERM=xterm ;;
-esac
-export TERM
-
-for p in "$DM_ROOT/bin/nano" /opt/bin/nano /tmp/opt/bin/nano "$DM_ROOT/sbin/nano"; do
+for p in /opt/bin/nano /tmp/opt/bin/nano "$DM_ROOT/bin/nano" "$DM_ROOT/sbin/nano"; do
   test -x "$p" && exec "$p" "$@"
 done
 echo "nano не найден. Установи nano через пакетный менеджер Download Master" >&2
@@ -2370,38 +2342,17 @@ exit 0
 HOOK
     chmod 755 /jffs/scripts/usb-umount-script || return 1
 
-    rm -f /jffs/scripts/gc /jffs/scripts/nano "$DM_ROOT/bin/gc" /opt/bin/gc 2>/dev/null || true
-    if test "${LEGACY:-0}" = 1; then
-        write_test_wrapper /jffs/scripts/test || return 1
-        write_bracket_wrapper /jffs/scripts/'[' || return 1
-    else
-        rm -f /jffs/scripts/test /jffs/scripts/'[' 2>/dev/null || true
-    fi
-    write_command_wrapper /jffs/scripts/gc || return 1
-    write_command_wrapper "$DM_ROOT/bin/gc" || return 1
-    ensure_optware_link >/dev/null 2>&1 || true
-    if test -d /opt/bin && test -w /opt/bin; then
-        write_command_wrapper /opt/bin/gc 2>/dev/null || true
-    fi
-    test -x "$DM_ROOT/bin/gc" || { fail "Не удалось установить CLI wrapper gc в $DM_ROOT/bin"; return 1; }
-    say "CLI wrapper: $DM_ROOT/bin/gc"
+    rm -f /jffs/scripts/gc "$DM_ROOT/bin/gc" /opt/bin/gc 2>/dev/null || true
+    write_test_wrapper /jffs/scripts/test || return 1
+    write_bracket_wrapper /jffs/scripts/'[' || return 1
+    write_command_wrapper /jffs/scripts/gc
+    write_nano_wrapper /jffs/scripts/nano
+    write_command_wrapper "$DM_ROOT/bin/gc"
+    test -d /opt/bin && test -w /opt/bin && write_command_wrapper /opt/bin/gc 2>/dev/null || true
     add_once /jffs/configs/profile.add 'export PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"'
 
     remove_pre3712_autostart
-
-    # NVRAM USB hooks are the generic stock-ASUSWRT path and are especially
-    # important for newer firmware where Download Master's old ipkg init.d
-    # layout may differ.
-    install_nvram_usb_hooks || true
-
-    # Legacy Download Master bridge is a fallback. On modern layouts without
-    # an ipkg status database, do not manufacture old Optware package metadata.
-    if test "${LEGACY:-0}" = 1 || test -f "$DM_ROOT/lib/ipkg/status"; then
-        install_stock_usb_mount_bridge || return 1
-    else
-        say "Modern Download Master: old ipkg USB-mount bridge не требуется"
-    fi
-
+    install_stock_usb_mount_bridge || return 1
     rm -f "$BASE/logs/goshacrash.log" "$BASE/logs/watchdog.log" "$BASE/logs/boot.log" 2>/dev/null || true
     ok "Автозапуск установлен для stock ASUSWRT"
 }
