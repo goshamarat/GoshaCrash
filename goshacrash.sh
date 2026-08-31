@@ -2060,16 +2060,16 @@ menu_draw(){
     printf '\033[1;36m'
     printf '┌───────────────────────────────────────────┐\n'
     printf '│               G O S H A C R A S H         │\n'
-    printf '│              ROUTER CONTROLLER             │\n'
+    printf '│              ROUTER CONTROLLER            │\n'
     printf '├───────────────────────────────────────────┤\n'
     printf '\033[0m'
     core_state="$(menu_state_core)"
     tun_state="$(menu_state_tun)"
     profile_state="$(menu_profile_name)"
     routing_state="$(printf '%s' "${ROUTING_MODE:-unknown}" | tr '[:lower:]' '[:upper:]')"
-    printf '│  MIHOMO  '
+    printf '│  MIHOMO: '
     menu_print_state "$core_state" 12
-    printf ' TUN  '
+    printf ' TUN: '
     menu_print_state "$tun_state" 10
     printf ' │\n'
     printf '│  PROFILE %-10s       ROUTING %-8s │\n' "$profile_state" "$routing_state"
