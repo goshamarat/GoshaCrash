@@ -1,8 +1,18 @@
 # GoshaCrash
 
-## rc25: consolidated cold-boot + installer build
+## rc26: pinned Mihomo + ELF architecture guard
 
-rc25 собирает в одну версию исправления BT10, меню и структуры каталогов, а также закрывает несколько проблем обновления:
+- Modern Mihomo is pinned to immutable `v1.19.30` instead of GitHub `latest`.
+- BT10 `armv7l` accepts only a 32-bit ARM ELF before the core can replace the installed binary.
+- ARM64/x86_64 targets receive the corresponding ELF-class/machine guard.
+- A downloaded gzip/HTML/wrong-architecture payload is rejected before installation.
+- A broken current core is not copied into `backups/mihomo.previous`; the new core is staged and executed successfully before the atomic replacement.
+- Runtime reports an explicit architecture mismatch instead of the opaque BusyBox `line 1: syntax error`.
+
+
+## rc25 lineage: consolidated cold-boot + installer build
+
+rc26 собирает в одну версию исправления BT10, меню и структуры каталогов, а также закрывает несколько проблем обновления:
 
 - lock-каталоги на USB теперь привязаны к **текущей загрузке Linux** через `/proc/sys/kernel/random/boot_id`; PID после полного power-cycle больше не может случайно сделать старый lock «живым»;
 - watchdog запускается в самом начале boot worker и после завершения boot-пути берёт recovery на себя; пока boot worker активен, watchdog не гоняет параллельный start;
@@ -24,13 +34,13 @@ HOME=/tmp/goshacrash-wget /usr/sbin/wget --no-check-certificate -O - \
   'https://raw.githubusercontent.com/goshamarat/GoshaCrash/refs/heads/main/install.sh' | /bin/sh
 ```
 
-Перед online install в `main` должны быть одновременно загружены **оба** файла rc25: `install.sh` и `goshacrash.sh`. Если одно зеркало ещё отдаёт старый controller, installer попробует следующее; несовпадающая версия не устанавливается.
+Перед online install в `main` должны быть одновременно загружены **оба** файла rc26: `install.sh` и `goshacrash.sh`. Если одно зеркало ещё отдаёт старый controller, installer попробует следующее; несовпадающая версия не устанавливается.
 
 GoshaCrash — установщик и контроллер Mihomo для ASUSWRT с Zashboard, TUN-маршрутизацией, watchdog, автозапуском и вспомогательными утилитами.
 
 Этот RC в первую очередь проверяется на **ASUS RT-AC68U** со старым ASUSWRT / Linux 2.6.36. Для legacy-профиля используется **Mihomo ARMv5 + gVisor**.
 
-> **Тестовая версия:** 3.10.2-rc25  
+> **Тестовая версия:** 3.10.2-rc26  
 > Не публикуйте её как универсально стабильную для всех ASUS до проверки новых ARM64-моделей.
 
 ## Что уже проверено на RT-AC68U

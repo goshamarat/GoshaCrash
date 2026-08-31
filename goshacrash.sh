@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc25"
-BUILD_ID="2026-08-31-consolidated-coldboot-install-rc25"
+VERSION="3.10.2-rc26"
+BUILD_ID="2026-08-31-pinned-mihomo-elf-guard-rc26"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -663,9 +663,47 @@ ensure_tun(){
     dd if=/dev/net/tun of=/dev/null bs=1 count=0 >/dev/null 2>&1
 }
 
+
+mihomo_elf_header_runtime(){
+    file="$1"
+    od_bin=""; dd_bin=""
+    for p in /usr/bin/od /bin/od /usr/sbin/od /sbin/od "$DM_ROOT/bin/od" /opt/bin/od /tmp/opt/bin/od; do
+        [ -x "$p" ] && { od_bin="$p"; break; }
+    done
+    for p in /bin/dd /usr/bin/dd /sbin/dd /usr/sbin/dd "$DM_ROOT/bin/dd" /opt/bin/dd /tmp/opt/bin/dd; do
+        [ -x "$p" ] && { dd_bin="$p"; break; }
+    done
+    [ -n "$od_bin" ] && [ -n "$dd_bin" ] || return 2
+    "$dd_bin" if="$file" bs=1 count=20 2>/dev/null | "$od_bin" -An -tx1 2>/dev/null | tr -d ' \n\r'
+}
+
+validate_binary_arch(){
+    file="$1"
+    hex="$(mihomo_elf_header_runtime "$file")"; rc=$?
+    [ "$rc" -eq 2 ] && return 0
+    [ "$rc" -eq 0 ] || return 0
+    magic="$(printf '%s' "$hex" | cut -c 1-8)"
+    class="$(printf '%s' "$hex" | cut -c 9-10)"
+    machine="$(printf '%s' "$hex" | cut -c 37-40)"
+    [ "$magic" = 7f454c46 ] || { fail "Mihomo повреждён: файл не является ELF (header=${hex:-empty})"; return 1; }
+    case "$MIHOMO_TARGET" in
+      armv5|armv7)
+        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку rc26"; return 1; }
+        ;;
+      arm64|aarch64)
+        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку rc26"; return 1; }
+        ;;
+      amd64|amd64-compatible|x86_64)
+        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку rc26"; return 1; }
+        ;;
+    esac
+    return 0
+}
+
 validate_binary_file(){
     file="$1"; require_gvisor="${2:-0}"
     [ -x "$file" ] || { fail "Не найден исполняемый Mihomo: $file"; return 1; }
+    validate_binary_arch "$file" || return 1
     out="$("$file" -v 2>&1)" || { printf '%s\n' "$out" >&2; fail "Mihomo не запускается"; return 1; }
     printf '%s\n' "$out" | grep -qi mihomo || { printf '%s\n' "$out" >&2; fail "Файл не похож на Mihomo"; return 1; }
     if [ "$require_gvisor" = 1 ]; then
@@ -2312,7 +2350,7 @@ doctor(){
 }
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.10.2-rc25 — что буквально вводить в SSH
+GoshaCrash 3.10.2-rc26 — что буквально вводить в SSH
 
 КАТАЛОГ УСТАНОВКИ
   BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"

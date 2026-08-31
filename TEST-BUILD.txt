@@ -1,13 +1,16 @@
-# GoshaCrash 3.10.2-rc25
+# GoshaCrash 3.10.2-rc26
 
 Consolidated test build for ASUS RT-AC68U and ZenWiFi BT10.
 
-Key rc25 changes:
+Key rc26 changes:
+- modern Mihomo pinned to v1.19.30; no mutable latest API selection;
+- pre-install ELF architecture guard for armv7/arm64/x86_64;
+- broken/wrong core cannot replace a working binary;
 - cold-boot locks are bound to the current Linux boot ID, not PID alone;
 - watchdog is launched early by boot() and skips recovery while the boot worker owns BOOT_LOCK;
 - stale USB lock directories from a previous power cycle are removed even if their old PID was reused;
 - controller/watchdog PID validation still checks /proc/PID/cmdline;
-- install hooks are always rewritten as rc25 and gc autostart status reports hook/controller MATCH or MISMATCH;
+- install hooks are always rewritten as rc26 and gc autostart status reports hook/controller MATCH or MISMATCH;
 - online controller download validates VERSION on every mirror and continues past stale CDN/cache responses;
 - extracted release archives use their matching local goshacrash.sh and local assets/gcnet-armv5;
 - rulesets/ and proxies/ are not created; old empty copies are removed with rmdir only;
@@ -18,12 +21,12 @@ Validation performed for this artifact:
 - bash -n install.sh + goshacrash.sh
 - dash -n install.sh + goshacrash.sh
 - BusyBox ash -n install.sh + goshacrash.sh
-- install.sh --help reports 3.10.2-rc25
-- goshacrash.sh version reports 3.10.2-rc25
+- install.sh --help reports 3.10.2-rc26
+- goshacrash.sh version reports 3.10.2-rc26
 - boot-token/lock test verifies that a lock stamped with another boot ID is treated as stale and removed
 - no BusyBox-incompatible find -type or find -path in executable shell code
 - ZIP integrity tested with unzip -t
 
 Real-router status:
-- RT-AC68U: rc12 lineage is the last fully end-to-end tested legacy baseline; rc25 keeps the same legacy package/routing model with generic lock hardening.
-- ZenWiFi BT10: package path, writable /opt bind, SFTP payload, terminfo/nano, ARMv7 Mihomo, TUN, and auto routing were proven manually. rc25 cold power-cycle behavior still requires a real-router power-off/power-on test before calling the build stable.
+- RT-AC68U: rc12 lineage is the last fully end-to-end tested legacy baseline; rc26 keeps the same legacy package/routing model with generic lock hardening.
+- ZenWiFi BT10: package path, writable /opt bind, SFTP payload, terminfo/nano, ARMv7 Mihomo, TUN, and auto routing were proven manually. rc26 cold power-cycle behavior still requires a real-router power-off/power-on test before calling the build stable.

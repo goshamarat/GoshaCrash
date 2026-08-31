@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc25"
+INSTALLER_VERSION="3.10.2-rc26"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -15,7 +15,8 @@ BRANCH="${BRANCH:-main}"
 
 LEGACY_MIHOMO_VERSION="${LEGACY_MIHOMO_VERSION:-v1.19.28}"
 LEGACY_MIHOMO_TAG="${LEGACY_MIHOMO_TAG:-mihomo-gvisor-armv5-$LEGACY_MIHOMO_VERSION}"
-OFFICIAL_MIHOMO_FALLBACK="${OFFICIAL_MIHOMO_FALLBACK:-v1.19.29}"
+OFFICIAL_MIHOMO_VERSION="${OFFICIAL_MIHOMO_VERSION:-v1.19.30}"
+OFFICIAL_MIHOMO_FALLBACK="${OFFICIAL_MIHOMO_FALLBACK:-$OFFICIAL_MIHOMO_VERSION}"
 ZASHBOARD_PRIMARY="${ZASHBOARD_URL:-https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip}"
 
 TMP_ROOT="/tmp/goshacrash-install.$$"
@@ -2186,22 +2187,10 @@ json_asset_urls(){
 }
 
 latest_official_mihomo_url(){
-    api="$TMP_ROOT/mihomo-latest.json"
-    if fetch "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" "$api"; then
-        case "$MIHOMO_TARGET" in
-            amd64-compatible) pattern='/mihomo-linux-amd64-compatible-v[^/]*\.gz$' ;;
-            *) pattern="/mihomo-linux-$MIHOMO_TARGET-v[^/]*\\.gz$" ;;
-        esac
-        url="$(json_asset_urls "$api" | grep -E "$pattern" | head -n 1)"
-        if test -n "$url"; then
-            MIHOMO_VERSION_SELECTED="$(printf '%s\n' "$url" | sed -n 's#.*/download/\([^/]*\)/.*#\1#p')"
-            printf '%s\n' "$url"
-            return 0
-        fi
-    fi
-
-    MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_FALLBACK"
-    printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$OFFICIAL_MIHOMO_FALLBACK/mihomo-linux-$MIHOMO_TARGET-$OFFICIAL_MIHOMO_FALLBACK.gz"
+    # rc26 deliberately pins the modern core. A router install must not silently
+    # switch CPU binary just because GitHub "latest" changed between runs.
+    MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_VERSION"
+    printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$OFFICIAL_MIHOMO_VERSION/mihomo-linux-$MIHOMO_TARGET-$OFFICIAL_MIHOMO_VERSION.gz"
 }
 
 legacy_mihomo_urls(){
@@ -2214,12 +2203,68 @@ legacy_mihomo_urls(){
 }
 
 
+
+mihomo_elf_header(){
+    file="$1"
+    od_bin=""
+    dd_bin=""
+    for p in /usr/bin/od /bin/od /usr/sbin/od /sbin/od "$DM_ROOT/bin/od" /opt/bin/od /tmp/opt/bin/od; do
+        test -x "$p" && { od_bin="$p"; break; }
+    done
+    for p in /bin/dd /usr/bin/dd /sbin/dd /usr/sbin/dd "$DM_ROOT/bin/dd" /opt/bin/dd /tmp/opt/bin/dd; do
+        test -x "$p" && { dd_bin="$p"; break; }
+    done
+    test -n "$od_bin" && test -n "$dd_bin" || return 2
+    "$dd_bin" if="$file" bs=1 count=20 2>/dev/null | "$od_bin" -An -tx1 2>/dev/null | tr -d ' \n\r'
+}
+
+validate_mihomo_elf_target(){
+    file="$1"
+    hex="$(mihomo_elf_header "$file")"
+    rc=$?
+    # The runtime execution check below is still authoritative if this very old
+    # BusyBox lacks od/dd. Do not introduce a new hard dependency just for ELF inspection.
+    test "$rc" -eq 2 && return 0
+    test "$rc" -eq 0 || { fail "Не удалось прочитать ELF-заголовок Mihomo"; return 1; }
+
+    magic="$(printf '%s' "$hex" | cut -c 1-8)"
+    class="$(printf '%s' "$hex" | cut -c 9-10)"
+    machine="$(printf '%s' "$hex" | cut -c 37-40)"
+    test "$magic" = 7f454c46 || {
+        fail "Скачанный Mihomo не ELF-файл (header=${hex:-empty})"
+        return 1
+    }
+
+    case "$MIHOMO_TARGET" in
+        armv5|armv7)
+            test "$class" = 01 && test "$machine" = 2800 || {
+                fail "Mihomo architecture mismatch: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine"
+                return 1
+            }
+            ;;
+        arm64|aarch64)
+            test "$class" = 02 && test "$machine" = b700 || {
+                fail "Mihomo architecture mismatch: нужен ARM64, ELF class=$class machine=$machine"
+                return 1
+            }
+            ;;
+        amd64|amd64-compatible|x86_64)
+            test "$class" = 02 && test "$machine" = 3e00 || {
+                fail "Mihomo architecture mismatch: нужен x86_64, ELF class=$class machine=$machine"
+                return 1
+            }
+            ;;
+    esac
+    return 0
+}
+
 validate_downloaded_mihomo(){
     archive="$1"; newbin="$2"
     "$GZIP_BIN" -t "$archive" >/dev/null 2>&1 || { fail "Архив Mihomo повреждён"; return 1; }
     "$GZIP_BIN" -dc "$archive" > "$newbin" || { fail "Не удалось распаковать Mihomo"; return 1; }
+    validate_mihomo_elf_target "$newbin" || { rm -f "$newbin"; return 1; }
     chmod 755 "$newbin" || return 1
-    out="$("$newbin" -v 2>&1)" || { printf '%s\n' "$out" >&2; fail "Mihomo не запускается на этой архитектуре"; return 1; }
+    out="$("$newbin" -v 2>&1)" || { printf '%s\n' "$out" >&2; fail "Mihomo не запускается на этой архитектуре"; rm -f "$newbin"; return 1; }
     printf '%s\n' "$out" | grep -qi 'mihomo' || { printf '%s\n' "$out" >&2; fail "Скачанный файл не похож на Mihomo"; return 1; }
     if test "$MIHOMO_TARGET" = armv5; then
         printf '%s\n' "$out" | grep -Fq 'Use tags: with_gvisor' || { printf '%s\n' "$out" >&2; fail "Legacy-профилю нужна сборка Mihomo with_gvisor"; return 1; }
@@ -2268,7 +2313,14 @@ install_mihomo(){
         validate_downloaded_mihomo "$archive" "$newbin" || return 1
     fi
 
-    test -f "$BASE/bin/mihomo" && cp -f "$BASE/bin/mihomo" "$BASE/backups/mihomo.previous" 2>/dev/null || true
+    if test -x "$BASE/bin/mihomo"; then
+        existing_out="$("$BASE/bin/mihomo" -v 2>&1)"
+        if printf '%s\n' "$existing_out" | grep -qi 'mihomo'; then
+            cp -f "$BASE/bin/mihomo" "$BASE/backups/mihomo.previous" 2>/dev/null || true
+        else
+            warn "Старый Mihomo повреждён/несовместим; в mihomo.previous он не сохраняется"
+        fi
+    fi
     mv -f "$newbin" "$BASE/bin/mihomo" || return 1
     chmod 755 "$BASE/bin/mihomo" || return 1
 }
@@ -2469,7 +2521,7 @@ install_stock_usb_mount_bridge(){
     mkdir -p "$DM_ROOT/etc/init.d" "$DM_ROOT/lib/ipkg/info" || return 1
     cat > "$DM_ROOT/etc/init.d/S50usb-mount-script" <<'HOOK'
 #!/bin/sh
-# GoshaCrash Download Master bridge 3.10.2-rc25
+# GoshaCrash Download Master bridge 3.10.2-rc26
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2559,7 +2611,7 @@ install_hooks(){
 
     cat > "$JFFS_DIR/start.sh" <<'HOOK'
 #!/bin/sh
-# GoshaCrash autostart hook 3.10.2-rc25
+# GoshaCrash autostart hook 3.10.2-rc26
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2594,7 +2646,7 @@ done
 trace "controller ready after ${WAITED}s; base=$BASE"
 mkdir -p "$BASE/run" "$BASE/state" "$BASE/logs" 2>/dev/null || true
 date '+%Y-%m-%d %H:%M:%S' > "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-printf '[%s] autostart hook rc25: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
+printf '[%s] autostart hook rc26: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
 NOHUP=""
 for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup; do
   test -x "$p" && { NOHUP="$p"; break; }
@@ -2612,7 +2664,7 @@ HOOK
 
     cat > /jffs/scripts/usb-mount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB hook 3.10.2-rc25
+# GoshaCrash USB hook 3.10.2-rc26
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2649,7 +2701,7 @@ HOOK
 
     cat > /jffs/scripts/usb-umount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB unmount hook 3.10.2-rc25
+# GoshaCrash USB unmount hook 3.10.2-rc26
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2824,7 +2876,7 @@ main(){
     }
     BASE="${INSTALL_DIR:-$USB_MOUNT/goshacrash}"
     mkdir -p "$TMP_ROOT" "$BASE/bin" "$BASE/ui" "$BASE/logs" "$BASE/run" "$BASE/state" "$BASE/backups" || return 1
-    # rc25: these directories were never used by GoshaCrash. Remove legacy
+    # rc26: these directories were never used by GoshaCrash. Remove legacy
     # empty copies from older builds, but never delete user files.
     rmdir "$BASE/rulesets" "$BASE/proxies" 2>/dev/null || true
     save_install_log
