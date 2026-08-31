@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc18"
-BUILD_ID="2026-08-31-common-dm-optware-path-rc18"
+VERSION="3.10.2-rc19"
+BUILD_ID="2026-08-31-opt-bind-boot-ready-rc19"
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.
@@ -41,6 +41,7 @@ BACKUPS="$BASE/backups"
 PLATFORM_FILE="$STATE/platform.env"
 PIDFILE="$RUN/mihomo.pid"
 WATCHDOG_PIDFILE="$RUN/watchdog.pid"
+WATCHDOG_LOG="$LOGS/watchdog.log"
 BOOT_PIDFILE="$RUN/boot.pid"
 START_LOCK="$RUN/start.lock"
 CONTROL_LOCK="$RUN/control.lock"
@@ -122,7 +123,13 @@ rotate_log(){
     : > "$file"
 }
 
-log_event(){ :; }
+log_event(){
+    level="$1"; component="$2"; shift 2
+    mkdir -p "$LOGS" 2>/dev/null || true
+    logfile="$LOGS/goshacrash.log"
+    rotate_log "$logfile" 1048576
+    printf '[%s] [%s] [%s] %s\n' "$(now)" "$level" "$component" "$*" >> "$logfile" 2>/dev/null || true
+}
 
 say(){ printf '%s\n' "[GoshaCrash] $*"; log_event INFO main "$*"; }
 ok(){ printf '%s\n' "[GoshaCrash:OK] $*"; log_event OK main "$*"; }
@@ -158,7 +165,7 @@ refresh_path(){
     hash -r 2>/dev/null || true
 
     IP_BIN=""
-    for p in /opt/sbin/ip /opt/bin/ip /tmp/opt/sbin/ip /tmp/opt/bin/ip /usr/sbin/ip /sbin/ip /usr/bin/ip /bin/ip; do
+    for p in /usr/sbin/ip /sbin/ip /usr/bin/ip /bin/ip /opt/sbin/ip /opt/bin/ip /tmp/opt/sbin/ip /tmp/opt/bin/ip; do
         [ -x "$p" ] && { IP_BIN="$p"; break; }
     done
 
@@ -178,7 +185,7 @@ tool_path(){
         "/usr/sbin/$name" "/usr/bin/$name" "/sbin/$name" "/bin/$name"; do
         [ -n "$p" ] && [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
     done
-    command -v "$name" 2>/dev/null || return 1
+    return 1
 }
 
 have(){ tool_path "$1" >/dev/null 2>&1; }
@@ -189,8 +196,6 @@ find_nvram(){
     for p in /usr/sbin/nvram /sbin/nvram /usr/bin/nvram /bin/nvram; do
         [ -x "$p" ] && { NVRAM_BIN="$p"; return 0; }
     done
-    p="$(command -v nvram 2>/dev/null)"
-    [ -n "$p" ] && [ -x "$p" ] && { NVRAM_BIN="$p"; return 0; }
     return 1
 }
 
@@ -236,6 +241,87 @@ ensure_optware_link(){
     elif [ ! -e /tmp/opt ]; then
       ln -s "$DM_ROOT" /tmp/opt 2>/dev/null || return 1
     fi
+    return 0
+}
+
+
+OPT_NAMESPACE_STATE="/tmp/goshacrash-opt-bind.state"
+
+find_system_mount_runtime(){
+    for p in /bin/mount /sbin/mount /usr/bin/mount /usr/sbin/mount; do
+        [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+    done
+    return 1
+}
+
+find_system_umount_runtime(){
+    for p in /bin/umount /sbin/umount /usr/bin/umount /usr/sbin/umount; do
+        [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+    done
+    return 1
+}
+
+opt_namespace_write_through_runtime(){
+    [ -n "$DM_ROOT" ] && [ -d "$DM_ROOT" ] || return 1
+    probe=".goshacrash-opt-probe.$$"
+    rm -f "/opt/$probe" "$DM_ROOT/$probe" 2>/dev/null || true
+
+    if ( : > "/opt/$probe" ) 2>/dev/null; then
+        if [ -e "$DM_ROOT/$probe" ]; then
+            rm -f "/opt/$probe" "$DM_ROOT/$probe" 2>/dev/null || true
+            return 0
+        fi
+        rm -f "/opt/$probe" 2>/dev/null || true
+    fi
+    return 1
+}
+
+preserve_stock_opt_payload_runtime(){
+    for entry in /opt/*; do
+        [ -e "$entry" ] || continue
+        [ -L "$entry" ] && continue
+        name="${entry##*/}"
+        if [ -d "$entry" ]; then
+            mkdir -p "$DM_ROOT/$name" || return 1
+            cp -R "$entry/." "$DM_ROOT/$name/" 2>/dev/null || return 1
+        elif [ -f "$entry" ]; then
+            cp -f "$entry" "$DM_ROOT/$name" 2>/dev/null || return 1
+        fi
+    done
+    return 0
+}
+
+prepare_optware_namespace_runtime(){
+    ensure_optware_link || return 1
+
+    if opt_namespace_write_through_runtime; then
+        if awk '$2=="/opt" {found=1} END {exit !found}' /proc/mounts 2>/dev/null; then
+            printf '%s\n' "$DM_ROOT" > "$OPT_NAMESPACE_STATE" 2>/dev/null || true
+        fi
+        return 0
+    fi
+
+    mount_bin="$(find_system_mount_runtime 2>/dev/null)"
+    [ -n "$mount_bin" ] || return 1
+
+    if awk '$2=="/opt" {found=1} END {exit !found}' /proc/mounts 2>/dev/null; then
+        return 1
+    fi
+
+    preserve_stock_opt_payload_runtime || return 1
+    touch "$DM_ROOT/.goshacrash-opt-root" 2>/dev/null || true
+
+    "$mount_bin" -o bind "$DM_ROOT" /opt >> "$PACKAGES_LOG" 2>&1 || \
+      "$mount_bin" --bind "$DM_ROOT" /opt >> "$PACKAGES_LOG" 2>&1 || return 1
+
+    opt_namespace_write_through_runtime || {
+        umount_bin="$(find_system_umount_runtime 2>/dev/null)"
+        [ -n "$umount_bin" ] && "$umount_bin" /opt >/dev/null 2>&1 || true
+        return 1
+    }
+
+    printf '%s\n' "$DM_ROOT" > "$OPT_NAMESPACE_STATE" 2>/dev/null || true
+    log_event INFO opt "writable /opt bound to $DM_ROOT"
     return 0
 }
 optware_runtime_ready(){
@@ -351,6 +437,10 @@ repair_opt(){
         ln -s "$DM_ROOT" /tmp/opt 2>/dev/null || return 1
     fi
 
+    prepare_optware_namespace_runtime || {
+        log_event ERROR opt "cannot prepare writable /opt namespace for $DM_ROOT"
+        return 1
+    }
     repair_optware_abi_runtime >/dev/null 2>&1 || true
     refresh_path
     return 0
@@ -863,14 +953,73 @@ route_status(){
     if [ "$ROUTING_MODE" = manual ]; then manual_route_status; else modern_route_status; fi
 }
 
+wait_route_ready(){
+    n=0
+    while [ "$n" -lt 15 ]; do
+        route_status >/dev/null 2>&1 && return 0
+        sleep 1
+        n=$((n + 1))
+    done
+    return 1
+}
+
+
+modern_uplink_signature(){
+    [ "${LEGACY:-1}" = 0 ] || { printf '%s\n' legacy; return 0; }
+    refresh_path
+    [ -n "$IP_BIN" ] && [ -x "$IP_BIN" ] || return 1
+
+    out="$($IP_BIN route get 1.1.1.1 2>/dev/null | /bin/busybox head -n 1)"
+    [ -n "$out" ] || return 1
+
+    dev="$(printf '%s\n' "$out" | awk '{for(i=1;i<=NF;i++) if($i=="dev" && (i+1)<=NF){print $(i+1); exit}}')"
+    [ -n "$dev" ] || return 1
+    [ "$dev" != "$TUN_DEVICE" ] && [ "$dev" != lo ] || return 1
+
+    # A route may exist before the interface is usable. Require that the
+    # kernel can still resolve the device and that it exists in the link set.
+    "$IP_BIN" link show "$dev" >/dev/null 2>&1 || return 1
+    printf '%s\n' "$dev|$out"
+}
+
+wait_modern_uplink(){
+    [ "${LEGACY:-1}" = 0 ] || return 0
+    limit="${1:-60}"
+    waited=0
+    stable=0
+    previous=""
+
+    while [ "$waited" -lt "$limit" ]; do
+        sig="$(modern_uplink_signature 2>/dev/null)"
+        if [ -n "$sig" ]; then
+            if [ "$sig" = "$previous" ]; then
+                stable=$((stable + 1))
+            else
+                stable=1
+                previous="$sig"
+            fi
+            [ "$stable" -ge 3 ] && return 0
+        else
+            stable=0
+            previous=""
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    return 1
+}
 
 start_runtime(){
     ensure_dirs || return 1
     load_platform || return 1
+    repair_opt >/dev/null 2>&1 || true
     refresh_path
     check_config || return 1
     ensure_tun || { fail "/dev/net/tun недоступен"; return 1; }
     if p="$(running_pid)"; then route_start || return 1; say "Mihomo уже работает, PID=$p"; return 0; fi
+    if [ "${LEGACY:-1}" = 0 ]; then
+        wait_modern_uplink 60 || { fail "Modern uplink ещё не готов: стабильный ip route get не получен"; return 1; }
+    fi
 
     [ "$ROUTING_MODE" = manual ] && route_stop >/dev/null 2>&1 || true
     kill_mihomo
@@ -886,6 +1035,7 @@ start_runtime(){
     wait_port "$DNS_PORT" || { kill_mihomo; tail -n 80 "$MIHOMO_LOG" >&2; fail "DNS Mihomo не слушает порт $DNS_PORT"; return 1; }
     wait_tun || { kill_mihomo; tail -n 80 "$MIHOMO_LOG" >&2; fail "Mihomo не создал $TUN_DEVICE"; return 1; }
     route_start || { kill_mihomo; route_stop >/dev/null 2>&1 || true; fail "Маршрутизация не поднялась; оставлен DIRECT"; return 1; }
+    wait_route_ready || { kill_mihomo; route_stop >/dev/null 2>&1 || true; tail -n 80 "$MIHOMO_LOG" >&2; fail "Маршрутизация не стала рабочей после запуска; оставлен DIRECT"; return 1; }
     cp -f "$CONFIG" "$BACKUPS/config.last-good.yaml" 2>/dev/null || true
     ok "Mihomo запущен, PID=$p; profile=$PLATFORM"
 }
@@ -925,12 +1075,20 @@ watchdog_check(){
     watchdog_connectivity_step || true
     [ -f "$WAN_OFFLINE" ] && return 0
     if ! running_pid >/dev/null 2>&1; then
-      with_start_lock start_runtime >/dev/null 2>&1 || true
+      rotate_log "$WATCHDOG_LOG" 1048576
+      printf '[%s] watchdog: Mihomo down; recovery start\n' "$(now)" >> "$WATCHDOG_LOG" 2>/dev/null || true
+      if ! with_start_lock start_runtime >> "$WATCHDOG_LOG" 2>&1; then
+        printf '[%s] watchdog: recovery failed\n' "$(now)" >> "$WATCHDOG_LOG" 2>/dev/null || true
+      fi
       return 0
     fi
     if ! runtime_health_ok; then
+      rotate_log "$WATCHDOG_LOG" 1048576
+      printf '[%s] watchdog: runtime unhealthy; restart\n' "$(now)" >> "$WATCHDOG_LOG" 2>/dev/null || true
       stop_runtime
-      with_start_lock start_runtime >/dev/null 2>&1 || true
+      if ! with_start_lock start_runtime >> "$WATCHDOG_LOG" 2>&1; then
+        printf '[%s] watchdog: restart failed\n' "$(now)" >> "$WATCHDOG_LOG" 2>/dev/null || true
+      fi
     fi
 }
 watchdog_loop(){
@@ -1022,13 +1180,8 @@ restart(){
 
     [ "$rc" -eq 0 ] && return 0
 
-    if [ -f "$BACKUPS/config.last-good.yaml" ]; then
-        warn "Новый config.yaml не запустился; возвращаю последний рабочий"
-        cp -f "$BACKUPS/config.last-good.yaml" "$CONFIG" || return 1
-        if internet_probe_once || wan_nvram_up; then
-            with_start_lock start_runtime >/dev/null 2>&1 || true
-        fi
-    fi
+    warn "Конфиг синтаксически корректен, но runtime не поднялся; config.yaml не откатываю автоматически"
+    warn "Проверь $MIHOMO_LOG и $WATCHDOG_LOG: причина может быть в TUN/uplink/маршрутизации, а не в конфиге"
     return 1
 }
 
@@ -1063,7 +1216,12 @@ boot(){
     fi
 
     echo "$$" > "$BOOT_PIDFILE"
-    repair_opt >/dev/null 2>&1 || true
+    repair_opt >/dev/null 2>&1 || {
+        log_event ERROR boot "Optware namespace not ready"
+        rm -f "$BOOT_PIDFILE"
+        watchdog_start
+        return 0
+    }
     refresh_path
 
     waited=0
@@ -1072,6 +1230,11 @@ boot(){
         sleep 5
         waited=$((waited + 5))
     done
+
+    if [ "${LEGACY:-1}" = 0 ]; then
+        ensure_tun || log_event WARN boot "TUN device is not ready yet"
+        wait_modern_uplink "$BOOT_WAIT" || log_event WARN boot "modern uplink did not become stable within ${BOOT_WAIT}s"
+    fi
 
     rm -f "$BOOT_PIDFILE"
 
@@ -1368,14 +1531,20 @@ menu_find_stty(){
     MENU_STTY_BACKEND=""
     MENU_STTY_BIN=""
 
-    stty_bin="$(command -v stty 2>/dev/null)"
+    stty_bin=""
+    for p in /usr/bin/stty /bin/stty /usr/sbin/stty /sbin/stty /opt/bin/stty; do
+        [ -x "$p" ] && { stty_bin="$p"; break; }
+    done
     if [ -n "$stty_bin" ] && [ -x "$stty_bin" ]; then
         MENU_STTY_BACKEND="binary"
         MENU_STTY_BIN="$stty_bin"
         return 0
     fi
 
-    busybox_bin="$(command -v busybox 2>/dev/null)"
+    busybox_bin=""
+    for p in /bin/busybox /usr/bin/busybox /sbin/busybox /usr/sbin/busybox; do
+        [ -x "$p" ] && { busybox_bin="$p"; break; }
+    done
     if [ -n "$busybox_bin" ] && "$busybox_bin" stty --help >/dev/null 2>&1; then
         MENU_STTY_BACKEND="busybox"
         MENU_STTY_BIN="$busybox_bin"
@@ -1744,10 +1913,24 @@ doctor(){
 
     find_dm_root >/dev/null 2>&1 && echo "  Download Master: $DM_ROOT" || echo "  Download Master: FAIL"
     ensure_optware_link >/dev/null 2>&1 && echo "  /tmp/opt: OK" || echo "  /tmp/opt: FAIL"
+    if opt_namespace_write_through_runtime >/dev/null 2>&1; then
+        echo "  /opt -> USB: OK"
+    else
+        echo "  /opt -> USB: FAIL"
+    fi
     find_pkg >/dev/null 2>&1 && echo "  package manager: $PKG" || echo "  package manager: FAIL"
 
     editor="$(find_editor 2>/dev/null)"
     [ -n "$editor" ] && echo "  nano: $editor" || echo "  nano: NOT FOUND"
+    if [ -x "$DM_ROOT/bin/infocmp" ]; then
+        if TERM=xterm-256color run_optware_runtime "$DM_ROOT/bin/infocmp" xterm-256color >/dev/null 2>&1; then
+            echo "  terminfo xterm-256color: OK"
+        else
+            echo "  terminfo xterm-256color: FAIL"
+        fi
+    else
+        echo "  infocmp: MISSING"
+    fi
 
     [ -x /jffs/scripts/usb-mount-script ] && echo "  stock USB hook: OK" || echo "  stock USB hook: FAIL"
     [ -n "$DM_ROOT" ] && [ -x "$DM_ROOT/etc/init.d/S50usb-mount-script" ] \
@@ -1760,7 +1943,7 @@ doctor(){
 }
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.8.1 — что буквально вводить в SSH
+GoshaCrash 3.10.2-rc19 — что буквально вводить в SSH
 
 КАТАЛОГ УСТАНОВКИ
   BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
@@ -1780,7 +1963,7 @@ GoshaCrash 3.8.1 — что буквально вводить в SSH
   gc internet-probe
 
 ПРОВЕРИТЬ SHELL [
-  command -v '['
+  type '['
   /bin/busybox '[' -n "ok" ']'
   echo "BRACKET_RC=$?"
 

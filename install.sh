@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc18"
+INSTALLER_VERSION="3.10.2-rc19"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -103,8 +103,6 @@ find_nvram(){
     for p in /usr/sbin/nvram /sbin/nvram /usr/bin/nvram /bin/nvram; do
         test -x "$p" && { NVRAM_BIN="$p"; return 0; }
     done
-    p="$(command -v nvram 2>/dev/null)"
-    test -n "$p" && test -x "$p" && { NVRAM_BIN="$p"; return 0; }
     return 1
 }
 
@@ -138,7 +136,7 @@ find_tool_basic(){
     for p in "/usr/sbin/$name" "/usr/bin/$name" "/sbin/$name" "/bin/$name"; do
         test -x "$p" && { printf '%s\n' "$p"; return 0; }
     done
-    command -v "$name" 2>/dev/null || return 1
+    return 1
 }
 
 usb_disk_size_mb(){
@@ -521,7 +519,7 @@ tool_path(){
         "/usr/sbin/$name" "/usr/bin/$name" "/sbin/$name" "/bin/$name"; do
         test -n "$p" && test -x "$p" && { printf '%s\n' "$p"; return 0; }
     done
-    command -v "$name" 2>/dev/null || return 1
+    return 1
 }
 
 have(){ tool_path "$1" >/dev/null 2>&1; }
@@ -695,6 +693,106 @@ ensure_optware_link(){
     elif test ! -e /tmp/opt; then
         ln -s "$DM_ROOT" /tmp/opt 2>/dev/null || return 1
     fi
+    return 0
+}
+
+
+OPT_NAMESPACE_STATE="/tmp/goshacrash-opt-bind.state"
+
+find_system_mount(){
+    for p in /bin/mount /sbin/mount /usr/bin/mount /usr/sbin/mount; do
+        test -x "$p" && { printf '%s\n' "$p"; return 0; }
+    done
+    return 1
+}
+
+find_system_umount(){
+    for p in /bin/umount /sbin/umount /usr/bin/umount /usr/sbin/umount; do
+        test -x "$p" && { printf '%s\n' "$p"; return 0; }
+    done
+    return 1
+}
+
+opt_namespace_write_through(){
+    test -n "$DM_ROOT" && test -d "$DM_ROOT" || return 1
+    probe=".goshacrash-opt-probe.$$"
+    rm -f "/opt/$probe" "$DM_ROOT/$probe" 2>/dev/null || true
+
+    if ( : > "/opt/$probe" ) 2>/dev/null; then
+        if test -e "$DM_ROOT/$probe"; then
+            rm -f "/opt/$probe" "$DM_ROOT/$probe" 2>/dev/null || true
+            return 0
+        fi
+        rm -f "/opt/$probe" 2>/dev/null || true
+    fi
+    return 1
+}
+
+preserve_stock_opt_payload(){
+    # Preserve firmware-owned real files/directories that would otherwise be
+    # hidden by the bind mount. Firmware symlinks to /tmp/opt need no copy.
+    for entry in /opt/*; do
+        test -e "$entry" || continue
+        test -L "$entry" && continue
+        name="${entry##*/}"
+        if test -d "$entry"; then
+            mkdir -p "$DM_ROOT/$name" || return 1
+            cp -R "$entry/." "$DM_ROOT/$name/" 2>/dev/null || {
+                fail "Не удалось сохранить штатный /opt/$name перед подготовкой Optware"
+                return 1
+            }
+        elif test -f "$entry"; then
+            cp -f "$entry" "$DM_ROOT/$name" 2>/dev/null || return 1
+        fi
+    done
+    return 0
+}
+
+prepare_optware_namespace(){
+    ensure_optware_link || return 1
+
+    # Legacy ASUSWRT already exposes the whole USB Optware tree as /opt.
+    # Modern stock firmware can expose only a fixed set of read-only links
+    # (/opt/bin, /opt/lib, /opt/share, ...).  In that layout ipkg cannot
+    # create /opt/libexec, /opt/man, /opt/var and silently loses payload.
+    if opt_namespace_write_through; then
+        if awk '$2=="/opt" {found=1} END {exit !found}' /proc/mounts 2>/dev/null; then
+            printf '%s\n' "$DM_ROOT" > "$OPT_NAMESPACE_STATE" 2>/dev/null || true
+        fi
+        return 0
+    fi
+
+    mount_bin="$(find_system_mount 2>/dev/null)"
+    test -n "$mount_bin" || {
+        fail "Штатный mount не найден; невозможно подготовить writable /opt для ipkg"
+        return 1
+    }
+
+    # If something else is already mounted on /opt, never cover it blindly.
+    if awk '$2=="/opt" {found=1} END {exit !found}' /proc/mounts 2>/dev/null; then
+        fail "/opt уже является отдельной файловой системой, но не ведёт на Download Master"
+        return 1
+    fi
+
+    preserve_stock_opt_payload || return 1
+    touch "$DM_ROOT/.goshacrash-opt-root" 2>/dev/null || true
+
+    pkg_log "OPT NAMESPACE: bind $DM_ROOT -> /opt"
+    "$mount_bin" -o bind "$DM_ROOT" /opt >> "$BASE/logs/packages.log" 2>&1 || \
+      "$mount_bin" --bind "$DM_ROOT" /opt >> "$BASE/logs/packages.log" 2>&1 || {
+        fail "Не удалось bind-mount Download Master на /opt; ipkg на этой прошивке не сможет ставить полный payload"
+        return 1
+      }
+
+    if ! opt_namespace_write_through; then
+        umount_bin="$(find_system_umount 2>/dev/null)"
+        test -n "$umount_bin" && "$umount_bin" /opt >/dev/null 2>&1 || true
+        fail "Проверка /opt -> USB после bind-mount не прошла"
+        return 1
+    fi
+
+    printf '%s\n' "$DM_ROOT" > "$OPT_NAMESPACE_STATE" 2>/dev/null || true
+    say "Optware namespace: /opt -> $DM_ROOT (writable USB bind)"
     return 0
 }
 
@@ -940,6 +1038,7 @@ verify_dm_payload_natural(){
 
 verify_ipkg_runtime(){
     ensure_optware_link >/dev/null 2>&1 || return 1
+    prepare_optware_namespace || return 1
     repair_optware_abi || return 1
     prepare_path
     test -n "$PKG" || find_pkg || return 1
@@ -1087,7 +1186,7 @@ find_nano(){
         "$DM_ROOT/sbin/nano"; do
         test -x "$p" && { printf '%s\n' "$p"; return 0; }
     done
-    command -v nano 2>/dev/null || return 1
+    return 1
 }
 
 restart_download_master_env(){
@@ -1135,6 +1234,103 @@ repair_nano_package(){
     nano_bin="$(find_nano 2>/dev/null)"
     test -n "$nano_bin" || return 1
     run_optware "$nano_bin" --version >/dev/null 2>&1
+}
+
+
+terminfo_present(){
+    test -d "$DM_ROOT/share/terminfo" || return 1
+    first="$(/bin/busybox find "$DM_ROOT/share/terminfo" -type f -print 2>/dev/null | /bin/busybox head -n 1)"
+    test -n "$first"
+}
+
+
+terminfo_ready(){
+    terminfo_present || return 1
+
+    if test -x "$DM_ROOT/bin/infocmp"; then
+        TERM=xterm run_optware "$DM_ROOT/bin/infocmp" xterm >/dev/null 2>&1 || return 1
+        TERM=xterm-256color run_optware "$DM_ROOT/bin/infocmp" xterm-256color >/dev/null 2>&1 || return 1
+        return 0
+    fi
+
+    xterm="$(/bin/busybox find "$DM_ROOT/share/terminfo" -type f \( -name xterm -o -name xterm-256color \) -print 2>/dev/null | /bin/busybox head -n 1)"
+    test -n "$xterm"
+}
+
+optware_ng_feed_url(){
+    conf="$DM_ROOT/etc/ipkg.conf"
+    test -f "$conf" || return 1
+    awk '$1=="src/gz" && $2 ~ /armeabi-ng/ {print $3; exit}' "$conf" 2>/dev/null
+}
+
+optware_ng_package_filename(){
+    package="$1"
+    for list in "$DM_ROOT"/lib/ipkg/lists/*armeabi-ng*; do
+        test -f "$list" || continue
+        line="$(awk -v pkg="$package" '
+          $1=="Package:" {inside=($2==pkg)}
+          inside && $1=="Filename:" {print $2; exit}
+        ' "$list" 2>/dev/null)"
+        test -n "$line" && { printf '%s\n' "$line"; return 0; }
+    done
+    return 1
+}
+
+repair_terminfo_package(){
+    terminfo_ready && {
+        say "Optware terminfo: xterm + xterm-256color OK"
+        return 0
+    }
+
+    warn "Optware terminfo отсутствует; восстанавливаю ncurses-base из Optware-NG"
+    prepare_optware_namespace || return 1
+    verify_ipkg_runtime || return 1
+    refresh_tools
+
+    filename="$(optware_ng_package_filename ncurses-base 2>/dev/null)"
+    if test -z "$filename"; then
+        pkg_update_index_once || return 1
+        filename="$(optware_ng_package_filename ncurses-base 2>/dev/null)"
+    fi
+    test -n "$filename" || {
+        fail "В индексе Optware-NG не найден Filename для ncurses-base"
+        return 1
+    }
+
+    feed="$(optware_ng_feed_url 2>/dev/null)"
+    test -n "$feed" || {
+        fail "В ipkg.conf не найден feed Optware-NG armeabi-ng"
+        return 1
+    }
+
+    case "$filename" in
+        http://*|https://*) url="$filename" ;;
+        *) url="${feed%/}/${filename#/}" ;;
+    esac
+
+    ipk="$TMP_ROOT/ncurses-base-optware-ng.ipk"
+    say "Optware: загружаю штатный ncurses-base из Optware-NG"
+    fetch "$url" "$ipk" || {
+        fail "Не удалось скачать ncurses-base из Optware-NG"
+        return 1
+    }
+
+    pkg_log "RUN: $PKG -force-downgrade -force-reinstall install $ipk"
+    run_pkg "$PKG" -force-downgrade -force-reinstall install "$ipk" >> "$BASE/logs/packages.log" 2>&1 || {
+        warn "ipkg не принял force-downgrade; пробую force-reinstall"
+        run_pkg "$PKG" -force-reinstall install "$ipk" >> "$BASE/logs/packages.log" 2>&1 || return 1
+    }
+
+    repair_optware_abi >/dev/null 2>&1 || true
+    prepare_path
+
+    terminfo_ready || {
+        fail "ncurses-base установлен, но xterm/xterm-256color terminfo не читается"
+        return 1
+    }
+
+    ok "Optware terminfo восстановлен через ncurses-base (xterm + xterm-256color)"
+    return 0
 }
 
 
@@ -1218,6 +1414,7 @@ verify_persistent_optware(){
         return 1
     }
 
+    prepare_optware_namespace || return 1
     repair_optware_abi || return 1
     verify_ipkg_runtime || return 1
 
@@ -1372,62 +1569,10 @@ check_usb_filesystem(){
     esac
 }
 
-prepare_packages_modern(){
-    prepare_path
-    check_usb_filesystem
-    refresh_tools
-
-    find_pkg || {
-        fail "Download Master установлен, но ipkg/opkg не найден"
-        return 1
-    }
-    say "Менеджер пакетов Download Master: $PKG"
-    verify_ipkg_natural || return 1
-
-    pkg_natural_update || {
-        fail "ipkg update не удался. См. $BASE/logs/packages.log"
-        return 1
-    }
-
-    pkg_natural_install nano || {
-        fail "ipkg install nano не удался"
-        return 1
-    }
-    pkg_natural_install unzip || {
-        fail "ipkg install unzip не удался"
-        return 1
-    }
-    pkg_natural_install openssh-sftp-server || {
-        fail "ipkg install openssh-sftp-server не удался"
-        return 1
-    }
-
-    ensure_optware_link >/dev/null 2>&1 || true
-    prepare_path
-    refresh_tools
-    verify_dm_payload_natural || {
-        fail "Download Master установил пакеты не полностью. См. $BASE/logs/packages.log"
-        return 1
-    }
-
-    UNZIP_BIN=""
-    if test -x "$DM_ROOT/bin/unzip"; then
-        UNZIP_BIN="$DM_ROOT/bin/unzip"
-    elif test -x "$DM_ROOT/bin/unzip-unzip"; then
-        UNZIP_BIN="$DM_ROOT/bin/unzip-unzip"
-    fi
-    NANO_BIN="$DM_ROOT/bin/nano"
-
-    test -x "$GZIP_BIN" || { fail "Штатный gzip ASUSWRT не найден"; return 1; }
-    test -n "$DOWNLOADER" || { fail "Штатный wget/curl ASUSWRT не найден"; return 1; }
-
-    say "Инструменты DM: nano=$NANO_BIN, unzip=$UNZIP_BIN, sftp=$(cat "$BASE/state/sftp-server.path" 2>/dev/null)"
-    return 0
-}
-
 prepare_packages(){
     prepare_path
     check_usb_filesystem
+    prepare_optware_namespace || return 1
     find_pkg || { fail "В Download Master не найден ipkg/opkg"; return 1; }
     say "Менеджер пакетов ASUS: $PKG"
 
@@ -1452,9 +1597,10 @@ prepare_packages(){
         say "Готовлю nano"
         repair_nano_package || { fail "Не удалось получить nano"; return 1; }
     else
-        say "nano уже есть на USB — пропускаю"
+        say "nano уже есть на USB — проверяю terminal database"
     fi
 
+    repair_terminfo_package || { fail "Не удалось подготовить terminfo для nano"; return 1; }
     refresh_tools
 
     if test ! -x "$GZIP_BIN"; then
@@ -1747,10 +1893,18 @@ install_network_helper(){
 generate_dashboard_secret(){
     secret=""
     if test -r /dev/urandom; then
-        if command -v od >/dev/null 2>&1; then
-            secret="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
-        elif command -v hexdump >/dev/null 2>&1; then
-            secret="$(hexdump -n 16 -e '16/1 "%02x"' /dev/urandom 2>/dev/null)"
+        od_bin=""
+        for p in /usr/bin/od /bin/od /usr/sbin/od /sbin/od; do
+            test -x "$p" && { od_bin="$p"; break; }
+        done
+        hex_bin=""
+        for p in /usr/bin/hexdump /bin/hexdump /usr/sbin/hexdump /sbin/hexdump; do
+            test -x "$p" && { hex_bin="$p"; break; }
+        done
+        if test -n "$od_bin"; then
+            secret="$("$od_bin" -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+        elif test -n "$hex_bin"; then
+            secret="$("$hex_bin" -n 16 -e '16/1 "%02x"' /dev/urandom 2>/dev/null)"
         fi
     fi
     test -n "$secret" || secret="GC$(date +%s 2>/dev/null)$$"
@@ -2274,7 +2428,7 @@ remove_pre3712_autostart(){
 
 install_hooks(){
     JFFS_DIR="/jffs/addons/goshacrash"
-    mkdir -p "$JFFS_DIR" /jffs/scripts /jffs/configs "$DM_ROOT/bin" "$DM_ROOT/etc/init.d" || return 1
+    mkdir -p "$JFFS_DIR" /jffs/scripts /jffs/configs /jffs/etc "$DM_ROOT/bin" "$DM_ROOT/etc/init.d" || return 1
     printf '%s\n' "$BASE" > "$JFFS_DIR/base" || return 1
 
     cat > "$JFFS_DIR/start.sh" <<'HOOK'
@@ -2290,10 +2444,16 @@ while test -z "$BASE" || test ! -x "$BASE/goshacrash.sh"; do
 done
 mkdir -p "$BASE/run" "$BASE/state" 2>/dev/null || true
 date '+%Y-%m-%d %H:%M:%S' > "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-if command -v nohup >/dev/null 2>&1; then
-  GOSHACRASH_BASE="$BASE" nohup "$BASE/goshacrash.sh" boot </dev/null >/dev/null 2>&1 &
+mkdir -p "$BASE/logs" 2>/dev/null || true
+printf '[%s] autostart hook: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
+NOHUP=""
+for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup; do
+  test -x "$p" && { NOHUP="$p"; break; }
+done
+if test -n "$NOHUP"; then
+  GOSHACRASH_BASE="$BASE" "$NOHUP" "$BASE/goshacrash.sh" boot </dev/null >> "$BASE/logs/boot.log" 2>&1 &
 else
-  GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" boot </dev/null >/dev/null 2>&1 &
+  GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" boot </dev/null >> "$BASE/logs/boot.log" 2>&1 &
 fi
 HOOK
     chmod 755 "$JFFS_DIR/start.sh" || return 1
@@ -2336,6 +2496,19 @@ test -n "$BASE" || exit 0
 case "$BASE" in
   "$MOUNT_POINT"/*)
     test -x "$BASE/goshacrash.sh" && GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" service-stop >/dev/null 2>&1 || true
+    if test -f /tmp/goshacrash-opt-bind.state; then
+      OPTDM="$(cat /tmp/goshacrash-opt-bind.state 2>/dev/null)"
+      case "$OPTDM" in
+        "$MOUNT_POINT"/*)
+          for u in /bin/umount /sbin/umount /usr/bin/umount /usr/sbin/umount; do
+            test -x "$u" || continue
+            "$u" /opt >/dev/null 2>&1 || "$u" -l /opt >/dev/null 2>&1 || true
+            break
+          done
+          rm -f /tmp/goshacrash-opt-bind.state 2>/dev/null || true
+          ;;
+      esac
+    fi
     ;;
 esac
 exit 0
@@ -2349,6 +2522,7 @@ HOOK
     write_nano_wrapper /jffs/scripts/nano
     write_command_wrapper "$DM_ROOT/bin/gc"
     test -d /opt/bin && test -w /opt/bin && write_command_wrapper /opt/bin/gc 2>/dev/null || true
+    add_once /jffs/etc/profile 'export PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"'
     add_once /jffs/configs/profile.add 'export PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"'
 
     remove_pre3712_autostart

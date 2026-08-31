@@ -1,18 +1,20 @@
-# GoshaCrash 3.10.2-rc18
+# GoshaCrash 3.10.2-rc19
 
-Goal: BT10 differs from RT-AC68U only where platform/routing requires it.
+Main goal: fix the real stock ZenWiFi BT10 environment instead of patching nano/SFTP separately.
 
-Common path restored from the proven rc12/RT-AC68U implementation:
-- Download Master / Optware package preparation;
-- ipkg runtime handling;
-- nano/unzip handling;
-- openssh-sftp-server handling;
-- /opt-based CLI/hooks;
-- gc edit behavior (no BT10-specific TERM rewrite).
+Common ASUS path remains Download Master / Optware / ipkg.
 
-Modern-only pieces retained:
-- BT10 armv7 Mihomo;
-- system TUN;
-- auto-route + auto-redirect;
-- modern TUN/firewall preflight;
-- BT10/fdisk fixes from later RCs.
+New in rc19:
+- detect read-only ASUS /opt skeleton;
+- preserve firmware /opt/scripts and bind the full Download Master root to /opt;
+- verify /opt writes physically land on USB before ipkg work;
+- unmount the GoshaCrash /opt bind on USB removal;
+- repair missing terminfo with the ncurses-base package from the Optware-NG feed;
+- SFTP installs only after writable /opt exists, so /opt/libexec can be created;
+- stock BT10 PATH is persisted in /jffs/etc/profile as well as profile.add;
+- no command -v dependency;
+- modern boot waits for TUN + stable physical uplink before Mihomo;
+- boot/watchdog recovery errors are logged instead of discarded;
+- runtime startup failure no longer automatically rolls back a valid config.
+
+Legacy RT-AC68U behavior is preserved: if /opt already resolves to USB, the new namespace code is a no-op.

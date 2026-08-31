@@ -4,7 +4,7 @@ GoshaCrash — установщик и контроллер Mihomo для ASUSWR
 
 Этот RC в первую очередь проверяется на **ASUS RT-AC68U** со старым ASUSWRT / Linux 2.6.36. Для legacy-профиля используется **Mihomo ARMv5 + gVisor**.
 
-> **Тестовая версия:** 3.10.2-rc18  
+> **Тестовая версия:** 3.10.2-rc19  
 > Не публикуйте её как универсально стабильную для всех ASUS до проверки новых ARM64-моделей.
 
 ## Что уже проверено на RT-AC68U
@@ -780,3 +780,48 @@ rc15:
 - modern TUN/firewall capability checks.
 
 Никаких специальных xterm/TERM-подмен для BT10 в package path нет.
+
+
+### rc19: writable /opt namespace + BT10 boot hardening
+
+Исправления основаны на полном дампе реального ZenWiFi BT10.
+
+- На BT10 корень `/opt` находится в read-only squashfs и содержит только
+  заранее созданные ASUS-ссылки (`bin`, `lib`, `share`, `etc`, ...). Поэтому
+  `ipkg` не мог создать новые top-level каталоги вроде `/opt/libexec` и
+  `/opt/man`, хотя затем ошибочно отмечал пакет как установленный.
+- Если `/opt` уже целиком ведёт на Download Master (legacy RT-AC68U), ничего
+  не меняется. Если `/opt` является read-only ASUS skeleton, GoshaCrash
+  сохраняет штатный `/opt/scripts` и bind-mount'ит корень Download Master на
+  `/opt`. После этого `ipkg` получает обычный writable `/opt` на USB и может
+  создавать любые каталоги пакета естественным способом.
+- При USB unmount созданный bind `/opt` снимается до отключения накопителя.
+- `openssh-sftp-server` теперь переустанавливается уже после подготовки
+  writable `/opt`, поэтому `/opt/libexec/sftp-server` должен реально попасть
+  на USB, а не только в базу ipkg.
+- Если terminfo отсутствует, установщик берёт `ncurses-base` именно из
+  Optware-NG feed и делает штатный `ipkg -force-downgrade -force-reinstall`,
+  затем проверяет реальную terminfo database через `infocmp xterm`.
+- Для stock BT10 PATH теперь также записывается в `/jffs/etc/profile`, который
+  реально подключается его `/etc/profile`. `/jffs/configs/profile.add`
+  сохранён для совместимости с другими ASUSWRT/Merlin layout.
+- Убрана зависимость от `command -v`: на исследованном BT10 эта команда
+  отсутствует. Используются конкретные системные пути.
+- Boot modern-профиля ждёт стабильный `ip route get` до старта Mihomo и
+  заранее подготавливает TUN. Watchdog пишет причины recovery failure в
+  `logs/watchdog.log`, а boot hook — в `logs/boot.log`.
+- Runtime failure больше не считается автоматически ошибкой нового
+  `config.yaml`: синтаксически корректный конфиг не откатывается только из-за
+  временной проблемы TUN/uplink/маршрутизации.
+
+На BT10 после установки особенно проверить:
+
+```sh
+which gc
+gc status
+mount | grep ' on /opt '
+ls -ld /opt /opt/libexec /opt/man
+find /opt/share/terminfo -type f | head
+nano
+gc sftp status
+```
