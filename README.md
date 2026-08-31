@@ -4,7 +4,7 @@ GoshaCrash — установщик и контроллер Mihomo для ASUSWR
 
 Этот RC в первую очередь проверяется на **ASUS RT-AC68U** со старым ASUSWRT / Linux 2.6.36. Для legacy-профиля используется **Mihomo ARMv5 + gVisor**.
 
-> **Тестовая версия:** 3.10.2-rc19  
+> **Тестовая версия:** 3.10.2-rc21  
 > Не публикуйте её как универсально стабильную для всех ASUS до проверки новых ARM64-моделей.
 
 ## Что уже проверено на RT-AC68U
@@ -821,7 +821,35 @@ which gc
 gc status
 mount | grep ' on /opt '
 ls -ld /opt /opt/libexec /opt/man
-find /opt/share/terminfo -type f | head
+find /opt/share/terminfo -name xterm -print
+find /opt/share/terminfo -name xterm-256color -print
 nano
 gc sftp status
 ```
+
+### rc20: terminfo без downgrade ASUS ncurses
+
+Реальный BT10 показал ещё одну особенность смешанного Download Master feed:
+`ncurses-base 5.7-8` остаётся зарегистрированным ASUS-пакетом, его утилиты
+могут физически существовать, но не запускаться на современной прошивке
+(`infocmp: not found` при существующем файле — признак несовместимого ELF
+loader/runtime). Поэтому rc20 больше не пытается заменять этот пакет целиком.
+
+- `ncurses-base` из Optware-NG скачивается по тому же индексу `ipkg`;
+- `ipkg -o <offline-root>` распаковывает пакет в отдельный staging root;
+- из staging в USB `/opt/share/terminfo` копируются только compiled terminal
+  descriptions — архитектурно-независимые данные;
+- пакетная база Download Master и ASUS `ncurses-base 5.7-8` не изменяются;
+- готовность nano проверяется по физическому наличию `xterm` и
+  `xterm-256color`, а не запуском несовместимого `infocmp`.
+
+
+### rc21: ручная верификация BT10 package path
+
+rc21 переносит в installer ровно ту последовательность, которая была проверена вручную на реальном ZenWiFi BT10.
+
+- После bind-mount Download Master на `/opt` заранее создаются `/opt/libexec`, `/opt/man/man1` и `/opt/var`. Ручной тест подтвердил, что после этого обычный `ipkg install openssh-sftp-server` физически создаёт `/opt/libexec/sftp-server`.
+- `ncurses-base 5.7-8` от ASUS не удаляется и не downgrade-ится. Из Optware-NG пакет `ncurses-base 5.7-7` распаковывается в приватный staging root командой `ipkg -o <root> -force-depends install <ipk>`.
+- Из staging копируется только `opt/share/terminfo`. На реальном BT10 в нём подтверждены `x/xterm`, `x/xterm-256color` и `v/vt100`; после копирования обычный `nano` с `TERM=xterm-256color` запускается нормально.
+- В terminfo-проверках больше нет `find -type`/`find -path`: BusyBox 1.24.1 на BT10 этих predicates не поддерживает. Проверяются конкретные compiled entries.
+- Runtime после reboot создаёт тот же полный Optware layout, а `gc doctor` проверяет terminfo по файлам и не запускает несовместимый `infocmp`.

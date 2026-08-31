@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc19"
+INSTALLER_VERSION="3.10.2-rc21"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -748,6 +748,17 @@ preserve_stock_opt_payload(){
     return 0
 }
 
+prepare_optware_topdirs(){
+    # Stock BT10 firmware does not provide top-level /opt/libexec, /opt/man
+    # or /opt/var in its read-only skeleton.  Once /opt is mapped to USB,
+    # create the conventional Optware layout before any package extraction.
+    mkdir -p \
+        "$DM_ROOT/libexec" \
+        "$DM_ROOT/man/man1" \
+        "$DM_ROOT/var" || return 1
+    return 0
+}
+
 prepare_optware_namespace(){
     ensure_optware_link || return 1
 
@@ -756,6 +767,7 @@ prepare_optware_namespace(){
     # (/opt/bin, /opt/lib, /opt/share, ...).  In that layout ipkg cannot
     # create /opt/libexec, /opt/man, /opt/var and silently loses payload.
     if opt_namespace_write_through; then
+        prepare_optware_topdirs || return 1
         if awk '$2=="/opt" {found=1} END {exit !found}' /proc/mounts 2>/dev/null; then
             printf '%s\n' "$DM_ROOT" > "$OPT_NAMESPACE_STATE" 2>/dev/null || true
         fi
@@ -791,8 +803,14 @@ prepare_optware_namespace(){
         return 1
     fi
 
+    prepare_optware_topdirs || {
+        fail "Не удалось создать стандартные каталоги Optware: libexec/man/var"
+        return 1
+    }
+
     printf '%s\n' "$DM_ROOT" > "$OPT_NAMESPACE_STATE" 2>/dev/null || true
     say "Optware namespace: /opt -> $DM_ROOT (writable USB bind)"
+    say "Optware layout: /opt/libexec + /opt/man/man1 + /opt/var готовы"
     return 0
 }
 
@@ -1237,24 +1255,35 @@ repair_nano_package(){
 }
 
 
-terminfo_present(){
-    test -d "$DM_ROOT/share/terminfo" || return 1
-    first="$(/bin/busybox find "$DM_ROOT/share/terminfo" -type f -print 2>/dev/null | /bin/busybox head -n 1)"
-    test -n "$first"
+terminfo_entry_present(){
+    name="$1"
+    test -n "$name" || return 1
+
+    # Real BT10 BusyBox find has no -type/-path support.  Compiled terminfo
+    # from Optware-NG uses the classic first-letter layout, so check the exact
+    # files that were verified manually on stock BT10.
+    case "$name" in
+        xterm|xterm-256color)
+            test -s "$DM_ROOT/share/terminfo/x/$name"
+            ;;
+        vt100)
+            test -s "$DM_ROOT/share/terminfo/v/$name"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 
 terminfo_ready(){
-    terminfo_present || return 1
-
-    if test -x "$DM_ROOT/bin/infocmp"; then
-        TERM=xterm run_optware "$DM_ROOT/bin/infocmp" xterm >/dev/null 2>&1 || return 1
-        TERM=xterm-256color run_optware "$DM_ROOT/bin/infocmp" xterm-256color >/dev/null 2>&1 || return 1
-        return 0
-    fi
-
-    xterm="$(/bin/busybox find "$DM_ROOT/share/terminfo" -type f \( -name xterm -o -name xterm-256color \) -print 2>/dev/null | /bin/busybox head -n 1)"
-    test -n "$xterm"
+    # Do not execute ncurses-base helper binaries here.  On modern BT10 the
+    # ASUS 5.7-8 package can contain ARM binaries with a legacy ELF loader,
+    # so an existing /opt/bin/infocmp may still fail with ENOENT.  Nano only
+    # needs the compiled terminal descriptions themselves.
+    terminfo_entry_present xterm || return 1
+    terminfo_entry_present xterm-256color || return 1
+    return 0
 }
 
 optware_ng_feed_url(){
@@ -1282,7 +1311,7 @@ repair_terminfo_package(){
         return 0
     }
 
-    warn "Optware terminfo отсутствует; восстанавливаю ncurses-base из Optware-NG"
+    warn "Optware terminfo отсутствует; извлекаю terminal database из ncurses-base Optware-NG"
     prepare_optware_namespace || return 1
     verify_ipkg_runtime || return 1
     refresh_tools
@@ -1309,30 +1338,68 @@ repair_terminfo_package(){
     esac
 
     ipk="$TMP_ROOT/ncurses-base-optware-ng.ipk"
+    stage="$TMP_ROOT/ncurses-base-offline"
+    rm -rf "$stage" 2>/dev/null || true
+    mkdir -p "$stage" || return 1
+
     say "Optware: загружаю штатный ncurses-base из Optware-NG"
     fetch "$url" "$ipk" || {
         fail "Не удалось скачать ncurses-base из Optware-NG"
         return 1
     }
 
-    pkg_log "RUN: $PKG -force-downgrade -force-reinstall install $ipk"
-    run_pkg "$PKG" -force-downgrade -force-reinstall install "$ipk" >> "$BASE/logs/packages.log" 2>&1 || {
-        warn "ipkg не принял force-downgrade; пробую force-reinstall"
-        run_pkg "$PKG" -force-reinstall install "$ipk" >> "$BASE/logs/packages.log" 2>&1 || return 1
-    }
+    # Do NOT downgrade ASUS' installed ncurses-base 5.7-8 in-place.  That
+    # package belongs to Download Master and its helper binaries may target a
+    # legacy loader not provided by modern ASUSWRT.  ipkg 0.99.163 supports an
+    # offline root, so use the same package manager to unpack the exact
+    # Optware-NG package into a private staging root, then copy only compiled
+    # terminfo data to the real USB tree.  This leaves the DM package database
+    # and libraries untouched.
+    # This is the exact sequence verified manually on stock BT10 with
+    # ipkg 0.99.163.  -force-depends is required because the private offline
+    # root intentionally does not contain the already-installed uclibc-opt.
+    # ipkg may still print a dependency warning after successfully unpacking;
+    # the physical payload below is authoritative.
+    pkg_log "RUN OFFLINE: $PKG -o $stage -force-depends install $ipk"
+    run_pkg "$PKG" -o "$stage" -force-depends install "$ipk" >> "$BASE/logs/packages.log" 2>&1 || \
+      warn "offline ipkg вернул ненулевой код; проверяю фактически распакованный payload"
 
-    repair_optware_abi >/dev/null 2>&1 || true
-    prepare_path
+    staged_terminfo=""
+    for d in \
+        "$stage/opt/share/terminfo" \
+        "$stage/share/terminfo" \
+        "$stage/tmp/opt/share/terminfo"
+    do
+        if test -s "$d/x/xterm" && test -s "$d/x/xterm-256color"; then
+            staged_terminfo="$d"
+            break
+        fi
+    done
 
-    terminfo_ready || {
-        fail "ncurses-base установлен, но xterm/xterm-256color terminfo не читается"
+    test -n "$staged_terminfo" || {
+        fail "ncurses-base Optware-NG не дал xterm/xterm-256color в offline root"
         return 1
     }
 
-    ok "Optware terminfo восстановлен через ncurses-base (xterm + xterm-256color)"
+    say "Optware terminfo staging: xterm + xterm-256color найдены"
+
+    mkdir -p "$DM_ROOT/share/terminfo" || return 1
+    cp -R "$staged_terminfo/." "$DM_ROOT/share/terminfo/" >> "$BASE/logs/packages.log" 2>&1 || {
+        fail "Не удалось сохранить terminfo на USB"
+        return 1
+    }
+
+    prepare_path
+
+    terminfo_ready || {
+        fail "После offline extraction нет xterm/xterm-256color terminfo"
+        return 1
+    }
+
+    printf '%s\n' "Optware-NG: ${filename##*/}" > "$BASE/state/terminfo-source.txt" 2>/dev/null || true
+    ok "Optware terminfo восстановлен из Optware-NG без замены ASUS ncurses-base"
     return 0
 }
-
 
 
 find_sftp_server(){
@@ -2157,7 +2224,7 @@ find_ui_root(){
     for p in "$unpack/index.html" "$unpack"/*/index.html "$unpack"/*/*/index.html; do
         test -f "$p" && { dirname "$p"; return 0; }
     done
-    p="$(find "$unpack" -type f -name index.html 2>/dev/null | head -n 1)"
+    p="$(find "$unpack" -name index.html -print 2>/dev/null | head -n 1)"
     test -n "$p" && { dirname "$p"; return 0; }
     return 1
 }

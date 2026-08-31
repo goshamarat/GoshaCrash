@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc19"
-BUILD_ID="2026-08-31-opt-bind-boot-ready-rc19"
+VERSION="3.10.2-rc21"
+BUILD_ID="2026-08-31-bt10-optware-manual-verified-rc21"
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.
@@ -291,10 +291,20 @@ preserve_stock_opt_payload_runtime(){
     return 0
 }
 
+prepare_optware_topdirs_runtime(){
+    [ -n "$DM_ROOT" ] && [ -d "$DM_ROOT" ] || return 1
+    mkdir -p \
+        "$DM_ROOT/libexec" \
+        "$DM_ROOT/man/man1" \
+        "$DM_ROOT/var" 2>/dev/null || return 1
+    return 0
+}
+
 prepare_optware_namespace_runtime(){
     ensure_optware_link || return 1
 
     if opt_namespace_write_through_runtime; then
+        prepare_optware_topdirs_runtime || return 1
         if awk '$2=="/opt" {found=1} END {exit !found}' /proc/mounts 2>/dev/null; then
             printf '%s\n' "$DM_ROOT" > "$OPT_NAMESPACE_STATE" 2>/dev/null || true
         fi
@@ -320,8 +330,9 @@ prepare_optware_namespace_runtime(){
         return 1
     }
 
+    prepare_optware_topdirs_runtime || return 1
     printf '%s\n' "$DM_ROOT" > "$OPT_NAMESPACE_STATE" 2>/dev/null || true
-    log_event INFO opt "writable /opt bound to $DM_ROOT"
+    log_event INFO opt "writable /opt bound to $DM_ROOT; libexec/man/var ready"
     return 0
 }
 optware_runtime_ready(){
@@ -1922,14 +1933,10 @@ doctor(){
 
     editor="$(find_editor 2>/dev/null)"
     [ -n "$editor" ] && echo "  nano: $editor" || echo "  nano: NOT FOUND"
-    if [ -x "$DM_ROOT/bin/infocmp" ]; then
-        if TERM=xterm-256color run_optware_runtime "$DM_ROOT/bin/infocmp" xterm-256color >/dev/null 2>&1; then
-            echo "  terminfo xterm-256color: OK"
-        else
-            echo "  terminfo xterm-256color: FAIL"
-        fi
+    if [ -s "$DM_ROOT/share/terminfo/x/xterm" ] && [ -s "$DM_ROOT/share/terminfo/x/xterm-256color" ]; then
+        echo "  terminfo xterm/xterm-256color: OK"
     else
-        echo "  infocmp: MISSING"
+        echo "  terminfo xterm/xterm-256color: FAIL"
     fi
 
     [ -x /jffs/scripts/usb-mount-script ] && echo "  stock USB hook: OK" || echo "  stock USB hook: FAIL"
@@ -1943,7 +1950,7 @@ doctor(){
 }
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.10.2-rc19 — что буквально вводить в SSH
+GoshaCrash 3.10.2-rc21 — что буквально вводить в SSH
 
 КАТАЛОГ УСТАНОВКИ
   BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"

@@ -1,20 +1,23 @@
-# GoshaCrash 3.10.2-rc19
+# GoshaCrash 3.10.2-rc21
 
-Main goal: fix the real stock ZenWiFi BT10 environment instead of patching nano/SFTP separately.
+BT10 package-path fixes are now based on commands verified manually on the real router.
 
-Common ASUS path remains Download Master / Optware / ipkg.
+Confirmed manually before this build:
+- /dev/sda1 bind-mounted on /opt gives a writable full Optware root;
+- /opt/libexec, /opt/man/man1 and /opt/var can be created on USB;
+- plain ipkg reinstall then creates /opt/libexec/sftp-server successfully;
+- Optware-NG ncurses-base 5.7-7 can be unpacked with:
+    ipkg -o <staging-root> -force-depends install <ipk>
+- that staging payload contains x/xterm, x/xterm-256color and v/vt100;
+- copying only staging opt/share/terminfo to real /opt/share/terminfo makes nano open normally with TERM=xterm-256color.
 
-New in rc19:
-- detect read-only ASUS /opt skeleton;
-- preserve firmware /opt/scripts and bind the full Download Master root to /opt;
-- verify /opt writes physically land on USB before ipkg work;
-- unmount the GoshaCrash /opt bind on USB removal;
-- repair missing terminfo with the ncurses-base package from the Optware-NG feed;
-- SFTP installs only after writable /opt exists, so /opt/libexec can be created;
-- stock BT10 PATH is persisted in /jffs/etc/profile as well as profile.add;
-- no command -v dependency;
-- modern boot waits for TUN + stable physical uplink before Mihomo;
-- boot/watchdog recovery errors are logged instead of discarded;
-- runtime startup failure no longer automatically rolls back a valid config.
+rc21 changes:
+- creates conventional top-level Optware dirs before package work;
+- uses the exact proven offline ipkg command (no -force-defaults);
+- never uses BusyBox find -type/-path in terminfo checks;
+- checks exact compiled terminfo files directly;
+- leaves ASUS ncurses-base 5.7-8 installed and copies only architecture-neutral terminfo data;
+- runtime recreates the same writable /opt layout after reboot;
+- gc doctor checks terminfo data directly instead of executing incompatible infocmp.
 
-Legacy RT-AC68U behavior is preserved: if /opt already resolves to USB, the new namespace code is a no-op.
+Legacy RT-AC68U path remains unchanged when /opt already writes through to Download Master.
