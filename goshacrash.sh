@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc21"
-BUILD_ID="2026-08-31-bt10-optware-manual-verified-rc21"
+VERSION="3.10.2-rc22"
+BUILD_ID="2026-08-31-menu-incremental-redraw-rc22"
 
 # Stock ASUSWRT may invoke hooks with a minimal/empty PATH and some builds
 # do not expose the BusyBox `[` applet as /bin/[.
@@ -1658,18 +1658,58 @@ menu_print_state(){
     esac
 }
 
-menu_item(){
+menu_item_render(){
     current="$1"; number="$2"; label="$3"
     if [ "$current" -eq "$number" ]; then
-        printf '│    \033[1;36m▶ %-34s\033[0m   │\n' "$label"
+        printf '│    \033[1;36m▶ %-34s\033[0m   │' "$label"
     else
-        printf '│      %-34s   │\n' "$label"
+        printf '│      %-34s   │' "$label"
     fi
+}
+
+menu_item(){
+    menu_item_render "$1" "$2" "$3"
+    printf '\n'
+}
+
+menu_item_label(){
+    case "$1" in
+        1) printf 'Status' ;;
+        2) printf 'Edit config' ;;
+        3) printf 'Restart' ;;
+        4) printf 'Stop' ;;
+        5) printf 'Logs' ;;
+        6) printf 'Exit' ;;
+        *) printf '' ;;
+    esac
+}
+
+menu_repaint_item(){
+    current="$1"
+    number="$2"
+    row=$((7 + number))
+    label="$(menu_item_label "$number")"
+    # Rewrite only one menu row.  This avoids clearing/redrawing the whole
+    # terminal on every Up/Down key press (visible flicker over SSH).
+    printf '\033[%s;1H' "$row"
+    menu_item_render "$current" "$number" "$label"
+}
+
+menu_repaint_selection(){
+    old_selected="$1"
+    new_selected="$2"
+    [ "$old_selected" -eq "$new_selected" ] && return 0
+    menu_repaint_item "$new_selected" "$old_selected"
+    menu_repaint_item "$new_selected" "$new_selected"
+    # Keep the hidden cursor below the menu so terminals do not visibly jump.
+    printf '\033[17;1H'
 }
 
 menu_draw(){
     selected="$1"
-    printf '\033[2J\033[H'
+    # Hide cursor before clearing so the initial/full refresh itself is cleaner.
+    # Full refresh is only used on menu entry and after executing an action.
+    printf '\033[?25l\033[2J\033[H'
     printf '\033[1;36m'
     printf '┌───────────────────────────────────────────┐\n'
     printf '│               G O S H A C R A S H         │\n'
@@ -1786,27 +1826,35 @@ menu(){
         return 1
     }
 
-    trap 'menu_stty "$MENU_OLD_STTY" >/dev/null 2>&1; printf "\033[0m\n"' HUP INT TERM EXIT
+    # Always restore the terminal and cursor, including Ctrl+C / lost SSH.
+    trap 'menu_stty "$MENU_OLD_STTY" >/dev/null 2>&1; printf "\033[0m\033[?25h\n"' HUP INT TERM EXIT
+
+    load_platform >/dev/null 2>&1 || true
+    menu_draw "$selected"
 
     while :; do
-        load_platform >/dev/null 2>&1 || true
-        menu_draw "$selected"
         key="$(menu_read_key)"
         case "$key" in
             up)
+                old_selected="$selected"
                 selected=$((selected - 1))
                 [ "$selected" -lt 1 ] && selected=$items_count
+                menu_repaint_selection "$old_selected" "$selected"
                 ;;
             down)
+                old_selected="$selected"
                 selected=$((selected + 1))
                 [ "$selected" -gt "$items_count" ] && selected=1
+                menu_repaint_selection "$old_selected" "$selected"
                 ;;
             quit)
                 break
                 ;;
             enter)
                 menu_stty "$MENU_OLD_STTY" >/dev/null 2>&1 || true
-                printf '\033[2J\033[H'
+                # Actions/editors need a normal visible cursor.  A full screen
+                # refresh here is intentional; arrow navigation never clears it.
+                printf '\033[?25h\033[2J\033[H'
                 case "$selected" in
                     1) status; menu_pause ;;
                     2) edit_config; menu_pause ;;
@@ -1817,13 +1865,14 @@ menu(){
                 esac
                 load_platform >/dev/null 2>&1 || true
                 menu_stty -echo -icanon min 1 time 0 >/dev/null 2>&1 || true
+                menu_draw "$selected"
                 ;;
         esac
     done
 
     menu_stty "$MENU_OLD_STTY" >/dev/null 2>&1 || true
     trap - HUP INT TERM EXIT
-    printf '\033[0m\033[2J\033[H'
+    printf '\033[0m\033[?25h\033[2J\033[H'
 }
 
 autostart_status(){
@@ -1950,7 +1999,7 @@ doctor(){
 }
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.10.2-rc21 — что буквально вводить в SSH
+GoshaCrash 3.10.2-rc22 — что буквально вводить в SSH
 
 КАТАЛОГ УСТАНОВКИ
   BASE="$(cat /jffs/addons/goshacrash/base 2>/dev/null)"
