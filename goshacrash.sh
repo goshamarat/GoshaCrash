@@ -4,7 +4,7 @@
 # Zashboard updates are triggered from the native button inside Zashboard.
 
 VERSION="3.10.2-rc39"
-BUILD_ID="2026-09-01-safe-platform-env-loader-rc39"
+BUILD_ID="2026-09-01-check-config-file-scope-fix-rc39"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -138,55 +138,10 @@ ok(){ printf '%s\n' "[GoshaCrash:OK] $*"; log_event OK main "$*"; }
 warn(){ printf '%s\n' "[GoshaCrash:WARN] $*" >&2; log_event WARN main "$*"; }
 fail(){ printf '%s\n' "[GoshaCrash:ERROR] $*" >&2; log_event ERROR main "$*"; return 1; }
 
-platform_env_value(){
-    key="$1"
-    [ -f "$PLATFORM_FILE" ] || return 1
-
-    # platform.env is data, not executable shell code.  Reading it with `.`
-    # makes a malformed line such as `CONFIG_FILE= /path/config.yaml` execute
-    # the YAML path as a command (BusyBox ash then returns 126).  Parse only
-    # simple KEY=VALUE assignments and never execute file contents.
-    LC_ALL=C awk -v key="$key" '
-      BEGIN { sq=sprintf("%c",39) }
-      {
-        sub(/\r$/, "")
-        line=$0
-        sub(/^[[:space:]]+/, "", line)
-        if (line ~ /^export[[:space:]]+/) sub(/^export[[:space:]]+/, "", line)
-        if (line !~ "^" key "[[:space:]]*=") next
-        sub("^" key "[[:space:]]*=[[:space:]]*", "", line)
-        sub(/[[:space:]]+$/, "", line)
-
-        first=substr(line,1,1)
-        last=substr(line,length(line),1)
-        if (length(line) >= 2 && ((first == "\"" && last == "\"") || (first == sq && last == sq))) {
-          line=substr(line,2,length(line)-2)
-        }
-        print line
-        exit
-      }
-    ' "$PLATFORM_FILE" 2>/dev/null
-}
-
 load_platform(){
     [ -f "$PLATFORM_FILE" ] || { fail "Не найден $PLATFORM_FILE. Повтори установку через install.sh"; return 1; }
-
-    v="$(platform_env_value PLATFORM)";        [ -n "$v" ] && PLATFORM="$v"
-    v="$(platform_env_value LEGACY)";          [ -n "$v" ] && LEGACY="$v"
-    v="$(platform_env_value ROUTING_MODE)";    [ -n "$v" ] && ROUTING_MODE="$v"
-    v="$(platform_env_value TUN_STACK)";       [ -n "$v" ] && TUN_STACK="$v"
-    v="$(platform_env_value MIHOMO_TARGET)";   [ -n "$v" ] && MIHOMO_TARGET="$v"
-    v="$(platform_env_value MIHOMO_SOURCE)";   [ -n "$v" ] && MIHOMO_SOURCE="$v"
-    v="$(platform_env_value MIHOMO_VERSION)";  [ -n "$v" ] && MIHOMO_VERSION="$v"
-    v="$(platform_env_value MIHOMO_URL)";      [ -n "$v" ] && MIHOMO_URL="$v"
-    v="$(platform_env_value GCNET_BIN)";       [ -n "$v" ] && GCNET_BIN="$v"
-    v="$(platform_env_value DM_ROOT)";         [ -n "$v" ] && DM_ROOT="$v"
-    v="$(platform_env_value PKG_PATH)";        [ -n "$v" ] && PKG_PATH="$v"
-    v="$(platform_env_value ROUTER_MODEL)";    [ -n "$v" ] && ROUTER_MODEL="$v"
-    v="$(platform_env_value ROUTER_ARCH)";     [ -n "$v" ] && ROUTER_ARCH="$v"
-    v="$(platform_env_value ROUTER_KERNEL)";   [ -n "$v" ] && ROUTER_KERNEL="$v"
-    v="$(platform_env_value CONFIG_FILE)";     [ -n "$v" ] && CONFIG="$v"
-
+    . "$PLATFORM_FILE"
+    [ -n "${CONFIG_FILE:-}" ] && CONFIG="$CONFIG_FILE"
     [ -n "${GCNET_BIN:-}" ] || GCNET_BIN="$BASE/bin/gcnet"
     [ -n "${DM_ROOT:-}" ] || DM_ROOT=""
     return 0
@@ -857,10 +812,10 @@ required_config(){
 }
 
 check_config_with(){
-    file="$1"
+    mihomo_file="$1"
     load_platform || return 1
     req=0; [ "$MIHOMO_TARGET" = armv5 ] && req=1
-    validate_binary_file "$file" "$req" || return 1
+    validate_binary_file "$mihomo_file" "$req" || return 1
     config_utf8_valid
     utf8_rc=$?
     if [ "$utf8_rc" = 1 ]; then
@@ -868,7 +823,7 @@ check_config_with(){
         return 1
     fi
     required_config || return 1
-    "$file" -t -d "$BASE" -f "$CONFIG"
+    "$mihomo_file" -t -d "$BASE" -f "$CONFIG"
 }
 check_config(){ check_config_with "$BIN"; }
 
