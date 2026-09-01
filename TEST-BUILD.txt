@@ -1,6 +1,6 @@
-GoshaCrash 3.10.2-rc37
+GoshaCrash 3.10.2-rc38
 
-Дополнительные проверки rc37:
+Дополнительные проверки rc38:
 - standalone Esc -> quit
 - ESC [ A / ESC [ B -> Up/Down
 - Q больше не завершает TUI
@@ -8,11 +8,11 @@ GoshaCrash 3.10.2-rc37
 - --reset-config создаёт свежую UTF-8 DIRECT-заглушку
 - повторная UTF-8 диагностика различает кодировку и другие YAML ошибки
 
-# GoshaCrash 3.10.2-rc37
+# GoshaCrash 3.10.2-rc38
 
 Consolidated test build for ASUS RT-AC68U and ZenWiFi BT10.
 
-Key rc37 changes:
+Key rc38 changes:
 - existing config migration strips old whole-line comments before any YAML rewrite; YAML data is preserved byte-for-byte except GoshaCrash-owned fields;
 - canonical Russian comments are regenerated after migration in UTF-8 without BOM;
 - config-related AWK passes in installer/controller use LC_ALL=C so Cyrillic bytes are never locale-transcoded by ASUS BusyBox;
@@ -56,7 +56,7 @@ Validation performed for this artifact:
 - edit-config harness verified that valid edits do not call restart
 - edit-config validation uses only a volatile /tmp rollback copy; no persistent backup is created
 - generated source files decode as UTF-8 and contain no UTF-8 BOM
-- install.sh --help and goshacrash.sh version report 3.10.2-rc37
+- install.sh --help and goshacrash.sh version report 3.10.2-rc38
 - no BusyBox-incompatible find -type or find -path in executable shell code
 - ZIP integrity tested with unzip -t
 - public `gc start` dispatcher verified: it reaches start() instead of the unknown-command branch
@@ -65,8 +65,8 @@ Validation performed for this artifact:
 - interrupted Zashboard swap recovery was tested with an empty recreated ui/ and a valid .ui-old.* directory
 
 Real-router status:
-- RT-AC68U: rc12 lineage is the last fully end-to-end tested legacy baseline; rc37 keeps the same legacy package/routing model.
-- ZenWiFi BT10: package path, writable /opt bind, SFTP payload, terminfo/nano, ARMv7 Mihomo, TUN, and auto routing were proven manually. rc37 menu/edit/JFFS cleanup still requires real-router verification after install/reboot/power-cycle before calling the build stable.
+- RT-AC68U: rc12 lineage is the last fully end-to-end tested legacy baseline; rc38 keeps the same legacy package/routing model.
+- ZenWiFi BT10: package path, writable /opt bind, SFTP payload, terminfo/nano, ARMv7 Mihomo, TUN, and auto routing were proven manually. rc38 menu/edit/JFFS cleanup still requires real-router verification after install/reboot/power-cycle before calling the build stable.
 
 Additional rc34 encoding tests:
 - fresh generated config passes byte-level UTF-8 validator;
@@ -74,7 +74,7 @@ Additional rc34 encoding tests:
 - invalid UTF-8 inside an actual YAML scalar is rejected and the original file is restored;
 - gc check reports encoding failure before invoking Mihomo.
 
-Additional rc37 comment/encoding tests:
+Additional rc38 comment/encoding tests:
 - fresh placeholder config is emitted in one write directly from install.sh, with no AWK/decorator pass;
 - bash, dash and BusyBox ash produce byte-identical auto placeholder configs;
 - fresh auto config generated under bash, dash and BusyBox ash decodes as UTF-8 and parses as YAML;

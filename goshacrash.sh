@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc37"
-BUILD_ID="2026-09-01-esc-menu-config-reset-rc37"
+VERSION="3.10.2-rc38"
+BUILD_ID="2026-09-01-utf8-writer-auto-stub-repair-rc38"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -707,13 +707,13 @@ validate_binary_arch(){
     [ "$magic" = 7f454c46 ] || { fail "Mihomo повреждён: файл не является ELF (header=${hex:-empty})"; return 1; }
     case "$MIHOMO_TARGET" in
       armv5|armv7)
-        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку rc37"; return 1; }
+        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку rc38"; return 1; }
         ;;
       arm64|aarch64)
-        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку rc37"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку rc38"; return 1; }
         ;;
       amd64|amd64-compatible|x86_64)
-        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку rc37"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку rc38"; return 1; }
         ;;
     esac
     return 0
@@ -1804,6 +1804,8 @@ edit_config(){
     fi
 
     rm -f "$original" 2>/dev/null || true
+    mkdir -p "$STATE" 2>/dev/null || true
+    printf '%s\n' user > "$STATE/config-origin" 2>/dev/null || true
     ok "Синтаксис config.yaml: OK"
     say "Конфиг сохранён. Mihomo НЕ перезапускался — для применения выбери Restart."
     return 0
@@ -2396,7 +2398,7 @@ autostart_status(){
     [ -n "$bridge_version" ] && echo "  bridge version: $bridge_version" || echo "  bridge version: old/unknown"
     [ -f "$STATE/autostart-hook-ran" ] && echo "  last hook: $(cat "$STATE/autostart-hook-ran" 2>/dev/null)" || echo "  last hook: never"
     [ -f "$LOGS/coldboot.log" ] && echo "  coldboot trace: $LOGS/coldboot.log" || echo "  coldboot trace: not written yet"
-    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall rc37)" || echo "  legacy JFFS dir: clean"
+    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall rc38)" || echo "  legacy JFFS dir: clean"
     [ -f "$MANUAL_STOP" ] && echo "  manual-stop: YES" || echo "  manual-stop: no"
     return 0
 }
@@ -2538,7 +2540,7 @@ doctor(){
 }
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.10.2-rc37 — что буквально вводить в SSH
+GoshaCrash 3.10.2-rc38 — что буквально вводить в SSH
 
 КАТАЛОГ УСТАНОВКИ
   BASE="$(gc base)"

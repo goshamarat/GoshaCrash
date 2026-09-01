@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc37"
+INSTALLER_VERSION="3.10.2-rc38"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -2339,13 +2339,18 @@ strip_whole_line_comments_install(){
     LC_ALL=C awk '!/^[[:space:]]*#/' "$src" > "$dst"
 }
 
+# Emit UTF-8 deterministically from an ASCII-only shell string. Non-ASCII
+# bytes are stored as POSIX printf %b octal escapes (\0ddd), so generated
+# config comments do not depend on locale, terminal encoding or awk/sed.
+utf8_print_install(){
+    printf '%b\n' "$1"
+}
+
 write_config_header_comments_install(){
-    cat <<'EOF'
-# GoshaCrash — конфигурация Mihomo.
-# Кодировка файла: UTF-8 без BOM.
-# Служебные поля TUN, DNS, API и Zashboard поддерживаются GoshaCrash.
-# Пользовательские proxies, proxy-groups, rule-providers и rules сохраняются.
-EOF
+    utf8_print_install '# GoshaCrash \0342\0200\0224 \0320\0272\0320\0276\0320\0275\0321\0204\0320\0270\0320\0263\0321\0203\0321\0200\0320\0260\0321\0206\0320\0270\0321\0217 Mihomo.'
+    utf8_print_install '# \0320\0232\0320\0276\0320\0264\0320\0270\0321\0200\0320\0276\0320\0262\0320\0272\0320\0260 \0321\0204\0320\0260\0320\0271\0320\0273\0320\0260: UTF-8 \0320\0261\0320\0265\0320\0267 BOM.'
+    utf8_print_install '# \0320\0241\0320\0273\0321\0203\0320\0266\0320\0265\0320\0261\0320\0275\0321\0213\0320\0265 \0320\0277\0320\0276\0320\0273\0321\0217 TUN, DNS, API \0320\0270 Zashboard \0320\0277\0320\0276\0320\0264\0320\0264\0320\0265\0321\0200\0320\0266\0320\0270\0320\0262\0320\0260\0321\0216\0321\0202\0321\0201\0321\0217 GoshaCrash.'
+    utf8_print_install '# \0320\0237\0320\0276\0320\0273\0321\0214\0320\0267\0320\0276\0320\0262\0320\0260\0321\0202\0320\0265\0320\0273\0321\0214\0321\0201\0320\0272\0320\0270\0320\0265 proxies, proxy-groups, rule-providers \0320\0270 rules \0321\0201\0320\0276\0321\0205\0321\0200\0320\0260\0320\0275\0321\0217\0321\0216\0321\0202\0321\0201\0321\0217.'
 }
 
 # Add our comments only after all structural YAML rewrites are finished.
@@ -2355,162 +2360,67 @@ decorate_config_comments_install(){
     src="$1"; dst="$2"
     : > "$dst" || return 1
     write_config_header_comments_install >> "$dst" || return 1
-
     section=""
-    seen_api=0
-    seen_profile=0
-    seen_ports=0
-    seen_dns=0
-    seen_tun=0
-    seen_proxies=0
-    seen_groups=0
-    seen_providers=0
-    seen_rules=0
-    seen_mark=0
-
+    seen_api=0; seen_profile=0; seen_ports=0; seen_dns=0; seen_tun=0
+    seen_proxies=0; seen_groups=0; seen_providers=0; seen_rules=0; seen_mark=0
     while IFS= read -r line || test -n "$line"; do
-        case "$line" in
-          [![:space:]]*) section="" ;;
-        esac
-
+        case "$line" in [![:space:]]*) section="" ;; esac
         case "$line" in
           external-controller:*)
-            if test "$seen_api" = 0; then
-                cat >> "$dst" <<'EOF'
-
-# API Mihomo для Zashboard. Доступен из локальной сети и защищён secret.
-EOF
-                seen_api=1
-            fi
-            ;;
-          profile:*)
-            section="profile"
-            if test "$seen_profile" = 0; then
-                cat >> "$dst" <<'EOF'
-
-# Сохранять выбранные прокси и таблицу Fake-IP между перезапусками Mihomo.
-EOF
-                seen_profile=1
-            fi
-            ;;
-          mixed-port:*)
-            if test "$seen_ports" = 0; then
-                cat >> "$dst" <<'EOF'
-
-# Локальный mixed-порт (HTTP/SOCKS) и основные параметры Mihomo.
-EOF
-                seen_ports=1
-            fi
-            ;;
-          dns:*)
-            section="dns"
-            if test "$seen_dns" = 0; then
-                cat >> "$dst" <<'EOF'
-
-# DNS Mihomo. Fake-IP используется для прозрачной маршрутизации клиентов.
-EOF
-                seen_dns=1
-            fi
-            ;;
-          tun:*)
-            section="tun"
-            if test "$seen_tun" = 0; then
-                cat >> "$dst" <<'EOF'
-
-# Виртуальный TUN-интерфейс. Эти параметры контролирует GoshaCrash.
-EOF
-                seen_tun=1
-            fi
-            ;;
-          proxies:*)
-            section="proxies"
-            if test "$seen_proxies" = 0; then
-                cat >> "$dst" <<'EOF'
-
-# Прокси-серверы пользователя.
-EOF
-                seen_proxies=1
-            fi
-            ;;
-          proxy-groups:*)
-            section="proxy-groups"
-            if test "$seen_groups" = 0; then
-                cat >> "$dst" <<'EOF'
-
-# Группы прокси пользователя.
-EOF
-                seen_groups=1
-            fi
-            ;;
-          rule-providers:*)
-            section="rule-providers"
-            if test "$seen_providers" = 0; then
-                cat >> "$dst" <<'EOF'
-
-# Провайдеры правил пользователя.
-EOF
-                seen_providers=1
-            fi
-            ;;
-          rules:*)
-            section="rules"
-            if test "$seen_rules" = 0; then
-                cat >> "$dst" <<'EOF'
-
-# Правила маршрутизации. Порядок правил имеет значение.
-EOF
-                seen_rules=1
-            fi
-            ;;
-          routing-mark:*)
-            if test "$seen_mark" = 0; then
-                cat >> "$dst" <<'EOF'
-
-# Метка исходящих соединений Mihomo для ручной policy routing.
-EOF
-                seen_mark=1
-            fi
-            ;;
+            if test "$seen_api" = 0; then printf '\n' >> "$dst" || return 1
+                utf8_print_install '# API Mihomo \0320\0264\0320\0273\0321\0217 Zashboard. \0320\0224\0320\0276\0321\0201\0321\0202\0321\0203\0320\0277\0320\0265\0320\0275 \0320\0270\0320\0267 \0320\0273\0320\0276\0320\0272\0320\0260\0320\0273\0321\0214\0320\0275\0320\0276\0320\0271 \0321\0201\0320\0265\0321\0202\0320\0270 \0320\0270 \0320\0267\0320\0260\0321\0211\0320\0270\0321\0211\0321\0221\0320\0275 secret.' >> "$dst" || return 1
+                seen_api=1; fi ;;
+          profile:*) section="profile"; if test "$seen_profile" = 0; then printf '\n' >> "$dst" || return 1
+                utf8_print_install '# \0320\0241\0320\0276\0321\0205\0321\0200\0320\0260\0320\0275\0321\0217\0321\0202\0321\0214 \0320\0262\0321\0213\0320\0261\0321\0200\0320\0260\0320\0275\0320\0275\0321\0213\0320\0265 \0320\0277\0321\0200\0320\0276\0320\0272\0321\0201\0320\0270 \0320\0270 \0321\0202\0320\0260\0320\0261\0320\0273\0320\0270\0321\0206\0321\0203 Fake-IP \0320\0274\0320\0265\0320\0266\0320\0264\0321\0203 \0320\0277\0320\0265\0321\0200\0320\0265\0320\0267\0320\0260\0320\0277\0321\0203\0321\0201\0320\0272\0320\0260\0320\0274\0320\0270 Mihomo.' >> "$dst" || return 1
+                seen_profile=1; fi ;;
+          mixed-port:*) if test "$seen_ports" = 0; then printf '\n' >> "$dst" || return 1
+                utf8_print_install '# \0320\0233\0320\0276\0320\0272\0320\0260\0320\0273\0321\0214\0320\0275\0321\0213\0320\0271 mixed-\0320\0277\0320\0276\0321\0200\0321\0202 (HTTP/SOCKS) \0320\0270 \0320\0276\0321\0201\0320\0275\0320\0276\0320\0262\0320\0275\0321\0213\0320\0265 \0320\0277\0320\0260\0321\0200\0320\0260\0320\0274\0320\0265\0321\0202\0321\0200\0321\0213 Mihomo.' >> "$dst" || return 1
+                seen_ports=1; fi ;;
+          dns:*) section="dns"; if test "$seen_dns" = 0; then printf '\n' >> "$dst" || return 1
+                utf8_print_install '# DNS Mihomo. Fake-IP \0320\0270\0321\0201\0320\0277\0320\0276\0320\0273\0321\0214\0320\0267\0321\0203\0320\0265\0321\0202\0321\0201\0321\0217 \0320\0264\0320\0273\0321\0217 \0320\0277\0321\0200\0320\0276\0320\0267\0321\0200\0320\0260\0321\0207\0320\0275\0320\0276\0320\0271 \0320\0274\0320\0260\0321\0200\0321\0210\0321\0200\0321\0203\0321\0202\0320\0270\0320\0267\0320\0260\0321\0206\0320\0270\0320\0270 \0320\0272\0320\0273\0320\0270\0320\0265\0320\0275\0321\0202\0320\0276\0320\0262.' >> "$dst" || return 1
+                seen_dns=1; fi ;;
+          tun:*) section="tun"; if test "$seen_tun" = 0; then printf '\n' >> "$dst" || return 1
+                utf8_print_install '# \0320\0222\0320\0270\0321\0200\0321\0202\0321\0203\0320\0260\0320\0273\0321\0214\0320\0275\0321\0213\0320\0271 TUN-\0320\0270\0320\0275\0321\0202\0320\0265\0321\0200\0321\0204\0320\0265\0320\0271\0321\0201. \0320\0255\0321\0202\0320\0270 \0320\0277\0320\0260\0321\0200\0320\0260\0320\0274\0320\0265\0321\0202\0321\0200\0321\0213 \0320\0272\0320\0276\0320\0275\0321\0202\0321\0200\0320\0276\0320\0273\0320\0270\0321\0200\0321\0203\0320\0265\0321\0202 GoshaCrash.' >> "$dst" || return 1
+                seen_tun=1; fi ;;
+          proxies:*) section="proxies"; if test "$seen_proxies" = 0; then printf '\n' >> "$dst" || return 1
+                utf8_print_install '# \0320\0237\0321\0200\0320\0276\0320\0272\0321\0201\0320\0270-\0321\0201\0320\0265\0321\0200\0320\0262\0320\0265\0321\0200\0321\0213 \0320\0277\0320\0276\0320\0273\0321\0214\0320\0267\0320\0276\0320\0262\0320\0260\0321\0202\0320\0265\0320\0273\0321\0217.' >> "$dst" || return 1
+                seen_proxies=1; fi ;;
+          proxy-groups:*) section="proxy-groups"; if test "$seen_groups" = 0; then printf '\n' >> "$dst" || return 1
+                utf8_print_install '# \0320\0223\0321\0200\0321\0203\0320\0277\0320\0277\0321\0213 \0320\0277\0321\0200\0320\0276\0320\0272\0321\0201\0320\0270 \0320\0277\0320\0276\0320\0273\0321\0214\0320\0267\0320\0276\0320\0262\0320\0260\0321\0202\0320\0265\0320\0273\0321\0217.' >> "$dst" || return 1
+                seen_groups=1; fi ;;
+          rule-providers:*) section="rule-providers"; if test "$seen_providers" = 0; then printf '\n' >> "$dst" || return 1
+                utf8_print_install '# \0320\0237\0321\0200\0320\0276\0320\0262\0320\0260\0320\0271\0320\0264\0320\0265\0321\0200\0321\0213 \0320\0277\0321\0200\0320\0260\0320\0262\0320\0270\0320\0273 \0320\0277\0320\0276\0320\0273\0321\0214\0320\0267\0320\0276\0320\0262\0320\0260\0321\0202\0320\0265\0320\0273\0321\0217.' >> "$dst" || return 1
+                seen_providers=1; fi ;;
+          rules:*) section="rules"; if test "$seen_rules" = 0; then printf '\n' >> "$dst" || return 1
+                utf8_print_install '# \0320\0237\0321\0200\0320\0260\0320\0262\0320\0270\0320\0273\0320\0260 \0320\0274\0320\0260\0321\0200\0321\0210\0321\0200\0321\0203\0321\0202\0320\0270\0320\0267\0320\0260\0321\0206\0320\0270\0320\0270. \0320\0237\0320\0276\0321\0200\0321\0217\0320\0264\0320\0276\0320\0272 \0320\0277\0321\0200\0320\0260\0320\0262\0320\0270\0320\0273 \0320\0270\0320\0274\0320\0265\0320\0265\0321\0202 \0320\0267\0320\0275\0320\0260\0321\0207\0320\0265\0320\0275\0320\0270\0320\0265.' >> "$dst" || return 1
+                seen_rules=1; fi ;;
+          routing-mark:*) if test "$seen_mark" = 0; then printf '\n' >> "$dst" || return 1
+                utf8_print_install '# \0320\0234\0320\0265\0321\0202\0320\0272\0320\0260 \0320\0270\0321\0201\0321\0205\0320\0276\0320\0264\0321\0217\0321\0211\0320\0270\0321\0205 \0321\0201\0320\0276\0320\0265\0320\0264\0320\0270\0320\0275\0320\0265\0320\0275\0320\0270\0320\0271 Mihomo \0320\0264\0320\0273\0321\0217 \0321\0200\0321\0203\0321\0207\0320\0275\0320\0276\0320\0271 policy routing.' >> "$dst" || return 1
+                seen_mark=1; fi ;;
         esac
-
         case "$section|$line" in
           'dns|  enhanced-mode:'*)
-            cat >> "$dst" <<'EOF'
-  # Fake-IP позволяет Mihomo прозрачно сопоставлять DNS-ответы с соединениями.
-EOF
+            utf8_print_install '  # Fake-IP \0320\0277\0320\0276\0320\0267\0320\0262\0320\0276\0320\0273\0321\0217\0320\0265\0321\0202 Mihomo \0320\0277\0321\0200\0320\0276\0320\0267\0321\0200\0320\0260\0321\0207\0320\0275\0320\0276 \0321\0201\0320\0276\0320\0277\0320\0276\0321\0201\0321\0202\0320\0260\0320\0262\0320\0273\0321\0217\0321\0202\0321\0214 DNS-\0320\0276\0321\0202\0320\0262\0320\0265\0321\0202\0321\0213 \0321\0201 \0321\0201\0320\0276\0320\0265\0320\0264\0320\0270\0320\0275\0320\0265\0320\0275\0320\0270\0321\0217\0320\0274\0320\0270.' >> "$dst" || return 1
             ;;
           'dns|  default-nameserver:'*)
-            cat >> "$dst" <<'EOF'
-  # DNS для начального разрешения имён до запуска основной DNS-логики.
-EOF
+            utf8_print_install '  # DNS \0320\0264\0320\0273\0321\0217 \0320\0275\0320\0260\0321\0207\0320\0260\0320\0273\0321\0214\0320\0275\0320\0276\0320\0263\0320\0276 \0321\0200\0320\0260\0320\0267\0321\0200\0320\0265\0321\0210\0320\0265\0320\0275\0320\0270\0321\0217 \0320\0270\0320\0274\0321\0221\0320\0275 \0320\0264\0320\0276 \0320\0267\0320\0260\0320\0277\0321\0203\0321\0201\0320\0272\0320\0260 \0320\0276\0321\0201\0320\0275\0320\0276\0320\0262\0320\0275\0320\0276\0320\0271 DNS-\0320\0273\0320\0276\0320\0263\0320\0270\0320\0272\0320\0270.' >> "$dst" || return 1
             ;;
           'dns|  nameserver:'*)
-            cat >> "$dst" <<'EOF'
-  # Основные DNS-серверы.
-EOF
+            utf8_print_install '  # \0320\0236\0321\0201\0320\0275\0320\0276\0320\0262\0320\0275\0321\0213\0320\0265 DNS-\0321\0201\0320\0265\0321\0200\0320\0262\0320\0265\0321\0200\0321\0213.' >> "$dst" || return 1
             ;;
           'tun|  auto-route:'*)
-            cat >> "$dst" <<'EOF'
-  # Автоматически создавать системные маршруты для TUN.
-EOF
+            utf8_print_install '  # \0320\0220\0320\0262\0321\0202\0320\0276\0320\0274\0320\0260\0321\0202\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270 \0321\0201\0320\0276\0320\0267\0320\0264\0320\0260\0320\0262\0320\0260\0321\0202\0321\0214 \0321\0201\0320\0270\0321\0201\0321\0202\0320\0265\0320\0274\0320\0275\0321\0213\0320\0265 \0320\0274\0320\0260\0321\0200\0321\0210\0321\0200\0321\0203\0321\0202\0321\0213 \0320\0264\0320\0273\0321\0217 TUN.' >> "$dst" || return 1
             ;;
           'tun|  auto-redirect:'*)
-            cat >> "$dst" <<'EOF'
-  # Автоматически настраивать прозрачный TCP/UDP-перехват на Linux.
-EOF
+            utf8_print_install '  # \0320\0220\0320\0262\0321\0202\0320\0276\0320\0274\0320\0260\0321\0202\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270 \0320\0275\0320\0260\0321\0201\0321\0202\0321\0200\0320\0260\0320\0270\0320\0262\0320\0260\0321\0202\0321\0214 \0320\0277\0321\0200\0320\0276\0320\0267\0321\0200\0320\0260\0321\0207\0320\0275\0321\0213\0320\0271 TCP/UDP-\0320\0277\0320\0265\0321\0200\0320\0265\0321\0205\0320\0262\0320\0260\0321\0202 \0320\0275\0320\0260 Linux.' >> "$dst" || return 1
             ;;
           'tun|  auto-detect-interface:'*)
-            cat >> "$dst" <<'EOF'
-  # Автоматически определять физический интерфейс выхода в интернет.
-EOF
+            utf8_print_install '  # \0320\0220\0320\0262\0321\0202\0320\0276\0320\0274\0320\0260\0321\0202\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270 \0320\0276\0320\0277\0321\0200\0320\0265\0320\0264\0320\0265\0320\0273\0321\0217\0321\0202\0321\0214 \0321\0204\0320\0270\0320\0267\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270\0320\0271 \0320\0270\0320\0275\0321\0202\0320\0265\0321\0200\0321\0204\0320\0265\0320\0271\0321\0201 \0320\0262\0321\0213\0321\0205\0320\0276\0320\0264\0320\0260 \0320\0262 \0320\0270\0320\0275\0321\0202\0320\0265\0321\0200\0320\0275\0320\0265\0321\0202.' >> "$dst" || return 1
             ;;
           'tun|  dns-hijack:'*)
-            cat >> "$dst" <<'EOF'
-  # Перехватывать обычные DNS-запросы клиентов через TUN.
-EOF
+            utf8_print_install '  # \0320\0237\0320\0265\0321\0200\0320\0265\0321\0205\0320\0262\0320\0260\0321\0202\0321\0213\0320\0262\0320\0260\0321\0202\0321\0214 \0320\0276\0320\0261\0321\0213\0321\0207\0320\0275\0321\0213\0320\0265 DNS-\0320\0267\0320\0260\0320\0277\0321\0200\0320\0276\0321\0201\0321\0213 \0320\0272\0320\0273\0320\0270\0320\0265\0320\0275\0321\0202\0320\0276\0320\0262 \0321\0207\0320\0265\0321\0200\0320\0265\0320\0267 TUN.' >> "$dst" || return 1
             ;;
         esac
-
         printf '%s\n' "$line" >> "$dst" || return 1
     done < "$src"
     return 0
@@ -2520,40 +2430,32 @@ generate_base_config(){
     file="$1"
     secret="$(generate_dashboard_secret)"
     test -n "$secret" || { fail "Не удалось создать secret для Zashboard"; return 1; }
-
-    if test "$ROUTING_MODE" = manual; then
-        cfg_auto_route=false
-        cfg_auto_redirect=false
-        cfg_auto_detect=false
-    else
-        cfg_auto_route=true
-        cfg_auto_redirect=true
-        cfg_auto_detect=true
-    fi
-
-    # Fresh install gets the final placeholder config in one write.  Do not
-    # build an ASCII file and decorate it later: the canonical Cyrillic comments
-    # live directly in this UTF-8 installer and /bin/sh copies those bytes as-is.
-    # Mihomo itself validates the resulting file before runtime is started.
-    cat > "$file" <<EOF
-# GoshaCrash — базовая конфигурация Mihomo.
-# Кодировка файла: UTF-8 без BOM.
-# Это безопасная стартовая заглушка: пока прокси не добавлены, весь трафик идёт DIRECT.
-# Добавь свои proxies / proxy-groups / rules, сохрани файл и проверь его через gc check.
-# Служебные параметры TUN, DNS, API и Zashboard поддерживаются GoshaCrash автоматически.
-
-# API Mihomo для Zashboard. Доступен из локальной сети и защищён уникальным secret.
+    if test "$ROUTING_MODE" = manual; then cfg_auto_route=false; cfg_auto_redirect=false; cfg_auto_detect=false
+    else cfg_auto_route=true; cfg_auto_redirect=true; cfg_auto_detect=true; fi
+    : > "$file" || return 1
+    utf8_print_install '# GoshaCrash \0342\0200\0224 \0320\0261\0320\0260\0320\0267\0320\0276\0320\0262\0320\0260\0321\0217 \0320\0272\0320\0276\0320\0275\0321\0204\0320\0270\0320\0263\0321\0203\0321\0200\0320\0260\0321\0206\0320\0270\0321\0217 Mihomo.' >> "$file" || return 1
+    utf8_print_install '# \0320\0232\0320\0276\0320\0264\0320\0270\0321\0200\0320\0276\0320\0262\0320\0272\0320\0260 \0321\0204\0320\0260\0320\0271\0320\0273\0320\0260: UTF-8 \0320\0261\0320\0265\0320\0267 BOM.' >> "$file" || return 1
+    utf8_print_install '# \0320\0255\0321\0202\0320\0276 \0320\0261\0320\0265\0320\0267\0320\0276\0320\0277\0320\0260\0321\0201\0320\0275\0320\0260\0321\0217 \0321\0201\0321\0202\0320\0260\0321\0200\0321\0202\0320\0276\0320\0262\0320\0260\0321\0217 \0320\0267\0320\0260\0320\0263\0320\0273\0321\0203\0321\0210\0320\0272\0320\0260: \0320\0277\0320\0276\0320\0272\0320\0260 \0320\0277\0321\0200\0320\0276\0320\0272\0321\0201\0320\0270 \0320\0275\0320\0265 \0320\0264\0320\0276\0320\0261\0320\0260\0320\0262\0320\0273\0320\0265\0320\0275\0321\0213, \0320\0262\0320\0265\0321\0201\0321\0214 \0321\0202\0321\0200\0320\0260\0321\0204\0320\0270\0320\0272 \0320\0270\0320\0264\0321\0221\0321\0202 DIRECT.' >> "$file" || return 1
+    utf8_print_install '# \0320\0224\0320\0276\0320\0261\0320\0260\0320\0262\0321\0214 \0321\0201\0320\0262\0320\0276\0320\0270 proxies / proxy-groups / rules, \0321\0201\0320\0276\0321\0205\0321\0200\0320\0260\0320\0275\0320\0270 \0321\0204\0320\0260\0320\0271\0320\0273 \0320\0270 \0320\0277\0321\0200\0320\0276\0320\0262\0320\0265\0321\0200\0321\0214 \0320\0265\0320\0263\0320\0276 \0321\0207\0320\0265\0321\0200\0320\0265\0320\0267 gc check.' >> "$file" || return 1
+    utf8_print_install '# \0320\0241\0320\0273\0321\0203\0320\0266\0320\0265\0320\0261\0320\0275\0321\0213\0320\0265 \0320\0277\0320\0260\0321\0200\0320\0260\0320\0274\0320\0265\0321\0202\0321\0200\0321\0213 TUN, DNS, API \0320\0270 Zashboard \0320\0277\0320\0276\0320\0264\0320\0264\0320\0265\0321\0200\0320\0266\0320\0270\0320\0262\0320\0260\0321\0216\0321\0202\0321\0201\0321\0217 GoshaCrash \0320\0260\0320\0262\0321\0202\0320\0276\0320\0274\0320\0260\0321\0202\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270.' >> "$file" || return 1
+    printf '\n' >> "$file" || return 1
+    utf8_print_install '# API Mihomo \0320\0264\0320\0273\0321\0217 Zashboard. \0320\0224\0320\0276\0321\0201\0321\0202\0321\0203\0320\0277\0320\0265\0320\0275 \0320\0270\0320\0267 \0320\0273\0320\0276\0320\0272\0320\0260\0320\0273\0321\0214\0320\0275\0320\0276\0320\0271 \0321\0201\0320\0265\0321\0202\0320\0270 \0320\0270 \0320\0267\0320\0260\0321\0211\0320\0270\0321\0211\0321\0221\0320\0275 \0321\0203\0320\0275\0320\0270\0320\0272\0320\0260\0320\0273\0321\0214\0320\0275\0321\0213\0320\0274 secret.' >> "$file" || return 1
+    cat >> "$file" <<EOF
 external-controller: 0.0.0.0:9090
 secret: "$secret"
 external-ui: ui
 external-ui-url: "$ZASHBOARD_PRIMARY"
 
-# Сохранять выбранные прокси и таблицу Fake-IP между перезапусками Mihomo.
+EOF
+    utf8_print_install '# \0320\0241\0320\0276\0321\0205\0321\0200\0320\0260\0320\0275\0321\0217\0321\0202\0321\0214 \0320\0262\0321\0213\0320\0261\0321\0200\0320\0260\0320\0275\0320\0275\0321\0213\0320\0265 \0320\0277\0321\0200\0320\0276\0320\0272\0321\0201\0320\0270 \0320\0270 \0321\0202\0320\0260\0320\0261\0320\0273\0320\0270\0321\0206\0321\0203 Fake-IP \0320\0274\0320\0265\0320\0266\0320\0264\0321\0203 \0320\0277\0320\0265\0321\0200\0320\0265\0320\0267\0320\0260\0320\0277\0321\0203\0321\0201\0320\0272\0320\0260\0320\0274\0320\0270 Mihomo.' >> "$file" || return 1
+    cat >> "$file" <<'EOF'
 profile:
   store-selected: true
   store-fake-ip: true
 
-# Локальный mixed-порт (HTTP/SOCKS) и основные параметры Mihomo.
+EOF
+    utf8_print_install '# \0320\0233\0320\0276\0320\0272\0320\0260\0320\0273\0321\0214\0320\0275\0321\0213\0320\0271 mixed-\0320\0277\0320\0276\0321\0200\0321\0202 (HTTP/SOCKS) \0320\0270 \0320\0276\0321\0201\0320\0275\0320\0276\0320\0262\0320\0275\0321\0213\0320\0265 \0320\0277\0320\0260\0321\0200\0320\0260\0320\0274\0320\0265\0321\0202\0321\0200\0321\0213 Mihomo.' >> "$file" || return 1
+    cat >> "$file" <<'EOF'
 mixed-port: 7892
 allow-lan: true
 bind-address: "*"
@@ -2562,59 +2464,66 @@ log-level: info
 ipv6: false
 find-process-mode: "off"
 
-# DNS Mihomo. Fake-IP используется для прозрачной маршрутизации клиентов.
+EOF
+    utf8_print_install '# DNS Mihomo. Fake-IP \0320\0270\0321\0201\0320\0277\0320\0276\0320\0273\0321\0214\0320\0267\0321\0203\0320\0265\0321\0202\0321\0201\0321\0217 \0320\0264\0320\0273\0321\0217 \0320\0277\0321\0200\0320\0276\0320\0267\0321\0200\0320\0260\0321\0207\0320\0275\0320\0276\0320\0271 \0320\0274\0320\0260\0321\0200\0321\0210\0321\0200\0321\0203\0321\0202\0320\0270\0320\0267\0320\0260\0321\0206\0320\0270\0320\0270 \0320\0272\0320\0273\0320\0270\0320\0265\0320\0275\0321\0202\0320\0276\0320\0262.' >> "$file" || return 1
+    cat >> "$file" <<'EOF'
 dns:
   enable: true
   listen: 127.0.0.1:1053
   ipv6: false
 
-  # Fake-IP позволяет Mihomo прозрачно сопоставлять DNS-ответы с соединениями.
+EOF
+    utf8_print_install '  # Fake-IP \0320\0277\0320\0276\0320\0267\0320\0262\0320\0276\0320\0273\0321\0217\0320\0265\0321\0202 Mihomo \0320\0277\0321\0200\0320\0276\0320\0267\0321\0200\0320\0260\0321\0207\0320\0275\0320\0276 \0321\0201\0320\0276\0320\0277\0320\0276\0321\0201\0321\0202\0320\0260\0320\0262\0320\0273\0321\0217\0321\0202\0321\0214 DNS-\0320\0276\0321\0202\0320\0262\0320\0265\0321\0202\0321\0213 \0321\0201 \0321\0201\0320\0276\0320\0265\0320\0264\0320\0270\0320\0275\0320\0265\0320\0275\0320\0270\0321\0217\0320\0274\0320\0270.' >> "$file" || return 1
+    cat >> "$file" <<'EOF'
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
 
-  # DNS для начального разрешения имён до запуска основной DNS-логики.
+EOF
+    utf8_print_install '  # DNS \0320\0264\0320\0273\0321\0217 \0320\0275\0320\0260\0321\0207\0320\0260\0320\0273\0321\0214\0320\0275\0320\0276\0320\0263\0320\0276 \0321\0200\0320\0260\0320\0267\0321\0200\0320\0265\0321\0210\0320\0265\0320\0275\0320\0270\0321\0217 \0320\0270\0320\0274\0321\0221\0320\0275 \0320\0264\0320\0276 \0320\0267\0320\0260\0320\0277\0321\0203\0321\0201\0320\0272\0320\0260 \0320\0276\0321\0201\0320\0275\0320\0276\0320\0262\0320\0275\0320\0276\0320\0271 DNS-\0320\0273\0320\0276\0320\0263\0320\0270\0320\0272\0320\0270.' >> "$file" || return 1
+    cat >> "$file" <<'EOF'
   default-nameserver:
     - 1.1.1.1
     - 8.8.8.8
 
-  # Основные DNS-серверы.
+EOF
+    utf8_print_install '  # \0320\0236\0321\0201\0320\0275\0320\0276\0320\0262\0320\0275\0321\0213\0320\0265 DNS-\0321\0201\0320\0265\0321\0200\0320\0262\0320\0265\0321\0200\0321\0213.' >> "$file" || return 1
+    cat >> "$file" <<'EOF'
   nameserver:
     - 1.1.1.1
     - 8.8.8.8
 
-# Виртуальный TUN-интерфейс. Эти параметры контролирует GoshaCrash.
+EOF
+    utf8_print_install '# \0320\0222\0320\0270\0321\0200\0321\0202\0321\0203\0320\0260\0320\0273\0321\0214\0320\0275\0321\0213\0320\0271 TUN-\0320\0270\0320\0275\0321\0202\0320\0265\0321\0200\0321\0204\0320\0265\0320\0271\0321\0201. \0320\0255\0321\0202\0320\0270 \0320\0277\0320\0260\0321\0200\0320\0260\0320\0274\0320\0265\0321\0202\0321\0200\0321\0213 \0320\0272\0320\0276\0320\0275\0321\0202\0321\0200\0320\0276\0320\0273\0320\0270\0321\0200\0321\0203\0320\0265\0321\0202 GoshaCrash.' >> "$file" || return 1
+    cat >> "$file" <<EOF
 tun:
   enable: true
   stack: $TUN_STACK
   device: tun0
 
-  # Автоматически создавать системные маршруты для TUN.
-  auto-route: $cfg_auto_route
-
-  # Автоматически настраивать прозрачный TCP/UDP-перехват на Linux.
-  auto-redirect: $cfg_auto_redirect
-
-  # Автоматически определять физический интерфейс выхода в интернет.
-  auto-detect-interface: $cfg_auto_detect
-
-  # Перехватывать обычные DNS-запросы клиентов через TUN.
+EOF
+    utf8_print_install '  # \0320\0220\0320\0262\0321\0202\0320\0276\0320\0274\0320\0260\0321\0202\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270 \0321\0201\0320\0276\0320\0267\0320\0264\0320\0260\0320\0262\0320\0260\0321\0202\0321\0214 \0321\0201\0320\0270\0321\0201\0321\0202\0320\0265\0320\0274\0320\0275\0321\0213\0320\0265 \0320\0274\0320\0260\0321\0200\0321\0210\0321\0200\0321\0203\0321\0202\0321\0213 \0320\0264\0320\0273\0321\0217 TUN.' >> "$file" || return 1
+    printf '  auto-route: %s\n\n' "$cfg_auto_route" >> "$file" || return 1
+    utf8_print_install '  # \0320\0220\0320\0262\0321\0202\0320\0276\0320\0274\0320\0260\0321\0202\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270 \0320\0275\0320\0260\0321\0201\0321\0202\0321\0200\0320\0260\0320\0270\0320\0262\0320\0260\0321\0202\0321\0214 \0320\0277\0321\0200\0320\0276\0320\0267\0321\0200\0320\0260\0321\0207\0320\0275\0321\0213\0320\0271 TCP/UDP-\0320\0277\0320\0265\0321\0200\0320\0265\0321\0205\0320\0262\0320\0260\0321\0202 \0320\0275\0320\0260 Linux.' >> "$file" || return 1
+    printf '  auto-redirect: %s\n\n' "$cfg_auto_redirect" >> "$file" || return 1
+    utf8_print_install '  # \0320\0220\0320\0262\0321\0202\0320\0276\0320\0274\0320\0260\0321\0202\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270 \0320\0276\0320\0277\0321\0200\0320\0265\0320\0264\0320\0265\0320\0273\0321\0217\0321\0202\0321\0214 \0321\0204\0320\0270\0320\0267\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270\0320\0271 \0320\0270\0320\0275\0321\0202\0320\0265\0321\0200\0321\0204\0320\0265\0320\0271\0321\0201 \0320\0262\0321\0213\0321\0205\0320\0276\0320\0264\0320\0260 \0320\0262 \0320\0270\0320\0275\0321\0202\0320\0265\0321\0200\0320\0275\0320\0265\0321\0202.' >> "$file" || return 1
+    printf '  auto-detect-interface: %s\n\n' "$cfg_auto_detect" >> "$file" || return 1
+    utf8_print_install '  # \0320\0237\0320\0265\0321\0200\0320\0265\0321\0205\0320\0262\0320\0260\0321\0202\0321\0213\0320\0262\0320\0260\0321\0202\0321\0214 \0320\0276\0320\0261\0321\0213\0321\0207\0320\0275\0321\0213\0320\0265 DNS-\0320\0267\0320\0260\0320\0277\0321\0200\0320\0276\0321\0201\0321\0213 \0320\0272\0320\0273\0320\0270\0320\0265\0320\0275\0321\0202\0320\0276\0320\0262 \0321\0207\0320\0265\0321\0200\0320\0265\0320\0267 TUN.' >> "$file" || return 1
+    cat >> "$file" <<'EOF'
   dns-hijack:
     - any:53
     - tcp://any:53
 
-# Стартовое правило-заглушка: до добавления прокси весь трафик идёт напрямую.
+EOF
+    utf8_print_install '# \0320\0241\0321\0202\0320\0260\0321\0200\0321\0202\0320\0276\0320\0262\0320\0276\0320\0265 \0320\0277\0321\0200\0320\0260\0320\0262\0320\0270\0320\0273\0320\0276-\0320\0267\0320\0260\0320\0263\0320\0273\0321\0203\0321\0210\0320\0272\0320\0260: \0320\0264\0320\0276 \0320\0264\0320\0276\0320\0261\0320\0260\0320\0262\0320\0273\0320\0265\0320\0275\0320\0270\0321\0217 \0320\0277\0321\0200\0320\0276\0320\0272\0321\0201\0320\0270 \0320\0262\0320\0265\0321\0201\0321\0214 \0321\0202\0321\0200\0320\0260\0321\0204\0320\0270\0320\0272 \0320\0270\0320\0264\0321\0221\0321\0202 \0320\0275\0320\0260\0320\0277\0321\0200\0321\0217\0320\0274\0321\0203\0321\0216.' >> "$file" || return 1
+    cat >> "$file" <<'EOF'
 rules:
   - MATCH,DIRECT
 EOF
-
     if test "$ROUTING_MODE" = manual; then
-        cat >> "$file" <<'EOF'
-
-# Метка исходящих соединений Mihomo для ручной policy routing.
-routing-mark: 9012
-EOF
+        printf '\n' >> "$file" || return 1
+        utf8_print_install '# \0320\0234\0320\0265\0321\0202\0320\0272\0320\0260 \0320\0270\0321\0201\0321\0205\0320\0276\0320\0264\0321\0217\0321\0211\0320\0270\0321\0205 \0321\0201\0320\0276\0320\0265\0320\0264\0320\0270\0320\0275\0320\0265\0320\0275\0320\0270\0320\0271 Mihomo \0320\0264\0320\0273\0321\0217 \0321\0200\0321\0203\0321\0207\0320\0275\0320\0276\0320\0271 policy routing.' >> "$file" || return 1
+        printf 'routing-mark: 9012\n' >> "$file" || return 1
     fi
-
     chmod 600 "$file" 2>/dev/null || true
     return 0
 }
@@ -2637,6 +2546,8 @@ install_configs(){
         rm -f "$ACTIVE_CONFIG" "$BASE/config-legacy.yaml" 2>/dev/null || true
         generate_base_config "$ACTIVE_CONFIG" || { fail "Не удалось сгенерировать новый config.yaml"; return 1; }
         chmod 600 "$ACTIVE_CONFIG" 2>/dev/null || true
+        mkdir -p "$BASE/state" 2>/dev/null || true
+        printf '%s\n' generated-stub > "$BASE/state/config-origin" 2>/dev/null || true
         say "config.yaml сброшен явно: создана новая UTF-8 заглушка (старый файл хранится только временно до успешной проверки)"
         return 0
     fi
@@ -2656,6 +2567,8 @@ install_configs(){
             fail "Внутренняя ошибка: только что созданный config.yaml не является корректным UTF-8"
             return 1
         fi
+        mkdir -p "$BASE/state" 2>/dev/null || true
+        printf '%s\n' generated-stub > "$BASE/state/config-origin" 2>/dev/null || true
         say "Базовый config.yaml создан install.sh для $PLATFORM (routing=$ROUTING_MODE, tun.stack=$TUN_STACK)"
         warn "VPN ещё не настроен: добавь свои proxy/rules и выполни gc restart"
     else
@@ -2704,6 +2617,54 @@ config_test_has_utf8_error_install(){
     grep -Eiq 'invalid[^[:cntrl:]]*UTF-8|UTF-8[^[:cntrl:]]*invalid|invalid trailing UTF-8 octet|invalid UTF-8|invalid utf-8' "$ctu_log" 2>/dev/null
 }
 
+config_has_user_payload_install(){
+    chp_file="$1"
+    if LC_ALL=C awk '
+      /^[[:space:]]*(proxies|proxy-groups|proxy-providers|rule-providers):[[:space:]]*/ {found=1; exit}
+      END{exit found ? 0 : 1}
+    ' "$chp_file" >/dev/null 2>&1; then return 0; fi
+    LC_ALL=C awk '
+      BEGIN{inrules=0; user=0}
+      /^rules:[[:space:]]*($|#)/ {inrules=1; next}
+      inrules && /^[^[:space:]]/ {inrules=0}
+      inrules && /^[[:space:]]*-[[:space:]]*/ {
+        line=$0; sub(/^[[:space:]]*-[[:space:]]*/, "", line); sub(/[[:space:]]*#.*/, "", line); gsub(/[[:space:]]/, "", line)
+        if (line != "MATCH,DIRECT" && line != "") user=1
+      }
+      END{exit user ? 0 : 1}
+    ' "$chp_file" >/dev/null 2>&1
+}
+
+config_looks_like_factory_stub_install(){
+    cls_file="$1"
+    config_has_user_payload_install "$cls_file" && return 1
+    LC_ALL=C grep -q 'MATCH,DIRECT' "$cls_file" 2>/dev/null && return 0
+    LC_ALL=C grep -q 'GoshaCrash' "$cls_file" 2>/dev/null && return 0
+    return 1
+}
+
+rebuild_factory_stub_install(){
+    rfs_tmp="$TMP_ROOT/config-factory-clean.$$"
+    rfs_log="$TMP_ROOT/config-factory-clean.log.$$"
+    rm -f "$rfs_tmp" "$rfs_log" 2>/dev/null || true
+    generate_base_config "$rfs_tmp" || return 1
+    if ! mihomo_config_test_install "$rfs_tmp" "$rfs_log"; then
+        cat "$rfs_log" >&2 2>/dev/null || true
+        rm -f "$rfs_tmp" "$rfs_log" 2>/dev/null || true
+        fail "Внутренняя ошибка: новая стартовая заглушка не проходит mihomo -t"
+        return 1
+    fi
+    mv -f "$rfs_tmp" "$ACTIVE_CONFIG" || return 1
+    chmod 600 "$ACTIVE_CONFIG" 2>/dev/null || true
+    mkdir -p "$BASE/state" 2>/dev/null || true
+    printf '%s\n' generated-stub > "$BASE/state/config-origin" 2>/dev/null || true
+    CONFIG_MIGRATION_PENDING="0"
+    test -n "$CONFIG_ROLLBACK_TMP" && rm -f "$CONFIG_ROLLBACK_TMP" 2>/dev/null || true
+    rm -f "$rfs_log" 2>/dev/null || true
+    ok "Повреждённая стартовая заглушка автоматически создана заново в UTF-8"
+    return 0
+}
+
 authoritative_config_preflight(){
     acp_log="$TMP_ROOT/config-mihomo-preflight.$$"
     if mihomo_config_test_install "$ACTIVE_CONFIG" "$acp_log"; then
@@ -2712,6 +2673,14 @@ authoritative_config_preflight(){
     fi
 
     if config_test_has_utf8_error_install "$acp_log"; then
+        # A broken factory DIRECT placeholder has no user VPN payload, so repair
+        # it automatically. Real proxies/groups/providers/custom rules are never overwritten.
+        if config_looks_like_factory_stub_install "$ACTIVE_CONFIG"; then
+            warn "Стартовая заглушка повреждена; создаю чистый config.yaml заново"
+            rm -f "$acp_log" 2>/dev/null || true
+            rebuild_factory_stub_install && return 0
+            return 1
+        fi
         data_only="$TMP_ROOT/config-data-only-test.$$"
         data_log="$acp_log.data"
         strip_whole_line_comments_install "$ACTIVE_CONFIG" "$data_only" || true
@@ -2727,7 +2696,7 @@ authoritative_config_preflight(){
                 cat "$acp_log" >&2 2>/dev/null || true
                 rm -f "$acp_log" "$data_log" "$data_only" 2>/dev/null || true
                 fail "config.yaml действительно содержит невалидный UTF-8 внутри YAML-данных"
-                fail "Для полностью новой заглушки запусти installer с --reset-config"
+                fail "Повреждены пользовательские YAML-данные; автоматическая замена отключена, чтобы не потерять настройки"
                 return 1
             fi
             # Do not mislabel a second, unrelated Mihomo validation failure as
@@ -2757,7 +2726,7 @@ json_asset_urls(){
 }
 
 pinned_official_mihomo_url(){
-    # rc37 deliberately pins the modern core. A router install must not silently
+    # rc38 deliberately pins the modern core. A router install must not silently
     # switch CPU binary just because GitHub "latest" changed between runs.
     MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_VERSION"
     printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$OFFICIAL_MIHOMO_VERSION/mihomo-linux-$MIHOMO_TARGET-$OFFICIAL_MIHOMO_VERSION.gz"
@@ -3067,7 +3036,7 @@ install_stock_usb_mount_bridge(){
     mkdir -p "$DM_ROOT/etc/init.d" "$DM_ROOT/lib/ipkg/info" || return 1
     cat > "$DM_ROOT/etc/init.d/S50usb-mount-script" <<'HOOK'
 #!/bin/sh
-# GoshaCrash Download Master bridge 3.10.2-rc37
+# GoshaCrash Download Master bridge 3.10.2-rc38
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -3157,7 +3126,7 @@ install_hooks(){
 
     cat > /jffs/scripts/usb-mount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB hook 3.10.2-rc37
+# GoshaCrash USB hook 3.10.2-rc38
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -3224,7 +3193,7 @@ BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 UPTIME="$(cat /proc/uptime 2>/dev/null)"
 trace "controller ready after ${WAITED}s dm=${DM:-none} boot_id=${BOOT_ID:-unknown} uptime=${UPTIME:-unknown}"
 date '+%Y-%m-%d %H:%M:%S' > "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-printf '[%s] autostart hook rc37: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
+printf '[%s] autostart hook rc38: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
 
 NOHUP=""
 for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup; do
@@ -3244,7 +3213,7 @@ HOOK
 
     cat > /jffs/scripts/usb-umount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB unmount hook 3.10.2-rc37
+# GoshaCrash USB unmount hook 3.10.2-rc38
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -3280,7 +3249,7 @@ HOOK
     test -d /opt/bin && test -w /opt/bin && write_command_wrapper /opt/bin/gc 2>/dev/null || true
 
     # Old rc23-rc26 used a custom /jffs/addons/goshacrash directory only to
-    # store base/start/trace. rc37 no longer needs it; remove our own residue.
+    # store base/start/trace. rc38 no longer needs it; remove our own residue.
     rm -rf /jffs/addons/goshacrash 2>/dev/null || true
     grep -Fq 'exec /bin/busybox test "$@"' /jffs/scripts/test 2>/dev/null && rm -f /jffs/scripts/test 2>/dev/null || true
     grep -Fq "exec /bin/busybox '['" /jffs/scripts/'[' 2>/dev/null && rm -f /jffs/scripts/'[' 2>/dev/null || true
@@ -3385,7 +3354,6 @@ main(){
             echo
             echo "Использование:"
             echo "  /bin/sh install.sh                 установить/обновить GoshaCrash"
-            echo "  /bin/sh install.sh --reset-config  установить с новой UTF-8 заглушкой config.yaml"
             echo "  /bin/sh install.sh --prepare-usb   безопасный мастер подготовки USB в EXT3"
             echo "  /bin/sh install.sh --help          эта справка"
             return 0
