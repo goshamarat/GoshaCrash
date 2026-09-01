@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc31"
-BUILD_ID="2026-09-01-config-migration-tun-fix-rc31"
+VERSION="3.10.2-rc36"
+BUILD_ID="2026-09-01-direct-utf8-stub-config-rc36"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -523,7 +523,7 @@ lan_ifaces(){ if [ -n "${GOSHACRASH_LAN_IFACES:-}" ]; then printf '%s\n' "$GOSHA
 strip_value(){ printf '%s\n' "$1" | sed 's/[[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//'; }
 yaml_top(){
     file="$1"; key="$2"
-    awk -v key="$key" '
+    LC_ALL=C awk -v key="$key" '
       {sub(/\r$/, "")}
       $0 ~ "^" key ":[[:space:]]*" {
         line=$0
@@ -535,12 +535,22 @@ yaml_top(){
 }
 yaml_section(){
     file="$1"; section="$2"; key="$3"
-    awk -v section="$section" -v key="$key" '
+    LC_ALL=C awk -v section="$section" -v key="$key" '
       {sub(/\r$/, ""); sub(/[[:space:]]+$/, "")}
       $0 ~ "^" section ":[[:space:]]*($|#)" {inside=1; next}
       inside && /^[^[:space:]#]/ {exit}
       inside && $0 ~ "^[[:space:]]+" key ":[[:space:]]*" {line=$0; sub("^[[:space:]]+" key ":[[:space:]]*", "", line); print line; exit}
     ' "$file" 2>/dev/null | while IFS= read -r line; do strip_value "$line"; done
+}
+yaml_section_has_key(){
+    file="$1"; section="$2"; key="$3"
+    LC_ALL=C awk -v section="$section" -v key="$key" '
+      {sub(/\r$/, "")}
+      $0 ~ "^" section ":[[:space:]]*($|#)" {inside=1; next}
+      inside && /^[^[:space:]]/ {exit}
+      inside && $0 ~ "^[[:space:]]+" key ":[[:space:]]*" {found=1; exit}
+      END{exit found ? 0 : 1}
+    ' "$file" >/dev/null 2>&1
 }
 is_true(){ case "$1" in true|True|TRUE|yes|Yes|YES|1|on|On|ON) return 0;; *) return 1;; esac; }
 is_false(){ case "$1" in false|False|FALSE|no|No|NO|0|off|Off|OFF) return 0;; *) return 1;; esac; }
@@ -697,13 +707,13 @@ validate_binary_arch(){
     [ "$magic" = 7f454c46 ] || { fail "Mihomo повреждён: файл не является ELF (header=${hex:-empty})"; return 1; }
     case "$MIHOMO_TARGET" in
       armv5|armv7)
-        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку rc31"; return 1; }
+        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку rc36"; return 1; }
         ;;
       arm64|aarch64)
-        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку rc31"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку rc36"; return 1; }
         ;;
       amd64|amd64-compatible|x86_64)
-        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку rc31"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку rc36"; return 1; }
         ;;
     esac
     return 0
@@ -720,29 +730,83 @@ validate_binary_file(){
     fi
 }
 
+find_od_runtime(){
+    for od_candidate in /usr/bin/od /bin/od /usr/sbin/od /sbin/od; do
+        [ -x "$od_candidate" ] && { printf '%s\n' "$od_candidate"; return 0; }
+    done
+    [ -x /bin/busybox ] && /bin/busybox od -An -tu1 -v /dev/null >/dev/null 2>&1 && { printf '%s\n' '/bin/busybox'; return 0; }
+    return 1
+}
+
+config_utf8_valid(){
+    [ -f "$CONFIG" ] || return 1
+    od_bin="$(find_od_runtime 2>/dev/null)" || return 2
+    if [ "$od_bin" = /bin/busybox ]; then
+        /bin/busybox od -An -tu1 -v "$CONFIG" 2>/dev/null
+    else
+        "$od_bin" -An -tu1 -v "$CONFIG" 2>/dev/null
+    fi | LC_ALL=C awk '
+      BEGIN { need=0; ok=1; minc=128; maxc=191 }
+      {
+        for (i=1; i<=NF; i++) {
+          b=$i+0
+          if (need == 0) {
+            if (b <= 127) continue
+            if (b >= 194 && b <= 223) { need=1; minc=128; maxc=191; continue }
+            if (b >= 224 && b <= 239) {
+              need=2
+              if (b == 224) { minc=160; maxc=191 }
+              else if (b == 237) { minc=128; maxc=159 }
+              else { minc=128; maxc=191 }
+              continue
+            }
+            if (b >= 240 && b <= 244) {
+              need=3
+              if (b == 240) { minc=144; maxc=191 }
+              else if (b == 244) { minc=128; maxc=143 }
+              else { minc=128; maxc=191 }
+              continue
+            }
+            ok=0; exit
+          }
+          if (b < minc || b > maxc) { ok=0; exit }
+          need--
+          minc=128; maxc=191
+        }
+      }
+      END { if (!ok || need != 0) exit 1; exit 0 }
+    '
+}
+
 required_config(){
     [ -f "$CONFIG" ] || { fail "Не найден $CONFIG"; return 1; }
+
     is_true "$(yaml_section "$CONFIG" tun enable)" || { fail "tun.enable должен быть true"; return 1; }
     stack="$(yaml_section "$CONFIG" tun stack)"
     [ -n "$stack" ] || { fail "tun.stack не задан"; return 1; }
-    if [ "$MIHOMO_TARGET" = armv5 ] && [ "$stack" != gvisor ]; then
-        fail "ARMv5 требует tun.stack: gvisor"
-        return 1
-    fi
+    [ "$stack" = "$TUN_STACK" ] || { fail "tun.stack должен быть $TUN_STACK для текущего профиля"; return 1; }
     [ "$(yaml_section "$CONFIG" tun device)" = "$TUN_DEVICE" ] || { fail "tun.device должен быть $TUN_DEVICE"; return 1; }
+    yaml_section_has_key "$CONFIG" tun dns-hijack || { fail "tun.dns-hijack не задан"; return 1; }
+
     is_true "$(yaml_section "$CONFIG" dns enable)" || { fail "dns.enable должен быть true"; return 1; }
     [ "$(yaml_section "$CONFIG" dns listen)" = "127.0.0.1:$DNS_PORT" ] || { fail "dns.listen должен быть 127.0.0.1:$DNS_PORT"; return 1; }
+
+    [ -n "$(yaml_top "$CONFIG" external-controller)" ] || { fail "external-controller не задан"; return 1; }
+    secret="$(yaml_top "$CONFIG" secret)"
+    case "$secret" in ''|CHANGE_ME|null|Null|NULL|'~') fail "secret для API/Zashboard должен быть задан"; return 1;; esac
     [ "$(yaml_top "$CONFIG" external-ui)" = "ui" ] || { fail "external-ui должен быть ui"; return 1; }
     [ -n "$(yaml_top "$CONFIG" external-ui-url)" ] || { fail "Добавь external-ui-url для обновления Zashboard из самой панели"; return 1; }
 
     if [ "$ROUTING_MODE" = manual ]; then
         is_false "$(yaml_section "$CONFIG" tun auto-route)" || { fail "manual: tun.auto-route должен быть false"; return 1; }
         is_false "$(yaml_section "$CONFIG" tun auto-redirect)" || { fail "manual: tun.auto-redirect должен быть false"; return 1; }
+        is_false "$(yaml_section "$CONFIG" tun auto-detect-interface)" || { fail "manual: tun.auto-detect-interface должен быть false"; return 1; }
         [ "$(yaml_top "$CONFIG" routing-mark)" = "$OUTBOUND_MARK_DEC" ] || { fail "manual: routing-mark должен быть $OUTBOUND_MARK_DEC"; return 1; }
     else
         [ "$MIHOMO_TARGET" != armv5 ] || { fail "ARMv5 не поддерживает automatic routing в GoshaCrash"; return 1; }
         is_true "$(yaml_section "$CONFIG" tun auto-route)" || { fail "auto: tun.auto-route должен быть true"; return 1; }
         is_true "$(yaml_section "$CONFIG" tun auto-redirect)" || { fail "auto: tun.auto-redirect должен быть true"; return 1; }
+        is_true "$(yaml_section "$CONFIG" tun auto-detect-interface)" || { fail "auto: tun.auto-detect-interface должен быть true"; return 1; }
         [ -z "$(yaml_top "$CONFIG" routing-mark)" ] || { fail "auto: routing-mark в конфиге не нужен"; return 1; }
     fi
 }
@@ -752,6 +816,12 @@ check_config_with(){
     load_platform || return 1
     req=0; [ "$MIHOMO_TARGET" = armv5 ] && req=1
     validate_binary_file "$file" "$req" || return 1
+    config_utf8_valid
+    utf8_rc=$?
+    if [ "$utf8_rc" = 1 ]; then
+        fail "config.yaml имеет повреждённую/не-UTF-8 кодировку. Mihomo принимает YAML только в корректном UTF-8"
+        return 1
+    fi
     required_config || return 1
     "$file" -t -d "$BASE" -f "$CONFIG"
 }
@@ -1742,32 +1812,55 @@ edit_config(){
 
 yaml_set_section_key(){
     file="$1"; section="$2"; key="$3"; value="$4"; tmp="$file.gc.$$"
-    awk -v section="$section" -v key="$key" -v value="$value" '
-      BEGIN {inside=0; found=0}
-      $0 ~ "^" section ":[[:space:]]*($|#)" {inside=1; found=0; print; next}
-      inside && /^[^[:space:]#]/ {if(!found) print "  " key ": " value; inside=0}
-      inside && $0 ~ "^[[:space:]]+" key ":[[:space:]]*" {indent=$0; sub(/[^[:space:]].*$/, "", indent); print indent key ": " value; found=1; next}
+    LC_ALL=C awk -v section="$section" -v key="$key" -v value="$value" '
+      BEGIN {inside=0; found=0; section_seen=0}
+      $0 ~ "^" section ":[[:space:]]*($|#)" {
+        inside=1
+        found=0
+        section_seen=1
+        print
+        next
+      }
+      inside && /^[^[:space:]]/ {
+        if (!found) print "  " key ": " value
+        inside=0
+      }
+      inside && $0 ~ "^[[:space:]]+" key ":[[:space:]]*" {
+        indent=$0
+        sub(/[^[:space:]].*$/, "", indent)
+        print indent key ": " value
+        found=1
+        next
+      }
       {print}
-      END {if(inside && !found) print "  " key ": " value}
+      END {
+        if (inside && !found) {
+          print "  " key ": " value
+        } else if (!section_seen) {
+          if (NR > 0) print ""
+          print section ":"
+          print "  " key ": " value
+        }
+      }
     ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
     mv -f "$tmp" "$file"
 }
 
 yaml_set_top_key(){
     file="$1"; key="$2"; value="$3"; tmp="$file.gc.$$"
-    awk -v key="$key" -v value="$value" 'BEGIN{done=0} $0 ~ "^" key ":[[:space:]]*" {if(!done){print key ": " value; done=1}; next} {print} END{if(!done) print key ": " value}' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    LC_ALL=C awk -v key="$key" -v value="$value" 'BEGIN{done=0} $0 ~ "^" key ":[[:space:]]*" {if(!done){print key ": " value; done=1}; next} {print} END{if(!done) print key ": " value}' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
     mv -f "$tmp" "$file"
 }
 
 yaml_remove_top_key(){
     file="$1"; key="$2"; tmp="$file.gc.$$"
-    awk -v key="$key" '$0 !~ "^" key ":[[:space:]]*" {print}' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    LC_ALL=C awk -v key="$key" '$0 !~ "^" key ":[[:space:]]*" {print}' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
     mv -f "$tmp" "$file"
 }
 
 platform_set(){
     key="$1"; value="$2"; tmp="$PLATFORM_FILE.gc.$$"
-    awk -v key="$key" -v value="$value" '
+    LC_ALL=C awk -v key="$key" -v value="$value" '
       BEGIN{done=0}
       $0 ~ "^" key "=" {if(!done){print key "=\"" value "\""; done=1}; next}
       {print}
@@ -1779,6 +1872,14 @@ platform_set(){
 
 rewrite_config_for_routing(){
     mode="$1"
+
+    # Keep the controller-owned runtime fields coherent while changing only
+    # the routing mode. Missing block sections are created if necessary.
+    yaml_set_section_key "$CONFIG" tun enable true || return 1
+    yaml_set_section_key "$CONFIG" tun device "$TUN_DEVICE" || return 1
+    yaml_set_section_key "$CONFIG" dns enable true || return 1
+    yaml_set_section_key "$CONFIG" dns listen "127.0.0.1:$DNS_PORT" || return 1
+
     if [ "$mode" = auto ]; then
         [ "$MIHOMO_TARGET" != armv5 ] || { fail "ARMv5: automatic routing недоступен"; return 1; }
         yaml_set_section_key "$CONFIG" tun stack system || return 1
@@ -2279,7 +2380,7 @@ autostart_status(){
     [ -n "$bridge_version" ] && echo "  bridge version: $bridge_version" || echo "  bridge version: old/unknown"
     [ -f "$STATE/autostart-hook-ran" ] && echo "  last hook: $(cat "$STATE/autostart-hook-ran" 2>/dev/null)" || echo "  last hook: never"
     [ -f "$LOGS/coldboot.log" ] && echo "  coldboot trace: $LOGS/coldboot.log" || echo "  coldboot trace: not written yet"
-    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall rc31)" || echo "  legacy JFFS dir: clean"
+    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall rc36)" || echo "  legacy JFFS dir: clean"
     [ -f "$MANUAL_STOP" ] && echo "  manual-stop: YES" || echo "  manual-stop: no"
     return 0
 }
@@ -2367,6 +2468,15 @@ doctor(){
     fi
 
     [ -f "$MANUAL_STOP" ] && echo "  manual stop: YES" || echo "  manual stop: no"
+    config_utf8_valid
+    utf8_rc=$?
+    if [ "$utf8_rc" = 0 ]; then
+        echo "  config UTF-8: OK"
+    elif [ "$utf8_rc" = 1 ]; then
+        echo "  config UTF-8: FAIL"
+    else
+        echo "  config UTF-8: UNKNOWN (od unavailable)"
+    fi
     tun_kernel_ready && echo "  kernel TUN (/dev/net/tun): OK" || echo "  kernel TUN (/dev/net/tun): FAIL"
     if running_pid >/dev/null 2>&1; then
         echo "  Mihomo process: OK"
@@ -2412,7 +2522,7 @@ doctor(){
 }
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.10.2-rc31 — что буквально вводить в SSH
+GoshaCrash 3.10.2-rc36 — что буквально вводить в SSH
 
 КАТАЛОГ УСТАНОВКИ
   BASE="$(gc base)"

@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc31"
+INSTALLER_VERSION="3.10.2-rc36"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -65,6 +65,8 @@ MIHOMO_VERSION_SELECTED=""
 MIHOMO_URL_SELECTED=""
 ACTIVE_CONFIG=""
 GCNET_BIN=""
+CONFIG_ROLLBACK_TMP=""
+CONFIG_MIGRATION_PENDING="0"
 
 now(){ date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date; }
 _emit(){ level="$1"; shift; line="[$(now)] [$level] [install] $*"; printf '%s\n' "$line"; printf '%s\n' "$line" >> "$INSTALL_LOG" 2>/dev/null || true; }
@@ -74,6 +76,12 @@ warn(){ _emit WARN "$@" >&2; }
 fail(){ _emit ERROR "$@" >&2; return 1; }
 
 cleanup(){
+    # Existing user config is only committed after the new Mihomo validates it.
+    # Until then the rollback copy lives only in /tmp and is restored on any
+    # installer abort. No persistent backup directory is created.
+    if test "$CONFIG_MIGRATION_PENDING" = 1 && test -n "$CONFIG_ROLLBACK_TMP" && test -f "$CONFIG_ROLLBACK_TMP" && test -n "$ACTIVE_CONFIG"; then
+        cp -f "$CONFIG_ROLLBACK_TMP" "$ACTIVE_CONFIG" 2>/dev/null || true
+    fi
     rm -rf "$TMP_ROOT" 2>/dev/null || true
     test "$LOCK_HELD" = 1 && rm -rf "$LOCK_DIR" 2>/dev/null || true
 }
@@ -2032,21 +2040,99 @@ generate_dashboard_secret(){
     printf '%s\n' "$secret"
 }
 
-replace_placeholder_secret(){
+yaml_top_raw_install(){
+    file="$1"; key="$2"
+    LC_ALL=C awk -v key="$key" '
+      $0 ~ "^" key ":[[:space:]]*" {
+        line=$0
+        sub("^" key ":[[:space:]]*", "", line)
+        print line
+        exit
+      }
+    ' "$file" 2>/dev/null
+}
+
+yaml_scalar_clean_install(){
+    printf '%s\n' "$1" | sed 's/[[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//'
+}
+
+config_block_section_preflight(){
+    file="$1"; section="$2"
+    state="$(LC_ALL=C awk -v section="$section" '
+      BEGIN{count=0; bad=0}
+      $0 ~ "^" section ":" {
+        count++
+        line=$0
+        sub("^" section ":[[:space:]]*", "", line)
+        if (line !~ "^($|#)") bad=1
+      }
+      END{print count ":" bad}
+    ' "$file" 2>/dev/null)"
+    case "$state" in
+      0:0|1:0) return 0;;
+      *:1)
+        fail "Секция $section должна быть обычным YAML-блоком ($section: с ключами ниже), flow-формат $section: {...} не поддерживается безопасной миграцией"
+        return 1
+        ;;
+      *)
+        fail "В config.yaml найдено несколько верхнеуровневых секций $section:. Убери дубликаты перед обновлением"
+        return 1
+        ;;
+    esac
+}
+
+
+yaml_top_section_exists_install(){
+    file="$1"; section="$2"
+    LC_ALL=C awk -v section="$section" '$0 ~ "^" section ":[[:space:]]*($|#)" {found=1; exit} END{exit found ? 0 : 1}' "$file" >/dev/null 2>&1
+}
+
+append_default_dns_section(){
     file="$1"
-    grep -q '^secret:[[:space:]]*["'"'"']CHANGE_ME["'"'"'][[:space:]]*$' "$file" 2>/dev/null || return 0
-    secret="$(generate_dashboard_secret)"
-    test -n "$secret" || return 1
-    sed -i "s@^secret:.*@secret: \"$secret\"@" "$file" || return 1
-    say "Для Zashboard создан уникальный локальный secret"
+    cat >> "$file" <<'EOF'
+
+dns:
+  enable: true
+  listen: 127.0.0.1:1053
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  default-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+  nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+EOF
+}
+
+append_default_tun_section(){
+    file="$1"
+    if test "$ROUTING_MODE" = manual; then
+        ar=false; ard=false; adi=false
+    else
+        ar=true; ard=true; adi=true
+    fi
+    cat >> "$file" <<EOF
+
+tun:
+  enable: true
+  stack: $TUN_STACK
+  device: tun0
+  auto-route: $ar
+  auto-redirect: $ard
+  auto-detect-interface: $adi
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+EOF
 }
 
 yaml_set_section_key(){
     file="$1"; section="$2"; key="$3"; value="$4"; tmp="$file.gc.$$"
-    # Update an existing key, add it to an existing block section, or create
-    # the whole section when upgrading an older user config that never had it.
-    # Keep this deliberately simple/portable for ASUS BusyBox awk.
-    awk -v section="$section" -v key="$key" -v value="$value" '
+    # Update an existing scalar key, add it to an existing block section, or
+    # create the whole section when upgrading an older user config.
+    LC_ALL=C awk -v section="$section" -v key="$key" -v value="$value" '
       BEGIN {inside=0; found=0; section_seen=0}
       $0 ~ "^" section ":[[:space:]]*($|#)" {
         inside=1
@@ -2055,7 +2141,7 @@ yaml_set_section_key(){
         print
         next
       }
-      inside && /^[^[:space:]#]/ {
+      inside && /^[^[:space:]]/ {
         if (!found) print "  " key ": " value
         inside=0
       }
@@ -2080,9 +2166,45 @@ yaml_set_section_key(){
     mv -f "$tmp" "$file"
 }
 
+yaml_section_has_key_install(){
+    file="$1"; section="$2"; key="$3"
+    LC_ALL=C awk -v section="$section" -v key="$key" '
+      $0 ~ "^" section ":[[:space:]]*($|#)" {inside=1; next}
+      inside && /^[^[:space:]]/ {exit}
+      inside && $0 ~ "^[[:space:]]+" key ":[[:space:]]*" {found=1; exit}
+      END{exit found ? 0 : 1}
+    ' "$file" >/dev/null 2>&1
+}
+
+yaml_ensure_tun_dns_hijack(){
+    file="$1"
+    yaml_section_has_key_install "$file" tun dns-hijack && return 0
+    tmp="$file.gc.$$"
+    LC_ALL=C awk '
+      BEGIN{inside=0; inserted=0}
+      $0 ~ "^tun:[[:space:]]*($|#)" {inside=1; print; next}
+      inside && /^[^[:space:]]/ {
+        print "  dns-hijack:"
+        print "    - any:53"
+        print "    - tcp://any:53"
+        inserted=1
+        inside=0
+      }
+      {print}
+      END{
+        if (inside && !inserted) {
+          print "  dns-hijack:"
+          print "    - any:53"
+          print "    - tcp://any:53"
+        }
+      }
+    ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$file"
+}
+
 yaml_set_top_key(){
     file="$1"; key="$2"; value="$3"; tmp="$file.gc.$$"
-    awk -v key="$key" -v value="$value" '
+    LC_ALL=C awk -v key="$key" -v value="$value" '
       BEGIN{done=0}
       $0 ~ "^" key ":[[:space:]]*" {if(!done){print key ": " value; done=1}; next}
       {print}
@@ -2093,28 +2215,54 @@ yaml_set_top_key(){
 
 yaml_remove_top_key(){
     file="$1"; key="$2"; tmp="$file.gc.$$"
-    awk -v key="$key" '$0 !~ "^" key ":[[:space:]]*" {print}' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    LC_ALL=C awk -v key="$key" '$0 !~ "^" key ":[[:space:]]*" {print}' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
     mv -f "$tmp" "$file"
+}
+
+ensure_dashboard_secret(){
+    file="$1"
+    raw="$(yaml_top_raw_install "$file" secret)"
+    current="$(yaml_scalar_clean_install "$raw")"
+    case "$current" in
+      ''|CHANGE_ME|null|Null|NULL|'~')
+        secret="$(generate_dashboard_secret)"
+        test -n "$secret" || return 1
+        yaml_set_top_key "$file" secret "\"$secret\"" || return 1
+        say "Для Zashboard создан уникальный локальный secret"
+        ;;
+    esac
 }
 
 configure_routing_in_config(){
     file="$1"
     test -f "$file" || return 1
 
-    # These keys are owned by GoshaCrash runtime. Older configs may have been
-    # created before TUN/DNS became mandatory, or may contain enable:false.
-    # Normalize only the service keys we actually require; user proxies,
-    # groups, rules and resolver lists stay untouched.
+    # Safe shell migration only handles normal block-style tun:/dns: sections.
+    # Refuse ambiguous duplicate/flow mappings instead of silently producing
+    # duplicate YAML keys and damaging a user config.
+    config_block_section_preflight "$file" tun || return 1
+    config_block_section_preflight "$file" dns || return 1
+
+    # If an old/imported config has no TUN or DNS section at all, create the
+    # complete minimal GoshaCrash blocks instead of only two scalar keys.
+    yaml_top_section_exists_install "$file" tun || append_default_tun_section "$file" || return 1
+    yaml_top_section_exists_install "$file" dns || append_default_dns_section "$file" || return 1
+
+    # GoshaCrash-owned API/UI fields. Zashboard is served by this Mihomo core,
+    # therefore the controller must be reachable from LAN and protected.
+    yaml_set_top_key "$file" external-controller 0.0.0.0:9090 || return 1
+    yaml_set_top_key "$file" external-ui ui || return 1
+    yaml_set_top_key "$file" external-ui-url "\"$ZASHBOARD_PRIMARY\"" || return 1
+    ensure_dashboard_secret "$file" || return 1
+
+    # Runtime-owned TUN/DNS fields. User proxies, groups, rules and DNS resolver
+    # lists are intentionally preserved.
     yaml_set_section_key "$file" tun enable true || return 1
     yaml_set_section_key "$file" tun stack "$TUN_STACK" || return 1
     yaml_set_section_key "$file" tun device tun0 || return 1
+    yaml_ensure_tun_dns_hijack "$file" || return 1
     yaml_set_section_key "$file" dns enable true || return 1
     yaml_set_section_key "$file" dns listen 127.0.0.1:1053 || return 1
-    yaml_set_top_key "$file" external-ui ui || return 1
-
-    if ! grep -q '^external-ui-url:[[:space:]]*[^[:space:]#]' "$file" 2>/dev/null; then
-        yaml_set_top_key "$file" external-ui-url '"https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip"' || return 1
-    fi
 
     if test "$ROUTING_MODE" = manual; then
         yaml_set_section_key "$file" tun auto-route false || return 1
@@ -2125,10 +2273,246 @@ configure_routing_in_config(){
         yaml_set_section_key "$file" tun auto-route true || return 1
         yaml_set_section_key "$file" tun auto-redirect true || return 1
         # Mihomo auto-redirect supports iptables or nftables on Linux.
-        # auto-detect-interface itself does not require nft.
         yaml_set_section_key "$file" tun auto-detect-interface true || return 1
         yaml_remove_top_key "$file" routing-mark || return 1
     fi
+}
+
+find_od_install(){
+    for od_candidate in /usr/bin/od /bin/od /usr/sbin/od /sbin/od /bin/busybox; do
+        test -x "$od_candidate" || continue
+        if test "$od_candidate" = /bin/busybox; then
+            "$od_candidate" od -An -tu1 -v /dev/null >/dev/null 2>&1 && { printf '%s\n' "$od_candidate od"; return 0; }
+        else
+            "$od_candidate" -An -tu1 -v /dev/null >/dev/null 2>&1 && { printf '%s\n' "$od_candidate"; return 0; }
+        fi
+    done
+    return 1
+}
+
+utf8_validate_file_install(){
+    uv_file="$1"
+    uv_od_cmd="$(find_od_install 2>/dev/null)" || return 2
+    if test "$uv_od_cmd" = "/bin/busybox od"; then
+        /bin/busybox od -An -tu1 -v "$uv_file" 2>/dev/null
+    else
+        "$uv_od_cmd" -An -tu1 -v "$uv_file" 2>/dev/null
+    fi | LC_ALL=C awk '
+      BEGIN { need=0; ok=1; minc=128; maxc=191 }
+      {
+        for (i=1; i<=NF; i++) {
+          b=$i+0
+          if (need == 0) {
+            if (b <= 127) continue
+            if (b >= 194 && b <= 223) { need=1; minc=128; maxc=191; continue }
+            if (b >= 224 && b <= 239) {
+              need=2
+              if (b == 224) { minc=160; maxc=191 }
+              else if (b == 237) { minc=128; maxc=159 }
+              else { minc=128; maxc=191 }
+              continue
+            }
+            if (b >= 240 && b <= 244) {
+              need=3
+              if (b == 240) { minc=144; maxc=191 }
+              else if (b == 244) { minc=128; maxc=143 }
+              else { minc=128; maxc=191 }
+              continue
+            }
+            ok=0; exit
+          }
+          if (b < minc || b > maxc) { ok=0; exit }
+          need--
+          minc=128; maxc=191
+        }
+      }
+      END { if (!ok || need != 0) exit 1; exit 0 }
+    '
+}
+
+strip_whole_line_comments_install(){
+    src="$1"; dst="$2"
+    # Old comments are not configuration. Remove them byte-for-byte before any
+    # AWK migration so a CP1251/broken comment can never poison a UTF-8 YAML.
+    # LC_ALL=C is intentional: treat the file as bytes, not locale text.
+    LC_ALL=C awk '!/^[[:space:]]*#/' "$src" > "$dst"
+}
+
+write_config_header_comments_install(){
+    cat <<'EOF'
+# GoshaCrash — конфигурация Mihomo.
+# Кодировка файла: UTF-8 без BOM.
+# Служебные поля TUN, DNS, API и Zashboard поддерживаются GoshaCrash.
+# Пользовательские proxies, proxy-groups, rule-providers и rules сохраняются.
+EOF
+}
+
+# Add our comments only after all structural YAML rewrites are finished.
+# This keeps every migration pass ASCII/data-only and prevents a tiny ASUS
+# awk/locale implementation from ever touching Cyrillic bytes.
+decorate_config_comments_install(){
+    src="$1"; dst="$2"
+    : > "$dst" || return 1
+    write_config_header_comments_install >> "$dst" || return 1
+
+    section=""
+    seen_api=0
+    seen_profile=0
+    seen_ports=0
+    seen_dns=0
+    seen_tun=0
+    seen_proxies=0
+    seen_groups=0
+    seen_providers=0
+    seen_rules=0
+    seen_mark=0
+
+    while IFS= read -r line || test -n "$line"; do
+        case "$line" in
+          [![:space:]]*) section="" ;;
+        esac
+
+        case "$line" in
+          external-controller:*)
+            if test "$seen_api" = 0; then
+                cat >> "$dst" <<'EOF'
+
+# API Mihomo для Zashboard. Доступен из локальной сети и защищён secret.
+EOF
+                seen_api=1
+            fi
+            ;;
+          profile:*)
+            section="profile"
+            if test "$seen_profile" = 0; then
+                cat >> "$dst" <<'EOF'
+
+# Сохранять выбранные прокси и таблицу Fake-IP между перезапусками Mihomo.
+EOF
+                seen_profile=1
+            fi
+            ;;
+          mixed-port:*)
+            if test "$seen_ports" = 0; then
+                cat >> "$dst" <<'EOF'
+
+# Локальный mixed-порт (HTTP/SOCKS) и основные параметры Mihomo.
+EOF
+                seen_ports=1
+            fi
+            ;;
+          dns:*)
+            section="dns"
+            if test "$seen_dns" = 0; then
+                cat >> "$dst" <<'EOF'
+
+# DNS Mihomo. Fake-IP используется для прозрачной маршрутизации клиентов.
+EOF
+                seen_dns=1
+            fi
+            ;;
+          tun:*)
+            section="tun"
+            if test "$seen_tun" = 0; then
+                cat >> "$dst" <<'EOF'
+
+# Виртуальный TUN-интерфейс. Эти параметры контролирует GoshaCrash.
+EOF
+                seen_tun=1
+            fi
+            ;;
+          proxies:*)
+            section="proxies"
+            if test "$seen_proxies" = 0; then
+                cat >> "$dst" <<'EOF'
+
+# Прокси-серверы пользователя.
+EOF
+                seen_proxies=1
+            fi
+            ;;
+          proxy-groups:*)
+            section="proxy-groups"
+            if test "$seen_groups" = 0; then
+                cat >> "$dst" <<'EOF'
+
+# Группы прокси пользователя.
+EOF
+                seen_groups=1
+            fi
+            ;;
+          rule-providers:*)
+            section="rule-providers"
+            if test "$seen_providers" = 0; then
+                cat >> "$dst" <<'EOF'
+
+# Провайдеры правил пользователя.
+EOF
+                seen_providers=1
+            fi
+            ;;
+          rules:*)
+            section="rules"
+            if test "$seen_rules" = 0; then
+                cat >> "$dst" <<'EOF'
+
+# Правила маршрутизации. Порядок правил имеет значение.
+EOF
+                seen_rules=1
+            fi
+            ;;
+          routing-mark:*)
+            if test "$seen_mark" = 0; then
+                cat >> "$dst" <<'EOF'
+
+# Метка исходящих соединений Mihomo для ручной policy routing.
+EOF
+                seen_mark=1
+            fi
+            ;;
+        esac
+
+        case "$section|$line" in
+          'dns|  enhanced-mode:'*)
+            cat >> "$dst" <<'EOF'
+  # Fake-IP позволяет Mihomo прозрачно сопоставлять DNS-ответы с соединениями.
+EOF
+            ;;
+          'dns|  default-nameserver:'*)
+            cat >> "$dst" <<'EOF'
+  # DNS для начального разрешения имён до запуска основной DNS-логики.
+EOF
+            ;;
+          'dns|  nameserver:'*)
+            cat >> "$dst" <<'EOF'
+  # Основные DNS-серверы.
+EOF
+            ;;
+          'tun|  auto-route:'*)
+            cat >> "$dst" <<'EOF'
+  # Автоматически создавать системные маршруты для TUN.
+EOF
+            ;;
+          'tun|  auto-redirect:'*)
+            cat >> "$dst" <<'EOF'
+  # Автоматически настраивать прозрачный TCP/UDP-перехват на Linux.
+EOF
+            ;;
+          'tun|  auto-detect-interface:'*)
+            cat >> "$dst" <<'EOF'
+  # Автоматически определять физический интерфейс выхода в интернет.
+EOF
+            ;;
+          'tun|  dns-hijack:'*)
+            cat >> "$dst" <<'EOF'
+  # Перехватывать обычные DNS-запросы клиентов через TUN.
+EOF
+            ;;
+        esac
+
+        printf '%s\n' "$line" >> "$dst" || return 1
+    done < "$src"
+    return 0
 }
 
 generate_base_config(){
@@ -2136,59 +2520,100 @@ generate_base_config(){
     secret="$(generate_dashboard_secret)"
     test -n "$secret" || { fail "Не удалось создать secret для Zashboard"; return 1; }
 
-    cat > "$file" <<EOF
-# Базовая конфигурация GoshaCrash. Кодировка файла: UTF-8 без BOM.
-# Сгенерирована install.sh под текущую архитектуру и режим маршрутизации роутера.
-# По умолчанию трафик идёт напрямую (DIRECT). Добавь свои proxy / proxy-groups / rules.
+    if test "$ROUTING_MODE" = manual; then
+        cfg_auto_route=false
+        cfg_auto_redirect=false
+        cfg_auto_detect=false
+    else
+        cfg_auto_route=true
+        cfg_auto_redirect=true
+        cfg_auto_detect=true
+    fi
 
-# Веб-интерфейс Zashboard и локальный API Mihomo.
+    # Fresh install gets the final placeholder config in one write.  Do not
+    # build an ASCII file and decorate it later: the canonical Cyrillic comments
+    # live directly in this UTF-8 installer and /bin/sh copies those bytes as-is.
+    # Mihomo itself validates the resulting file before runtime is started.
+    cat > "$file" <<EOF
+# GoshaCrash — базовая конфигурация Mihomo.
+# Кодировка файла: UTF-8 без BOM.
+# Это безопасная стартовая заглушка: пока прокси не добавлены, весь трафик идёт DIRECT.
+# Добавь свои proxies / proxy-groups / rules, сохрани файл и проверь его через gc check.
+# Служебные параметры TUN, DNS, API и Zashboard поддерживаются GoshaCrash автоматически.
+
+# API Mihomo для Zashboard. Доступен из локальной сети и защищён уникальным secret.
 external-controller: 0.0.0.0:9090
 secret: "$secret"
 external-ui: ui
-external-ui-url: "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip"
+external-ui-url: "$ZASHBOARD_PRIMARY"
 
-# Сохранять выбранные прокси и Fake-IP между перезапусками Mihomo.
+# Сохранять выбранные прокси и таблицу Fake-IP между перезапусками Mihomo.
 profile:
   store-selected: true
   store-fake-ip: true
 
-# Локальный mixed HTTP/SOCKS порт Mihomo.
+# Локальный mixed-порт (HTTP/SOCKS) и основные параметры Mihomo.
 mixed-port: 7892
 allow-lan: true
 bind-address: "*"
 mode: rule
 log-level: info
 ipv6: false
+find-process-mode: "off"
 
 # DNS Mihomo. Fake-IP используется для прозрачной маршрутизации клиентов.
 dns:
   enable: true
   listen: 127.0.0.1:1053
   ipv6: false
+
+  # Fake-IP позволяет Mihomo прозрачно сопоставлять DNS-ответы с соединениями.
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
+
+  # DNS для начального разрешения имён до запуска основной DNS-логики.
   default-nameserver:
     - 1.1.1.1
     - 8.8.8.8
+
+  # Основные DNS-серверы.
   nameserver:
     - 1.1.1.1
     - 8.8.8.8
 
-# TUN-интерфейс. auto-route / auto-redirect ниже выставляет сам GoshaCrash.
+# Виртуальный TUN-интерфейс. Эти параметры контролирует GoshaCrash.
 tun:
   enable: true
   stack: $TUN_STACK
   device: tun0
+
+  # Автоматически создавать системные маршруты для TUN.
+  auto-route: $cfg_auto_route
+
+  # Автоматически настраивать прозрачный TCP/UDP-перехват на Linux.
+  auto-redirect: $cfg_auto_redirect
+
+  # Автоматически определять физический интерфейс выхода в интернет.
+  auto-detect-interface: $cfg_auto_detect
+
+  # Перехватывать обычные DNS-запросы клиентов через TUN.
   dns-hijack:
     - any:53
     - tcp://any:53
 
-# Без пользовательских правил весь трафик остаётся DIRECT.
+# Стартовое правило-заглушка: до добавления прокси весь трафик идёт напрямую.
 rules:
   - MATCH,DIRECT
 EOF
 
-    configure_routing_in_config "$file" || return 1
+    if test "$ROUTING_MODE" = manual; then
+        cat >> "$file" <<'EOF'
+
+# Метка исходящих соединений Mihomo для ручной policy routing.
+routing-mark: 9012
+EOF
+    fi
+
     chmod 600 "$file" 2>/dev/null || true
     return 0
 }
@@ -2205,22 +2630,89 @@ install_configs(){
 
     if test ! -f "$ACTIVE_CONFIG"; then
         generate_base_config "$ACTIVE_CONFIG" || { fail "Не удалось сгенерировать базовый config.yaml"; return 1; }
+        utf8_validate_file_install "$ACTIVE_CONFIG"
+        utf8_rc=$?
+        if test "$utf8_rc" = 1; then
+            fail "Внутренняя ошибка: только что созданный config.yaml не является корректным UTF-8"
+            return 1
+        fi
         say "Базовый config.yaml создан install.sh для $PLATFORM (routing=$ROUTING_MODE, tun.stack=$TUN_STACK)"
         warn "VPN ещё не настроен: добавь свои proxy/rules и выполни gc restart"
     else
-        config_tmp="$TMP_ROOT/config-before-routing.yaml"
-        cp -f "$ACTIVE_CONFIG" "$config_tmp" || return 1
-        say "Существующий $ACTIVE_CONFIG сохранён; служебные TUN/DNS/UI поля нормализуются, пользовательские proxy/rules не трогаются"
-        if ! configure_routing_in_config "$ACTIVE_CONFIG"; then
-            cp -f "$config_tmp" "$ACTIVE_CONFIG" 2>/dev/null || true
-            fail "Не удалось применить routing=$ROUTING_MODE к конфигу"
+        CONFIG_ROLLBACK_TMP="$TMP_ROOT/config-before-migration.yaml"
+        cp -f "$ACTIVE_CONFIG" "$CONFIG_ROLLBACK_TMP" || return 1
+        CONFIG_MIGRATION_PENDING="1"
+        say "Существующий $ACTIVE_CONFIG сохранён; YAML-данные остаются, комментарии будут заново созданы в UTF-8"
+
+        clean="$TMP_ROOT/config-data-no-comments.$$"
+        if ! strip_whole_line_comments_install "$ACTIVE_CONFIG" "$clean"; then
+            cp -f "$CONFIG_ROLLBACK_TMP" "$ACTIVE_CONFIG" 2>/dev/null || true
+            CONFIG_MIGRATION_PENDING="0"
+            fail "Не удалось удалить старые строки-комментарии из config.yaml"
             return 1
         fi
-        rm -f "$config_tmp" 2>/dev/null || true
+        mv -f "$clean" "$ACTIVE_CONFIG" || return 1
+
+        if ! configure_routing_in_config "$ACTIVE_CONFIG"; then
+            cp -f "$CONFIG_ROLLBACK_TMP" "$ACTIVE_CONFIG" 2>/dev/null || true
+            CONFIG_MIGRATION_PENDING="0"
+            fail "Не удалось безопасно нормализовать config.yaml"
+            return 1
+        fi
+
+        decorated="$TMP_ROOT/config-decorated.$$"
+        if ! decorate_config_comments_install "$ACTIVE_CONFIG" "$decorated"; then
+            cp -f "$CONFIG_ROLLBACK_TMP" "$ACTIVE_CONFIG" 2>/dev/null || true
+            CONFIG_MIGRATION_PENDING="0"
+            fail "Не удалось создать русские UTF-8 комментарии config.yaml"
+            return 1
+        fi
+        mv -f "$decorated" "$ACTIVE_CONFIG" || return 1
         chmod 600 "$ACTIVE_CONFIG" 2>/dev/null || true
     fi
 }
 
+mihomo_config_test_install(){
+    mct_file="$1"
+    mct_log="$2"
+    test -x "$BASE/bin/mihomo" || return 2
+    "$BASE/bin/mihomo" -t -d "$BASE" -f "$mct_file" >"$mct_log" 2>&1
+}
+
+config_test_has_utf8_error_install(){
+    ctu_log="$1"
+    grep -Eiq 'invalid[^[:cntrl:]]*UTF-8|UTF-8[^[:cntrl:]]*invalid|invalid trailing UTF-8 octet|invalid UTF-8|invalid utf-8' "$ctu_log" 2>/dev/null
+}
+
+authoritative_config_preflight(){
+    acp_log="$TMP_ROOT/config-mihomo-preflight.$$"
+    if mihomo_config_test_install "$ACTIVE_CONFIG" "$acp_log"; then
+        rm -f "$acp_log" 2>/dev/null || true
+        return 0
+    fi
+
+    if config_test_has_utf8_error_install "$acp_log"; then
+        data_only="$TMP_ROOT/config-data-only-test.$$"
+        strip_whole_line_comments_install "$ACTIVE_CONFIG" "$data_only" || true
+        if test -s "$data_only" && mihomo_config_test_install "$data_only" "$acp_log.data"; then
+            cat "$acp_log" >&2 2>/dev/null || true
+            rm -f "$acp_log" "$acp_log.data" "$data_only" 2>/dev/null || true
+            fail "Внутренняя ошибка: YAML без комментариев валиден, но свежие русские UTF-8 комментарии Mihomo не принял"
+            fail "Установка остановлена: config.yaml без комментариев оставлять не буду"
+            return 1
+        fi
+        cat "$acp_log" >&2 2>/dev/null || true
+        rm -f "$acp_log" "$acp_log.data" "$data_only" 2>/dev/null || true
+        fail "config.yaml содержит невалидный UTF-8 внутри YAML-данных, а не в комментариях"
+        fail "Автоматически перекодировать proxy/rules/имена небезопасно; пересохрани значения как UTF-8 и повтори установку"
+        return 1
+    fi
+
+    cat "$acp_log" >&2 2>/dev/null || true
+    rm -f "$acp_log" 2>/dev/null || true
+    fail "Mihomo отклонил config.yaml"
+    return 1
+}
 
 json_asset_urls(){
     file="$1"
@@ -2230,7 +2722,7 @@ json_asset_urls(){
 }
 
 pinned_official_mihomo_url(){
-    # rc31 deliberately pins the modern core. A router install must not silently
+    # rc36 deliberately pins the modern core. A router install must not silently
     # switch CPU binary just because GitHub "latest" changed between runs.
     MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_VERSION"
     printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$OFFICIAL_MIHOMO_VERSION/mihomo-linux-$MIHOMO_TARGET-$OFFICIAL_MIHOMO_VERSION.gz"
@@ -2540,7 +3032,7 @@ install_stock_usb_mount_bridge(){
     mkdir -p "$DM_ROOT/etc/init.d" "$DM_ROOT/lib/ipkg/info" || return 1
     cat > "$DM_ROOT/etc/init.d/S50usb-mount-script" <<'HOOK'
 #!/bin/sh
-# GoshaCrash Download Master bridge 3.10.2-rc31
+# GoshaCrash Download Master bridge 3.10.2-rc36
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2630,7 +3122,7 @@ install_hooks(){
 
     cat > /jffs/scripts/usb-mount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB hook 3.10.2-rc31
+# GoshaCrash USB hook 3.10.2-rc36
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2697,7 +3189,7 @@ BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 UPTIME="$(cat /proc/uptime 2>/dev/null)"
 trace "controller ready after ${WAITED}s dm=${DM:-none} boot_id=${BOOT_ID:-unknown} uptime=${UPTIME:-unknown}"
 date '+%Y-%m-%d %H:%M:%S' > "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-printf '[%s] autostart hook rc31: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
+printf '[%s] autostart hook rc36: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
 
 NOHUP=""
 for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup; do
@@ -2717,7 +3209,7 @@ HOOK
 
     cat > /jffs/scripts/usb-umount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB unmount hook 3.10.2-rc31
+# GoshaCrash USB unmount hook 3.10.2-rc36
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2753,7 +3245,7 @@ HOOK
     test -d /opt/bin && test -w /opt/bin && write_command_wrapper /opt/bin/gc 2>/dev/null || true
 
     # Old rc23-rc26 used a custom /jffs/addons/goshacrash directory only to
-    # store base/start/trace. rc31 no longer needs it; remove our own residue.
+    # store base/start/trace. rc36 no longer needs it; remove our own residue.
     rm -rf /jffs/addons/goshacrash 2>/dev/null || true
     grep -Fq 'exec /bin/busybox test "$@"' /jffs/scripts/test 2>/dev/null && rm -f /jffs/scripts/test 2>/dev/null || true
     grep -Fq "exec /bin/busybox '['" /jffs/scripts/'[' 2>/dev/null && rm -f /jffs/scripts/'[' 2>/dev/null || true
@@ -2925,6 +3417,9 @@ main(){
     install_configs || return 1
     install_mihomo || return 1
     install_zashboard || return 1
+    # Mihomo itself is the authority for UTF-8/YAML. This catches BT10 builds
+    # where the tiny BusyBox userland has no usable od for our preflight.
+    authoritative_config_preflight || return 1
     write_platform_state || return 1
 
     if test "${LEGACY:-0}" = 1; then
@@ -2932,7 +3427,15 @@ main(){
     fi
     install_hooks || return 1
     if test "${LEGACY:-0}" = 1; then verify_shell_compat || return 1; fi
-    GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" check || return 1
+    if ! GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" check; then
+        fail "Новый config.yaml не прошёл встроенную проверку Mihomo; исходный пользовательский конфиг будет восстановлен"
+        return 1
+    fi
+    # Syntax/semantic validation succeeded. Commit the in-place migration now;
+    # a later runtime failure must not roll back a syntactically valid config.
+    CONFIG_MIGRATION_PENDING="0"
+    test -n "$CONFIG_ROLLBACK_TMP" && rm -f "$CONFIG_ROLLBACK_TMP" 2>/dev/null || true
+
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" restart || {
         fail "Первый запуск не удался. Проверь $BASE/logs/mihomo.log и команду gc logs"
         return 1

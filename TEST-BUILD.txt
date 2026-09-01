@@ -1,19 +1,29 @@
-# GoshaCrash 3.10.2-rc31
+# GoshaCrash 3.10.2-rc36
 
 Consolidated test build for ASUS RT-AC68U and ZenWiFi BT10.
 
-Key rc31 changes:
-- existing configs are migrated so GoshaCrash-owned tun/dns/ui keys are made runtime-safe before `gc check`;
-- yaml_set_section_key now creates missing tun:/dns: block sections instead of silently doing nothing;
-- migration tested from both a config with no tun/dns sections and a config with tun.enable:false;
-- migrated configs parse as valid YAML and retain user proxies/rules/resolver lists.
+Key rc36 changes:
+- existing config migration strips old whole-line comments before any YAML rewrite; YAML data is preserved byte-for-byte except GoshaCrash-owned fields;
+- canonical Russian comments are regenerated after migration in UTF-8 without BOM;
+- config-related AWK passes in installer/controller use LC_ALL=C so Cyrillic bytes are never locale-transcoded by ASUS BusyBox;
+- fresh config is written directly as the final UTF-8 Russian-commented DIRECT placeholder in one heredoc; no data-first/decorate pass is used for a clean install;
+- no comments-free fallback: final config with Cyrillic comments must pass real `mihomo -t`;
+- rollback remains volatile under /tmp only; no persistent backup directory/file is created.
+
+Retained rc34 changes:
+- full audit of config.yaml generation/migration; fresh auto/manual configs are generated directly with canonical TUN/DNS blocks instead of post-patching a just-created file;
+- modern auto config: stack=system, tun.enable=true, device=tun0, auto-route/auto-redirect/auto-detect-interface=true, dns-hijack present, no routing-mark;
+- manual config: auto-route/auto-redirect/auto-detect-interface=false and routing-mark=9012; legacy ARMv5 uses stack=gvisor;
+- base router config adds find-process-mode: off per Mihomo router guidance;
+- existing configs preserve proxies/proxy-groups/rules/custom resolver lists while GoshaCrash-owned TUN/DNS/API/UI fields are normalized;
+- if tun:/dns: are entirely absent, complete minimal sections are appended (Fake-IP/resolver defaults included for a missing DNS block);
+- existing external-controller is normalized to 0.0.0.0:9090; external-ui/ui URL are normalized to Zashboard; missing/empty/CHANGE_ME secret gets a generated local secret;
+- duplicate top-level tun:/dns: and flow-style tun: {...}/dns: {...} are rejected before mutation instead of creating ambiguous duplicate YAML;
+- config migration is transactional: original user config is kept only in /tmp until the new Mihomo accepts it; installer abort restores it, and no persistent backup directory/file is created;
+- required_config now validates expected tun.stack, dns-hijack presence and auto-detect-interface in addition to enable/device/routing/DNS;
+- runtime routing rewrite creates missing tun:/dns: block sections and reasserts enable/device/listen fields before changing mode;
 - removed ROUTING: AUTO/MANUAL from the interactive menu header; routing remains available in status/doctor/CLI;
-- recalculated interactive repaint rows after removing the routing row; menu remains 45 columns wide and arrow navigation remains incremental;
-- doctor now distinguishes kernel /dev/net/tun from Mihomo-created tun0;
-- routing is reported as N/A when tun0 is down instead of as a misleading independent FAIL;
-- external Internet probe is the primary WAN health line; ASUS WAN NVRAM is explicitly informational;
-- doctor reports persistent manual-stop state;
-- kernel TUN readiness has a shared non-destructive probe used by runtime diagnostics.
+- doctor distinguishes kernel /dev/net/tun from Mihomo-created tun0 and reports routing N/A when tun0 is down;
 - installer no longer erases boot/watchdog/coldboot/controller logs during upgrade.
 
 Previous consolidated fixes retained:
@@ -36,7 +46,7 @@ Validation performed for this artifact:
 - edit-config harness verified that valid edits do not call restart
 - edit-config validation uses only a volatile /tmp rollback copy; no persistent backup is created
 - generated source files decode as UTF-8 and contain no UTF-8 BOM
-- install.sh --help and goshacrash.sh version report 3.10.2-rc31
+- install.sh --help and goshacrash.sh version report 3.10.2-rc36
 - no BusyBox-incompatible find -type or find -path in executable shell code
 - ZIP integrity tested with unzip -t
 - public `gc start` dispatcher verified: it reaches start() instead of the unknown-command branch
@@ -45,5 +55,20 @@ Validation performed for this artifact:
 - interrupted Zashboard swap recovery was tested with an empty recreated ui/ and a valid .ui-old.* directory
 
 Real-router status:
-- RT-AC68U: rc12 lineage is the last fully end-to-end tested legacy baseline; rc31 keeps the same legacy package/routing model.
-- ZenWiFi BT10: package path, writable /opt bind, SFTP payload, terminfo/nano, ARMv7 Mihomo, TUN, and auto routing were proven manually. rc31 menu/edit/JFFS cleanup still requires real-router verification after install/reboot/power-cycle before calling the build stable.
+- RT-AC68U: rc12 lineage is the last fully end-to-end tested legacy baseline; rc36 keeps the same legacy package/routing model.
+- ZenWiFi BT10: package path, writable /opt bind, SFTP payload, terminfo/nano, ARMv7 Mihomo, TUN, and auto routing were proven manually. rc36 menu/edit/JFFS cleanup still requires real-router verification after install/reboot/power-cycle before calling the build stable.
+
+Additional rc34 encoding tests:
+- fresh generated config passes byte-level UTF-8 validator;
+- CP1251 bytes contained only in full-line comments are safely removed and the YAML payload is preserved;
+- invalid UTF-8 inside an actual YAML scalar is rejected and the original file is restored;
+- gc check reports encoding failure before invoking Mihomo.
+
+Additional rc36 comment/encoding tests:
+- fresh placeholder config is emitted in one write directly from install.sh, with no AWK/decorator pass;
+- bash, dash and BusyBox ash produce byte-identical auto placeholder configs;
+- fresh auto config generated under bash, dash and BusyBox ash decodes as UTF-8 and parses as YAML;
+- migration input with an actual CP1251 whole-line comment is converted to canonical UTF-8 comments while a UTF-8 Cyrillic proxy name is preserved exactly;
+- the same migration harness passes under bash, dash and BusyBox ash;
+- all config read/rewrite AWK code paths use LC_ALL=C;
+- final config intentionally keeps Russian comments and has no comments-free fallback.
