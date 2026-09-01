@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc30"
-BUILD_ID="2026-09-01-tun-doctor-menu-cleanup-rc30"
+VERSION="3.10.2-rc31"
+BUILD_ID="2026-09-01-config-migration-tun-fix-rc31"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -697,13 +697,13 @@ validate_binary_arch(){
     [ "$magic" = 7f454c46 ] || { fail "Mihomo повреждён: файл не является ELF (header=${hex:-empty})"; return 1; }
     case "$MIHOMO_TARGET" in
       armv5|armv7)
-        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку rc30"; return 1; }
+        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку rc31"; return 1; }
         ;;
       arm64|aarch64)
-        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку rc30"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку rc31"; return 1; }
         ;;
       amd64|amd64-compatible|x86_64)
-        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку rc30"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку rc31"; return 1; }
         ;;
     esac
     return 0
@@ -2279,7 +2279,7 @@ autostart_status(){
     [ -n "$bridge_version" ] && echo "  bridge version: $bridge_version" || echo "  bridge version: old/unknown"
     [ -f "$STATE/autostart-hook-ran" ] && echo "  last hook: $(cat "$STATE/autostart-hook-ran" 2>/dev/null)" || echo "  last hook: never"
     [ -f "$LOGS/coldboot.log" ] && echo "  coldboot trace: $LOGS/coldboot.log" || echo "  coldboot trace: not written yet"
-    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall rc30)" || echo "  legacy JFFS dir: clean"
+    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall rc31)" || echo "  legacy JFFS dir: clean"
     [ -f "$MANUAL_STOP" ] && echo "  manual-stop: YES" || echo "  manual-stop: no"
     return 0
 }
@@ -2412,7 +2412,7 @@ doctor(){
 }
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.10.2-rc30 — что буквально вводить в SSH
+GoshaCrash 3.10.2-rc31 — что буквально вводить в SSH
 
 КАТАЛОГ УСТАНОВКИ
   BASE="$(gc base)"

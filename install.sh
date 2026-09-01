@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc30"
+INSTALLER_VERSION="3.10.2-rc31"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -2043,21 +2043,39 @@ replace_placeholder_secret(){
 
 yaml_set_section_key(){
     file="$1"; section="$2"; key="$3"; value="$4"; tmp="$file.gc.$$"
+    # Update an existing key, add it to an existing block section, or create
+    # the whole section when upgrading an older user config that never had it.
+    # Keep this deliberately simple/portable for ASUS BusyBox awk.
     awk -v section="$section" -v key="$key" -v value="$value" '
-      BEGIN {inside=0; found=0}
-      $0 ~ "^" section ":[[:space:]]*($|#)" {inside=1; found=0; print; next}
+      BEGIN {inside=0; found=0; section_seen=0}
+      $0 ~ "^" section ":[[:space:]]*($|#)" {
+        inside=1
+        found=0
+        section_seen=1
+        print
+        next
+      }
       inside && /^[^[:space:]#]/ {
         if (!found) print "  " key ": " value
         inside=0
       }
       inside && $0 ~ "^[[:space:]]+" key ":[[:space:]]*" {
-        indent=$0; sub(/[^[:space:]].*$/, "", indent)
+        indent=$0
+        sub(/[^[:space:]].*$/, "", indent)
         print indent key ": " value
         found=1
         next
       }
       {print}
-      END {if (inside && !found) print "  " key ": " value}
+      END {
+        if (inside && !found) {
+          print "  " key ": " value
+        } else if (!section_seen) {
+          if (NR > 0) print ""
+          print section ":"
+          print "  " key ": " value
+        }
+      }
     ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
     mv -f "$tmp" "$file"
 }
@@ -2082,14 +2100,28 @@ yaml_remove_top_key(){
 configure_routing_in_config(){
     file="$1"
     test -f "$file" || return 1
+
+    # These keys are owned by GoshaCrash runtime. Older configs may have been
+    # created before TUN/DNS became mandatory, or may contain enable:false.
+    # Normalize only the service keys we actually require; user proxies,
+    # groups, rules and resolver lists stay untouched.
+    yaml_set_section_key "$file" tun enable true || return 1
+    yaml_set_section_key "$file" tun stack "$TUN_STACK" || return 1
+    yaml_set_section_key "$file" tun device tun0 || return 1
+    yaml_set_section_key "$file" dns enable true || return 1
+    yaml_set_section_key "$file" dns listen 127.0.0.1:1053 || return 1
+    yaml_set_top_key "$file" external-ui ui || return 1
+
+    if ! grep -q '^external-ui-url:[[:space:]]*[^[:space:]#]' "$file" 2>/dev/null; then
+        yaml_set_top_key "$file" external-ui-url '"https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip"' || return 1
+    fi
+
     if test "$ROUTING_MODE" = manual; then
-        yaml_set_section_key "$file" tun stack "$TUN_STACK" || return 1
         yaml_set_section_key "$file" tun auto-route false || return 1
         yaml_set_section_key "$file" tun auto-redirect false || return 1
         yaml_set_section_key "$file" tun auto-detect-interface false || return 1
         yaml_set_top_key "$file" routing-mark 9012 || return 1
     else
-        yaml_set_section_key "$file" tun stack "$TUN_STACK" || return 1
         yaml_set_section_key "$file" tun auto-route true || return 1
         yaml_set_section_key "$file" tun auto-redirect true || return 1
         # Mihomo auto-redirect supports iptables or nftables on Linux.
@@ -2178,7 +2210,7 @@ install_configs(){
     else
         config_tmp="$TMP_ROOT/config-before-routing.yaml"
         cp -f "$ACTIVE_CONFIG" "$config_tmp" || return 1
-        say "Существующий $ACTIVE_CONFIG сохранён; меняются только параметры выбранной маршрутизации"
+        say "Существующий $ACTIVE_CONFIG сохранён; служебные TUN/DNS/UI поля нормализуются, пользовательские proxy/rules не трогаются"
         if ! configure_routing_in_config "$ACTIVE_CONFIG"; then
             cp -f "$config_tmp" "$ACTIVE_CONFIG" 2>/dev/null || true
             fail "Не удалось применить routing=$ROUTING_MODE к конфигу"
@@ -2198,7 +2230,7 @@ json_asset_urls(){
 }
 
 pinned_official_mihomo_url(){
-    # rc30 deliberately pins the modern core. A router install must not silently
+    # rc31 deliberately pins the modern core. A router install must not silently
     # switch CPU binary just because GitHub "latest" changed between runs.
     MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_VERSION"
     printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$OFFICIAL_MIHOMO_VERSION/mihomo-linux-$MIHOMO_TARGET-$OFFICIAL_MIHOMO_VERSION.gz"
@@ -2508,7 +2540,7 @@ install_stock_usb_mount_bridge(){
     mkdir -p "$DM_ROOT/etc/init.d" "$DM_ROOT/lib/ipkg/info" || return 1
     cat > "$DM_ROOT/etc/init.d/S50usb-mount-script" <<'HOOK'
 #!/bin/sh
-# GoshaCrash Download Master bridge 3.10.2-rc30
+# GoshaCrash Download Master bridge 3.10.2-rc31
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2598,7 +2630,7 @@ install_hooks(){
 
     cat > /jffs/scripts/usb-mount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB hook 3.10.2-rc30
+# GoshaCrash USB hook 3.10.2-rc31
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2665,7 +2697,7 @@ BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 UPTIME="$(cat /proc/uptime 2>/dev/null)"
 trace "controller ready after ${WAITED}s dm=${DM:-none} boot_id=${BOOT_ID:-unknown} uptime=${UPTIME:-unknown}"
 date '+%Y-%m-%d %H:%M:%S' > "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-printf '[%s] autostart hook rc30: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
+printf '[%s] autostart hook rc31: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
 
 NOHUP=""
 for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup; do
@@ -2685,7 +2717,7 @@ HOOK
 
     cat > /jffs/scripts/usb-umount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB unmount hook 3.10.2-rc30
+# GoshaCrash USB unmount hook 3.10.2-rc31
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2721,7 +2753,7 @@ HOOK
     test -d /opt/bin && test -w /opt/bin && write_command_wrapper /opt/bin/gc 2>/dev/null || true
 
     # Old rc23-rc26 used a custom /jffs/addons/goshacrash directory only to
-    # store base/start/trace. rc30 no longer needs it; remove our own residue.
+    # store base/start/trace. rc31 no longer needs it; remove our own residue.
     rm -rf /jffs/addons/goshacrash 2>/dev/null || true
     grep -Fq 'exec /bin/busybox test "$@"' /jffs/scripts/test 2>/dev/null && rm -f /jffs/scripts/test 2>/dev/null || true
     grep -Fq "exec /bin/busybox '['" /jffs/scripts/'[' 2>/dev/null && rm -f /jffs/scripts/'[' 2>/dev/null || true

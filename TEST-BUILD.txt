@@ -1,8 +1,12 @@
-# GoshaCrash 3.10.2-rc30
+# GoshaCrash 3.10.2-rc31
 
 Consolidated test build for ASUS RT-AC68U and ZenWiFi BT10.
 
-Key rc30 changes:
+Key rc31 changes:
+- existing configs are migrated so GoshaCrash-owned tun/dns/ui keys are made runtime-safe before `gc check`;
+- yaml_set_section_key now creates missing tun:/dns: block sections instead of silently doing nothing;
+- migration tested from both a config with no tun/dns sections and a config with tun.enable:false;
+- migrated configs parse as valid YAML and retain user proxies/rules/resolver lists.
 - removed ROUTING: AUTO/MANUAL from the interactive menu header; routing remains available in status/doctor/CLI;
 - recalculated interactive repaint rows after removing the routing row; menu remains 45 columns wide and arrow navigation remains incremental;
 - doctor now distinguishes kernel /dev/net/tun from Mihomo-created tun0;
@@ -32,7 +36,7 @@ Validation performed for this artifact:
 - edit-config harness verified that valid edits do not call restart
 - edit-config validation uses only a volatile /tmp rollback copy; no persistent backup is created
 - generated source files decode as UTF-8 and contain no UTF-8 BOM
-- install.sh --help and goshacrash.sh version report 3.10.2-rc30
+- install.sh --help and goshacrash.sh version report 3.10.2-rc31
 - no BusyBox-incompatible find -type or find -path in executable shell code
 - ZIP integrity tested with unzip -t
 - public `gc start` dispatcher verified: it reaches start() instead of the unknown-command branch
@@ -41,5 +45,5 @@ Validation performed for this artifact:
 - interrupted Zashboard swap recovery was tested with an empty recreated ui/ and a valid .ui-old.* directory
 
 Real-router status:
-- RT-AC68U: rc12 lineage is the last fully end-to-end tested legacy baseline; rc30 keeps the same legacy package/routing model.
-- ZenWiFi BT10: package path, writable /opt bind, SFTP payload, terminfo/nano, ARMv7 Mihomo, TUN, and auto routing were proven manually. rc30 menu/edit/JFFS cleanup still requires real-router verification after install/reboot/power-cycle before calling the build stable.
+- RT-AC68U: rc12 lineage is the last fully end-to-end tested legacy baseline; rc31 keeps the same legacy package/routing model.
+- ZenWiFi BT10: package path, writable /opt bind, SFTP payload, terminfo/nano, ARMv7 Mihomo, TUN, and auto routing were proven manually. rc31 menu/edit/JFFS cleanup still requires real-router verification after install/reboot/power-cycle before calling the build stable.
