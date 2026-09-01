@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc36"
+INSTALLER_VERSION="3.10.2-rc37"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -67,6 +67,7 @@ ACTIVE_CONFIG=""
 GCNET_BIN=""
 CONFIG_ROLLBACK_TMP=""
 CONFIG_MIGRATION_PENDING="0"
+RESET_CONFIG="0"
 
 now(){ date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date; }
 _emit(){ level="$1"; shift; line="[$(now)] [$level] [install] $*"; printf '%s\n' "$line"; printf '%s\n' "$line" >> "$INSTALL_LOG" 2>/dev/null || true; }
@@ -2621,6 +2622,25 @@ EOF
 install_configs(){
     test -n "$ACTIVE_CONFIG" || ACTIVE_CONFIG="$BASE/config.yaml"
 
+    if test "$RESET_CONFIG" = 1; then
+        old_config=""
+        if test -f "$ACTIVE_CONFIG"; then
+            old_config="$ACTIVE_CONFIG"
+        elif test -f "$BASE/config-legacy.yaml"; then
+            old_config="$BASE/config-legacy.yaml"
+        fi
+        if test -n "$old_config"; then
+            CONFIG_ROLLBACK_TMP="$TMP_ROOT/config-before-reset.yaml"
+            cp -f "$old_config" "$CONFIG_ROLLBACK_TMP" || return 1
+            CONFIG_MIGRATION_PENDING="1"
+        fi
+        rm -f "$ACTIVE_CONFIG" "$BASE/config-legacy.yaml" 2>/dev/null || true
+        generate_base_config "$ACTIVE_CONFIG" || { fail "Не удалось сгенерировать новый config.yaml"; return 1; }
+        chmod 600 "$ACTIVE_CONFIG" 2>/dev/null || true
+        say "config.yaml сброшен явно: создана новая UTF-8 заглушка (старый файл хранится только временно до успешной проверки)"
+        return 0
+    fi
+
     # Migration from GoshaCrash <= 3.5.x: move the old active config to the
     # unified name instead of creating a second persistent copy.
     if test ! -f "$ACTIVE_CONFIG" && test -f "$BASE/config-legacy.yaml"; then
@@ -2693,18 +2713,33 @@ authoritative_config_preflight(){
 
     if config_test_has_utf8_error_install "$acp_log"; then
         data_only="$TMP_ROOT/config-data-only-test.$$"
+        data_log="$acp_log.data"
         strip_whole_line_comments_install "$ACTIVE_CONFIG" "$data_only" || true
-        if test -s "$data_only" && mihomo_config_test_install "$data_only" "$acp_log.data"; then
-            cat "$acp_log" >&2 2>/dev/null || true
-            rm -f "$acp_log" "$acp_log.data" "$data_only" 2>/dev/null || true
-            fail "Внутренняя ошибка: YAML без комментариев валиден, но свежие русские UTF-8 комментарии Mihomo не принял"
-            fail "Установка остановлена: config.yaml без комментариев оставлять не буду"
+        if test -s "$data_only"; then
+            if mihomo_config_test_install "$data_only" "$data_log"; then
+                cat "$acp_log" >&2 2>/dev/null || true
+                rm -f "$acp_log" "$data_log" "$data_only" 2>/dev/null || true
+                fail "Внутренняя ошибка: YAML без комментариев валиден, но русские комментарии в итоговом config.yaml повреждены"
+                fail "Установка остановлена: комментарии должны оставаться нормальным UTF-8"
+                return 1
+            fi
+            if config_test_has_utf8_error_install "$data_log"; then
+                cat "$acp_log" >&2 2>/dev/null || true
+                rm -f "$acp_log" "$data_log" "$data_only" 2>/dev/null || true
+                fail "config.yaml действительно содержит невалидный UTF-8 внутри YAML-данных"
+                fail "Для полностью новой заглушки запусти installer с --reset-config"
+                return 1
+            fi
+            # Do not mislabel a second, unrelated Mihomo validation failure as
+            # bad UTF-8.  Surface the real parser/semantic error instead.
+            cat "$data_log" >&2 2>/dev/null || true
+            rm -f "$acp_log" "$data_log" "$data_only" 2>/dev/null || true
+            fail "После удаления комментариев Mihomo отклонил YAML уже по другой причине; смотри ошибку выше"
             return 1
         fi
         cat "$acp_log" >&2 2>/dev/null || true
-        rm -f "$acp_log" "$acp_log.data" "$data_only" 2>/dev/null || true
-        fail "config.yaml содержит невалидный UTF-8 внутри YAML-данных, а не в комментариях"
-        fail "Автоматически перекодировать proxy/rules/имена небезопасно; пересохрани значения как UTF-8 и повтори установку"
+        rm -f "$acp_log" "$data_log" "$data_only" 2>/dev/null || true
+        fail "Не удалось построить временный config.yaml без комментариев для UTF-8 диагностики"
         return 1
     fi
 
@@ -2722,7 +2757,7 @@ json_asset_urls(){
 }
 
 pinned_official_mihomo_url(){
-    # rc36 deliberately pins the modern core. A router install must not silently
+    # rc37 deliberately pins the modern core. A router install must not silently
     # switch CPU binary just because GitHub "latest" changed between runs.
     MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_VERSION"
     printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$OFFICIAL_MIHOMO_VERSION/mihomo-linux-$MIHOMO_TARGET-$OFFICIAL_MIHOMO_VERSION.gz"
@@ -3032,7 +3067,7 @@ install_stock_usb_mount_bridge(){
     mkdir -p "$DM_ROOT/etc/init.d" "$DM_ROOT/lib/ipkg/info" || return 1
     cat > "$DM_ROOT/etc/init.d/S50usb-mount-script" <<'HOOK'
 #!/bin/sh
-# GoshaCrash Download Master bridge 3.10.2-rc36
+# GoshaCrash Download Master bridge 3.10.2-rc37
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -3122,7 +3157,7 @@ install_hooks(){
 
     cat > /jffs/scripts/usb-mount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB hook 3.10.2-rc36
+# GoshaCrash USB hook 3.10.2-rc37
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -3189,7 +3224,7 @@ BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 UPTIME="$(cat /proc/uptime 2>/dev/null)"
 trace "controller ready after ${WAITED}s dm=${DM:-none} boot_id=${BOOT_ID:-unknown} uptime=${UPTIME:-unknown}"
 date '+%Y-%m-%d %H:%M:%S' > "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-printf '[%s] autostart hook rc36: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
+printf '[%s] autostart hook rc37: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
 
 NOHUP=""
 for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup; do
@@ -3209,7 +3244,7 @@ HOOK
 
     cat > /jffs/scripts/usb-umount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB unmount hook 3.10.2-rc36
+# GoshaCrash USB unmount hook 3.10.2-rc37
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -3245,7 +3280,7 @@ HOOK
     test -d /opt/bin && test -w /opt/bin && write_command_wrapper /opt/bin/gc 2>/dev/null || true
 
     # Old rc23-rc26 used a custom /jffs/addons/goshacrash directory only to
-    # store base/start/trace. rc36 no longer needs it; remove our own residue.
+    # store base/start/trace. rc37 no longer needs it; remove our own residue.
     rm -rf /jffs/addons/goshacrash 2>/dev/null || true
     grep -Fq 'exec /bin/busybox test "$@"' /jffs/scripts/test 2>/dev/null && rm -f /jffs/scripts/test 2>/dev/null || true
     grep -Fq "exec /bin/busybox '['" /jffs/scripts/'[' 2>/dev/null && rm -f /jffs/scripts/'[' 2>/dev/null || true
@@ -3349,10 +3384,15 @@ main(){
             echo "GoshaCrash installer $INSTALLER_VERSION"
             echo
             echo "Использование:"
-            echo "  /bin/sh install.sh                установить GoshaCrash"
-            echo "  /bin/sh install.sh --prepare-usb  безопасный мастер подготовки USB в EXT3"
-            echo "  /bin/sh install.sh --help         эта справка"
+            echo "  /bin/sh install.sh                 установить/обновить GoshaCrash"
+            echo "  /bin/sh install.sh --reset-config  установить с новой UTF-8 заглушкой config.yaml"
+            echo "  /bin/sh install.sh --prepare-usb   безопасный мастер подготовки USB в EXT3"
+            echo "  /bin/sh install.sh --help          эта справка"
             return 0
+            ;;
+        --reset-config)
+            test "$#" -eq 1 || { fail "Использование: /bin/sh install.sh --reset-config"; return 1; }
+            RESET_CONFIG="1"
             ;;
         '')
             ;;
@@ -3362,7 +3402,11 @@ main(){
             ;;
     esac
 
-    test "$#" -eq 0 || return 1
+    if test "$RESET_CONFIG" = 1; then
+        test "$#" -eq 1 || return 1
+    else
+        test "$#" -eq 0 || return 1
+    fi
     acquire_lock || return 1
 
     verify_asuswrt || return 1
