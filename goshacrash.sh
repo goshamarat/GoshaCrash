@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc28"
-BUILD_ID="2026-09-01-no-persistent-backups-rc28"
+VERSION="3.10.2-rc30"
+BUILD_ID="2026-09-01-tun-doctor-menu-cleanup-rc30"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -629,23 +629,36 @@ kill_mihomo(){
     rm -f "$PIDFILE"
 }
 
-ensure_tun(){
-    [ -c /dev/net/tun ] || {
-        modprobe_bin=""
-        for p in /sbin/modprobe /usr/sbin/modprobe /bin/modprobe /usr/bin/modprobe; do
-            [ -x "$p" ] && { modprobe_bin="$p"; break; }
-        done
-        [ -n "$modprobe_bin" ] && "$modprobe_bin" tun >/dev/null 2>&1 || true
+tun_kernel_ready(){
+    [ -c /dev/net/tun ] || return 1
+    dd_bin=""
+    for p in /bin/dd /usr/bin/dd /sbin/dd /usr/sbin/dd; do
+        [ -x "$p" ] && { dd_bin="$p"; break; }
+    done
+    [ -n "$dd_bin" ] || return 1
+    "$dd_bin" if=/dev/net/tun of=/dev/null bs=1 count=0 >/dev/null 2>&1
+}
 
+ensure_tun(){
+    tun_kernel_ready && return 0
+
+    modprobe_bin=""
+    for p in /sbin/modprobe /usr/sbin/modprobe /bin/modprobe /usr/bin/modprobe; do
+        [ -x "$p" ] && { modprobe_bin="$p"; break; }
+    done
+    [ -n "$modprobe_bin" ] && "$modprobe_bin" tun >/dev/null 2>&1 || true
+
+    if ! tun_kernel_ready; then
         insmod_bin=""
         for p in /sbin/insmod /usr/sbin/insmod /bin/insmod /usr/bin/insmod; do
             [ -x "$p" ] && { insmod_bin="$p"; break; }
         done
         for m in "$BASE/modules/tun.ko" "/lib/modules/$(uname -r)/kernel/drivers/net/tun.ko" "/lib/modules/$(uname -r)/tun.ko"; do
-            [ -c /dev/net/tun ] && break
+            tun_kernel_ready && break
             [ -n "$insmod_bin" ] && [ -f "$m" ] && "$insmod_bin" "$m" >/dev/null 2>&1 || true
         done
-    }
+    fi
+
     if [ ! -c /dev/net/tun ]; then
         mkdir -p /dev/net 2>/dev/null || true
         mknod_bin=""
@@ -655,8 +668,8 @@ ensure_tun(){
         [ -n "$mknod_bin" ] && "$mknod_bin" /dev/net/tun c 10 200 2>/dev/null || true
         chmod 600 /dev/net/tun 2>/dev/null || true
     fi
-    [ -c /dev/net/tun ] || return 1
-    dd if=/dev/net/tun of=/dev/null bs=1 count=0 >/dev/null 2>&1
+
+    tun_kernel_ready
 }
 
 
@@ -684,13 +697,13 @@ validate_binary_arch(){
     [ "$magic" = 7f454c46 ] || { fail "Mihomo повреждён: файл не является ELF (header=${hex:-empty})"; return 1; }
     case "$MIHOMO_TARGET" in
       armv5|armv7)
-        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку rc28"; return 1; }
+        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку rc30"; return 1; }
         ;;
       arm64|aarch64)
-        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку rc28"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку rc30"; return 1; }
         ;;
       amd64|amd64-compatible|x86_64)
-        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку rc28"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку rc30"; return 1; }
         ;;
     esac
     return 0
@@ -1414,6 +1427,7 @@ start(){
     ensure_dirs || return 1
     load_platform || return 1
     refresh_path
+    check_config || return 1
 
     rm -f "$MANUAL_STOP"
     control_lock_set || { fail "Другая операция GoshaCrash ещё выполняется"; return 1; }
@@ -2064,7 +2078,7 @@ menu_item_label(){
 menu_repaint_item(){
     current="$1"
     number="$2"
-    row=$((7 + number))
+    row=$((6 + number))
     label="$(menu_item_label "$number")"
     # Rewrite only one menu row.  This avoids clearing/redrawing the whole
     # terminal on every Up/Down key press (visible flicker over SSH).
@@ -2079,7 +2093,7 @@ menu_repaint_selection(){
     menu_repaint_item "$new_selected" "$old_selected"
     menu_repaint_item "$new_selected" "$new_selected"
     # Keep the hidden cursor below the menu so terminals do not visibly jump.
-    printf '\033[17;1H'
+    printf '\033[16;1H'
 }
 
 menu_draw(){
@@ -2095,13 +2109,11 @@ menu_draw(){
     printf '\033[0m'
     core_state="$(menu_state_core)"
     tun_state="$(menu_state_tun)"
-    routing_state="$(printf '%s' "${ROUTING_MODE:-unknown}" | tr '[:lower:]' '[:upper:]')"
     printf '│  MIHOMO: '
     menu_print_state "$core_state" 10
     printf '  TUN: '
     menu_print_state "$tun_state" 6
     printf '          │\n'
-    printf '│  ROUTING: %-8s                        │\n' "$routing_state"
     printf '\033[1;36m'
     printf '├───────────────────────────────────────────┤\n'
     printf '\033[0m'
@@ -2267,7 +2279,7 @@ autostart_status(){
     [ -n "$bridge_version" ] && echo "  bridge version: $bridge_version" || echo "  bridge version: old/unknown"
     [ -f "$STATE/autostart-hook-ran" ] && echo "  last hook: $(cat "$STATE/autostart-hook-ran" 2>/dev/null)" || echo "  last hook: never"
     [ -f "$LOGS/coldboot.log" ] && echo "  coldboot trace: $LOGS/coldboot.log" || echo "  coldboot trace: not written yet"
-    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall rc28)" || echo "  legacy JFFS dir: clean"
+    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall rc30)" || echo "  legacy JFFS dir: clean"
     [ -f "$MANUAL_STOP" ] && echo "  manual-stop: YES" || echo "  manual-stop: no"
     return 0
 }
@@ -2347,15 +2359,30 @@ doctor(){
     fi
 
     [ -x /bin/ping ] && echo "  firmware ping: /bin/ping" || echo "  firmware ping: NOT FOUND"
-    wan_nvram_up && echo "  ASUS WAN: UP" || echo "  ASUS WAN: DOWN"
-    internet_probe_once && echo "  external probe: OK" || echo "  external probe: FAIL"
+    internet_probe_once && echo "  Internet probe: OK" || echo "  Internet probe: FAIL"
+    if wan_nvram_up; then
+        echo "  ASUS WAN NVRAM: UP (informational)"
+    else
+        echo "  ASUS WAN NVRAM: DOWN (informational)"
+    fi
 
-    running_pid >/dev/null 2>&1 && echo "  Mihomo: OK" || echo "  Mihomo: FAIL"
+    [ -f "$MANUAL_STOP" ] && echo "  manual stop: YES" || echo "  manual stop: no"
+    tun_kernel_ready && echo "  kernel TUN (/dev/net/tun): OK" || echo "  kernel TUN (/dev/net/tun): FAIL"
+    if running_pid >/dev/null 2>&1; then
+        echo "  Mihomo process: OK"
+    else
+        echo "  Mihomo process: DOWN"
+    fi
     netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" \
-        && echo "  DNS: OK" || echo "  DNS: FAIL"
-    net_link_exists "$TUN_DEVICE" && echo "  TUN: OK" || echo "  TUN: FAIL"
-    route_status >/dev/null 2>&1 && echo "  routing: OK" || echo "  routing: FAIL"
-    watchdog_pid >/dev/null 2>&1 && echo "  watchdog: OK" || echo "  watchdog: FAIL"
+        && echo "  Mihomo DNS: OK" || echo "  Mihomo DNS: DOWN"
+    if net_link_exists "$TUN_DEVICE"; then
+        echo "  Mihomo TUN $TUN_DEVICE: UP"
+        route_status >/dev/null 2>&1 && echo "  routing runtime: OK" || echo "  routing runtime: FAIL"
+    else
+        echo "  Mihomo TUN $TUN_DEVICE: DOWN"
+        echo "  routing runtime: N/A (TUN down)"
+    fi
+    watchdog_pid >/dev/null 2>&1 && echo "  watchdog: OK" || echo "  watchdog: DOWN"
 
     find_dm_root >/dev/null 2>&1 && echo "  Download Master: $DM_ROOT" || echo "  Download Master: FAIL"
     ensure_optware_link >/dev/null 2>&1 && echo "  /tmp/opt: OK" || echo "  /tmp/opt: FAIL"
@@ -2385,7 +2412,7 @@ doctor(){
 }
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.10.2-rc28 — что буквально вводить в SSH
+GoshaCrash 3.10.2-rc30 — что буквально вводить в SSH
 
 КАТАЛОГ УСТАНОВКИ
   BASE="$(gc base)"
@@ -2437,6 +2464,9 @@ GoshaCrash 3.10.2-rc28 — что буквально вводить в SSH
   BASE="$(gc base)"
   "$BASE/bin/mihomo" -t -d "$BASE" -f "$BASE/config.yaml"
 
+ЗАПУСТИТЬ VPN
+  gc start
+
 ПЕРЕЗАПУСТИТЬ VPN
   gc restart
 
@@ -2444,7 +2474,7 @@ GoshaCrash 3.10.2-rc28 — что буквально вводить в SSH
   gc stop
 
 ВКЛЮЧИТЬ ПОСЛЕ gc stop
-  gc restart
+  gc start
 
 ЛОГ MIHOMO
   gc logs
@@ -2622,20 +2652,27 @@ CONTROLLER И SECRET
 
 USAGE
 }
+GC_COMMAND="${1:-menu}"
+# Read-only metadata/help commands must not create runtime directories or touch logs.
+case "$GC_COMMAND" in
+    version) echo "$VERSION"; exit 0;;
+    help|-h|--help) usage; exit 0;;
+    base) printf '%s\n' "$BASE"; exit 0;;
+esac
+
 refresh_path >/dev/null 2>&1 || true
 ensure_dirs >/dev/null 2>&1 || true
 load_platform >/dev/null 2>&1 || true
 refresh_path >/dev/null 2>&1 || true
-case "${1:-menu}" in
+case "$GC_COMMAND" in
     menu) menu;;
-    help|-h|--help) usage;;
+    start) start;;
     stop) stop;;
     service-stop) service_stop;;
     restart) restart;;
     status) status;;
     edit) edit_config;;
     dashboard) dashboard_url;;
-    base) printf '%s\n' "$BASE";;
     autostart)
         shift
         case "${1:-status}" in
@@ -2690,6 +2727,5 @@ case "${1:-menu}" in
     firewall-reload) firewall_reload;;
     watchdog-loop) watchdog_loop;;
     watchdog-check) watchdog_check;;
-    version) echo "$VERSION";;
     *) echo "Неизвестная команда: $1" >&2; echo >&2; usage; exit 1;;
 esac

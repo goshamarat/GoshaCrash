@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc28"
+INSTALLER_VERSION="3.10.2-rc30"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -365,7 +365,7 @@ prepare_usb_wizard(){
         fail "ASUSWRT всё ещё держит раздел флешки смонтированным. Ничего destructive не выполнено."
         echo "В веб-интерфейсе ASUS нажми «Отсоединить» для USB-диска, не вынимай его физически,"
         echo "и снова запусти:"
-        echo "  /bin/sh /tmp/install.sh --prepare-usb"
+        echo "  повторно запусти этот installer с аргументом --prepare-usb"
         return 1
     fi
 
@@ -432,7 +432,7 @@ prepare_usb_wizard(){
             echo
             warn "MBR записан, но старое ядро ASUSWRT ещё не создало $target_part."
             echo "Сделай reboot, снова скачай install.sh и повтори --prepare-usb."
-            echo "rc14 распознает готовую MBR и fdisk повторно запускать не будет."
+            echo "Установщик распознает готовую MBR и fdisk повторно запускать не будет."
             return 2
         fi
 
@@ -449,9 +449,9 @@ prepare_usb_wizard(){
             echo "  reboot"
             echo
             echo "После загрузки снова:"
-            echo "  /bin/sh /tmp/install.sh --prepare-usb"
+            echo "  повторно запусти этот installer с аргументом --prepare-usb"
             echo
-            echo "rc14 увидит совпавшую геометрию и ПРОПУСТИТ fdisk."
+            echo "Установщик увидит совпавшую геометрию и ПРОПУСТИТ fdisk."
             return 2
         fi
     fi
@@ -494,7 +494,7 @@ prepare_usb_wizard(){
     echo
     echo "Затем установи Download Master через веб-интерфейс ASUS"
     echo "и запусти обычную установку GoshaCrash:"
-    echo "  /bin/sh /tmp/install.sh"
+    echo "  повторно запусти обычную установку тем же способом"
     echo
     return 0
 }
@@ -635,7 +635,7 @@ legacy_preflight_before_dm(){
             echo
             echo "Подготовить эту флешку можно самим install.sh:"
             echo
-            echo "  /bin/sh /tmp/install.sh --prepare-usb"
+            echo "  повторно запусти этот installer с аргументом --prepare-usb"
             echo
             echo "ВНИМАНИЕ: форматирование удалит ВСЕ данные и Download Master."
             echo "После EXT3 установи Download Master через ASUS заново,"
@@ -1791,7 +1791,7 @@ detect_platform(){
     esac
 
     LEGACY="0"
-    MIHOMO_SOURCE="official-latest"
+    MIHOMO_SOURCE="official-pinned"
     ACTIVE_CONFIG="$BASE/config.yaml"
 
     case "${MIHOMO_ARCH:-$machine}" in
@@ -2197,8 +2197,8 @@ json_asset_urls(){
         tr -d '\r'
 }
 
-latest_official_mihomo_url(){
-    # rc28 deliberately pins the modern core. A router install must not silently
+pinned_official_mihomo_url(){
+    # rc30 deliberately pins the modern core. A router install must not silently
     # switch CPU binary just because GitHub "latest" changed between runs.
     MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_VERSION"
     printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$OFFICIAL_MIHOMO_VERSION/mihomo-linux-$MIHOMO_TARGET-$OFFICIAL_MIHOMO_VERSION.gz"
@@ -2280,7 +2280,6 @@ validate_downloaded_mihomo(){
     if test "$MIHOMO_TARGET" = armv5; then
         printf '%s\n' "$out" | grep -Fq 'Use tags: with_gvisor' || { printf '%s\n' "$out" >&2; fail "Legacy-профилю нужна сборка Mihomo with_gvisor"; return 1; }
     fi
-    printf '%s\n' "$out" > "$BASE/state/mihomo-version.txt"
 }
 
 install_mihomo(){
@@ -2316,7 +2315,7 @@ install_mihomo(){
         done < "$TMP_ROOT/legacy-urls.txt"
         test "$success" -eq 1 || { fail "Не удалось скачать совместимый ARMv5+gVisor Mihomo из Releases проекта"; return 1; }
     else
-        MIHOMO_URL_SELECTED="$(latest_official_mihomo_url)" || return 1
+        MIHOMO_URL_SELECTED="$(pinned_official_mihomo_url)" || return 1
         MIHOMO_VERSION_SELECTED="$(printf '%s\n' "$MIHOMO_URL_SELECTED" | sed -n 's#.*/download/\([^/]*\)/.*#\1#p')"
         test -n "$MIHOMO_VERSION_SELECTED" || MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_FALLBACK"
         say "Скачиваю официальный Mihomo $MIHOMO_VERSION_SELECTED для $MIHOMO_TARGET"
@@ -2326,13 +2325,17 @@ install_mihomo(){
 
     if test -x "$BASE/bin/mihomo"; then
         existing_out="$("$BASE/bin/mihomo" -v 2>&1)"
-        if ! printf '%s
-' "$existing_out" | grep -qi 'mihomo'; then
+        if ! printf '%s\n' "$existing_out" | grep -qi 'mihomo'; then
             warn "Старый Mihomo повреждён/несовместим; новый бинарник уже проверен и заменит его"
         fi
     fi
     mv -f "$newbin" "$BASE/bin/mihomo" || return 1
     chmod 755 "$BASE/bin/mihomo" || return 1
+    installed_out="$("$BASE/bin/mihomo" -v 2>&1)" || {
+        fail "Установленный Mihomo не запускается после активации"
+        return 1
+    }
+    printf '%s\n' "$installed_out" > "$BASE/state/mihomo-version.txt" || return 1
 }
 
 find_ui_root(){
@@ -2363,9 +2366,28 @@ unpack_ui(){
 install_zashboard(){
     archive="$TMP_ROOT/zashboard.zip"
     unpack="$TMP_ROOT/zashboard-unpack"
-    ui_new="$BASE/ui.new"
+    ui_new="$BASE/.ui-new.$$"
+    ui_old="$BASE/.ui-old.$$"
     selected=""
     last_url=""
+
+    # rc27/rc28 could leave project-owned staging/previous UI directories.
+    # Recover an interrupted atomic swap first, then remove obsolete residue.
+    if test ! -s "$BASE/ui/index.html"; then
+        for old in "$BASE"/.ui-old.*; do
+            test -s "$old/index.html" || continue
+            rm -rf "$BASE/ui"
+            mv "$old" "$BASE/ui" 2>/dev/null && break
+        done
+    fi
+    for old in "$BASE"/.ui-old.*; do
+        test -d "$old" && rm -rf "$old"
+    done
+    for staged in "$BASE"/.ui-new.*; do
+        test -d "$staged" && rm -rf "$staged"
+    done
+    rm -rf "$BASE/ui.previous" "$BASE/ui.new" "$ui_new" "$ui_old"
+
     for url in \
         "$ZASHBOARD_PRIMARY" \
         "https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip" \
@@ -2384,13 +2406,20 @@ install_zashboard(){
     done
     test -n "$selected" || { fail "Не удалось скачать и распаковать Zashboard"; return 1; }
 
-    rm -rf "$BASE/ui.previous"
-    test -d "$BASE/ui" && mv "$BASE/ui" "$BASE/ui.previous" 2>/dev/null || true
-    mv "$ui_new" "$BASE/ui" || {
-        test -d "$BASE/ui.previous" && mv "$BASE/ui.previous" "$BASE/ui" 2>/dev/null || true
+    if test -d "$BASE/ui"; then
+        mv "$BASE/ui" "$ui_old" || {
+            rm -rf "$ui_new"
+            fail "Не удалось подготовить замену Zashboard"
+            return 1
+        }
+    fi
+    if ! mv "$ui_new" "$BASE/ui"; then
+        test -d "$ui_old" && mv "$ui_old" "$BASE/ui" 2>/dev/null || true
+        rm -rf "$ui_new"
         fail "Не удалось активировать Zashboard"
         return 1
-    }
+    fi
+    rm -rf "$ui_old" "$unpack" "$archive"
     printf '%s\n' "$selected" > "$BASE/state/zashboard-source.txt"
 }
 
@@ -2479,7 +2508,7 @@ install_stock_usb_mount_bridge(){
     mkdir -p "$DM_ROOT/etc/init.d" "$DM_ROOT/lib/ipkg/info" || return 1
     cat > "$DM_ROOT/etc/init.d/S50usb-mount-script" <<'HOOK'
 #!/bin/sh
-# GoshaCrash Download Master bridge 3.10.2-rc28
+# GoshaCrash Download Master bridge 3.10.2-rc30
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2569,7 +2598,7 @@ install_hooks(){
 
     cat > /jffs/scripts/usb-mount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB hook 3.10.2-rc28
+# GoshaCrash USB hook 3.10.2-rc30
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2636,7 +2665,7 @@ BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 UPTIME="$(cat /proc/uptime 2>/dev/null)"
 trace "controller ready after ${WAITED}s dm=${DM:-none} boot_id=${BOOT_ID:-unknown} uptime=${UPTIME:-unknown}"
 date '+%Y-%m-%d %H:%M:%S' > "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-printf '[%s] autostart hook rc28: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
+printf '[%s] autostart hook rc30: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
 
 NOHUP=""
 for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup; do
@@ -2656,7 +2685,7 @@ HOOK
 
     cat > /jffs/scripts/usb-umount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB unmount hook 3.10.2-rc28
+# GoshaCrash USB unmount hook 3.10.2-rc30
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2692,7 +2721,7 @@ HOOK
     test -d /opt/bin && test -w /opt/bin && write_command_wrapper /opt/bin/gc 2>/dev/null || true
 
     # Old rc23-rc26 used a custom /jffs/addons/goshacrash directory only to
-    # store base/start/trace. rc28 no longer needs it; remove our own residue.
+    # store base/start/trace. rc30 no longer needs it; remove our own residue.
     rm -rf /jffs/addons/goshacrash 2>/dev/null || true
     grep -Fq 'exec /bin/busybox test "$@"' /jffs/scripts/test 2>/dev/null && rm -f /jffs/scripts/test 2>/dev/null || true
     grep -Fq "exec /bin/busybox '['" /jffs/scripts/'[' 2>/dev/null && rm -f /jffs/scripts/'[' 2>/dev/null || true
@@ -2702,7 +2731,8 @@ HOOK
 
     remove_pre3712_autostart
     install_stock_usb_mount_bridge || return 1
-    rm -f "$BASE/logs/goshacrash.log" "$BASE/logs/watchdog.log" "$BASE/logs/boot.log" "$BASE/logs/coldboot.log" 2>/dev/null || true
+    # Do not erase runtime/boot logs during an upgrade.  They are the only
+    # evidence of cold-boot failures on the router and runtime rotates them.
     ok "Автозапуск установлен для stock ASUSWRT; служебные данные остаются внутри $BASE"
 }
 
@@ -2818,12 +2848,12 @@ main(){
             echo
             echo "EXT3 уже подходит, но Download Master не найден."
             echo "Установи Download Master через веб-интерфейс ASUS на эту флешку,"
-            echo "затем снова запусти: /bin/sh /tmp/install.sh"
+            echo "затем снова запусти обычную установку тем же способом"
         fi
         return 1
     }
     BASE="${INSTALL_DIR:-$USB_MOUNT/goshacrash}"
-    mkdir -p "$TMP_ROOT" "$BASE/bin" "$BASE/ui" "$BASE/logs" "$BASE/run" "$BASE/state" || return 1
+    mkdir -p "$TMP_ROOT" "$BASE/bin" "$BASE/logs" "$BASE/run" "$BASE/state" || return 1
     # Keep the persistent tree minimal. Remove only empty legacy directories;
     # never delete existing user files automatically.
     rmdir "$BASE/rulesets" "$BASE/proxies" "$BASE/backups" 2>/dev/null || true

@@ -1,12 +1,22 @@
-# GoshaCrash 3.10.2-rc28
+# GoshaCrash 3.10.2-rc30
 
 Consolidated test build for ASUS RT-AC68U and ZenWiFi BT10.
 
-Key rc28 changes:
+Key rc30 changes:
+- removed ROUTING: AUTO/MANUAL from the interactive menu header; routing remains available in status/doctor/CLI;
+- recalculated interactive repaint rows after removing the routing row; menu remains 45 columns wide and arrow navigation remains incremental;
+- doctor now distinguishes kernel /dev/net/tun from Mihomo-created tun0;
+- routing is reported as N/A when tun0 is down instead of as a misleading independent FAIL;
+- external Internet probe is the primary WAN health line; ASUS WAN NVRAM is explicitly informational;
+- doctor reports persistent manual-stop state;
+- kernel TUN readiness has a shared non-destructive probe used by runtime diagnostics.
+- installer no longer erases boot/watchdog/coldboot/controller logs during upgrade.
+
+Previous consolidated fixes retained:
 - menu header uses MIHOMO: and TUN: labels; PROFILE MODERN is removed;
 - all menu rows are fixed to 45 visible columns; incremental arrow repaint is retained;
 - Edit config and Restart are fully separated: edit validates with Mihomo -t and never restarts;
-- invalid edits are backed up separately and the previous valid config is restored;
+- invalid edits are not kept: the previous valid config is restored from a volatile /tmp copy;
 - generated config.yaml is UTF-8 without BOM with Russian comments;
 - nano is launched with a scoped UTF-8 locale and the scoped Optware runtime library path;
 - persistent /jffs/addons/goshacrash is removed; runtime data/logs stay under the USB GoshaCrash directory;
@@ -22,10 +32,14 @@ Validation performed for this artifact:
 - edit-config harness verified that valid edits do not call restart
 - edit-config validation uses only a volatile /tmp rollback copy; no persistent backup is created
 - generated source files decode as UTF-8 and contain no UTF-8 BOM
-- install.sh --help and goshacrash.sh version report 3.10.2-rc28
+- install.sh --help and goshacrash.sh version report 3.10.2-rc30
 - no BusyBox-incompatible find -type or find -path in executable shell code
 - ZIP integrity tested with unzip -t
+- public `gc start` dispatcher verified: it reaches start() instead of the unknown-command branch
+- generated config.yaml parsed as valid YAML in both auto and manual routing modes
+- Zashboard swap harness passed under bash, dash and BusyBox ash; no ui.previous/ui.new/.ui-old/.ui-new remains after success
+- interrupted Zashboard swap recovery was tested with an empty recreated ui/ and a valid .ui-old.* directory
 
 Real-router status:
-- RT-AC68U: rc12 lineage is the last fully end-to-end tested legacy baseline; rc28 keeps the same legacy package/routing model.
-- ZenWiFi BT10: package path, writable /opt bind, SFTP payload, terminfo/nano, ARMv7 Mihomo, TUN, and auto routing were proven manually. rc28 menu/edit/JFFS cleanup still requires real-router verification after install/reboot/power-cycle before calling the build stable.
+- RT-AC68U: rc12 lineage is the last fully end-to-end tested legacy baseline; rc30 keeps the same legacy package/routing model.
+- ZenWiFi BT10: package path, writable /opt bind, SFTP payload, terminfo/nano, ARMv7 Mihomo, TUN, and auto routing were proven manually. rc30 menu/edit/JFFS cleanup still requires real-router verification after install/reboot/power-cycle before calling the build stable.
