@@ -1,4 +1,4 @@
-# rc39 — детерминированный UTF-8 config
+# rc40-test2 — детерминированный UTF-8 config
 
 - Стартовый `config.yaml` теперь формируется без зависимости от locale/codepage: YAML-тело ASCII, русские комментарии выводятся точными UTF-8 байтами через POSIX `printf %b`.
 - Если повреждена именно заводская `MATCH,DIRECT`-заглушка без пользовательских proxy/groups/providers/rules, installer автоматически пересоздаёт её. Специальный reset для обычного случая не нужен.
@@ -6,13 +6,23 @@
 - После успешного `Edit config` конфиг помечается пользовательским.
 - Выход из TUI — `Esc`.
 
-# GoshaCrash 3.10.2-rc39
+# GoshaCrash 3.10.2-rc40-test2
 
-**rc39:** выход из интерактивного меню перенесён с `Q` на одиночный `Esc` (стрелки `Esc [ A/B` продолжают работать); добавлен короткий таймаут только для распознавания standalone Esc. Также добавлен явный `--reset-config`, который создаёт новую UTF-8 DIRECT-заглушку без постоянного бэкапа, и исправлена UTF-8 диагностика: ошибка после удаления комментариев больше не объявляется «битой кодировкой» без повторной проверки лога Mihomo.
+**rc40-test2:** выход из интерактивного меню перенесён с `Q` на одиночный `Esc` (стрелки `Esc [ A/B` продолжают работать); добавлен короткий таймаут только для распознавания standalone Esc. Также добавлен явный `--reset-config`, который создаёт новую UTF-8 DIRECT-заглушку без постоянного бэкапа, и исправлена UTF-8 диагностика: ошибка после удаления комментариев больше не объявляется «битой кодировкой» без повторной проверки лога Mihomo.
 
 # GoshaCrash
 
-## 3.10.2-rc39 — Esc в меню и явный сброс config.yaml
+
+## USB filesystem profile (rc40-test2)
+
+`install.sh --prepare-usb` determines the router **before destructive operations** and uses:
+
+- RT-AC68U / legacy ASUSWRT profile → **EXT3**
+- ZenWiFi BT10 → **EXT4**
+
+Unknown hardware is refused rather than formatted with a guessed filesystem. On BT10, if `mkfs.ext4` is unavailable, the installer may use `mke2fs -t ext4`; it does **not** silently fall back to EXT3. The normal non-destructive installer still accepts a healthy Linux ext filesystem on modern BT10, so existing installations are not forced to reformat just to update.
+
+## 3.10.2-rc40-test2 — Esc в меню и явный сброс config.yaml
 
 - `Esc` выходит из главного TUI; `Q` больше не используется.
 - Стрелки не сломаны: после первого ESC контроллер ждёт продолжение escape-sequence только 0.2 секунды.

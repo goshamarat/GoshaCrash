@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc39"
-BUILD_ID="2026-09-01-check-config-file-scope-fix-rc39"
+VERSION="3.10.2-rc40-test2"
+BUILD_ID="2026-09-02-bt10-fs-opt-unmount-ui-nano-rc40-test2"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -287,16 +287,35 @@ opt_namespace_write_through_runtime(){
     return 1
 }
 
+usb_storage_sanity_runtime(){
+    for probe_dir in "$DM_ROOT" "$DM_ROOT/scripts" "$BASE/ui"; do
+        [ -d "$probe_dir" ] || continue
+        if ! ls -la "$probe_dir" >/dev/null 2>> "$PACKAGES_LOG"; then
+            log_event ERROR opt "USB filesystem metadata unreadable at $probe_dir; offline fsck required"
+            return 1
+        fi
+    done
+    return 0
+}
+
 preserve_stock_opt_payload_runtime(){
     for entry in /opt/*; do
         [ -e "$entry" ] || continue
         [ -L "$entry" ] && continue
         name="${entry##*/}"
+        target="$DM_ROOT/$name"
+        if [ -d "$target" ]; then
+            ls -la "$target" >/dev/null 2>> "$PACKAGES_LOG" || {
+                log_event ERROR opt "USB/Optware target unreadable: $target; offline fsck required"
+                return 1
+            }
+        fi
+        printf '[%s] OPT PRESERVE(runtime): %s -> %s\n' "$(now)" "$entry" "$target" >> "$PACKAGES_LOG" 2>/dev/null || true
         if [ -d "$entry" ]; then
-            mkdir -p "$DM_ROOT/$name" || return 1
-            cp -R "$entry/." "$DM_ROOT/$name/" 2>/dev/null || return 1
+            mkdir -p "$target" >> "$PACKAGES_LOG" 2>&1 || return 1
+            cp -R "$entry/." "$target/" >> "$PACKAGES_LOG" 2>&1 || return 1
         elif [ -f "$entry" ]; then
-            cp -f "$entry" "$DM_ROOT/$name" 2>/dev/null || return 1
+            cp -f "$entry" "$target" >> "$PACKAGES_LOG" 2>&1 || return 1
         fi
     done
     return 0
@@ -313,6 +332,7 @@ prepare_optware_topdirs_runtime(){
 
 prepare_optware_namespace_runtime(){
     ensure_optware_link || return 1
+    usb_storage_sanity_runtime || return 1
 
     if opt_namespace_write_through_runtime; then
         prepare_optware_topdirs_runtime || return 1
@@ -707,13 +727,13 @@ validate_binary_arch(){
     [ "$magic" = 7f454c46 ] || { fail "Mihomo повреждён: файл не является ELF (header=${hex:-empty})"; return 1; }
     case "$MIHOMO_TARGET" in
       armv5|armv7)
-        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку rc39"; return 1; }
+        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку rc40-test2"; return 1; }
         ;;
       arm64|aarch64)
-        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку rc39"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку rc40-test2"; return 1; }
         ;;
       amd64|amd64-compatible|x86_64)
-        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку rc39"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку rc40-test2"; return 1; }
         ;;
     esac
     return 0
@@ -1692,11 +1712,14 @@ firewall_reload(){
 }
 
 find_editor(){
-    repair_opt >/dev/null 2>&1 || true
+    # Nano can run directly from persistent USB with the Optware ABI overlay.
+    # Do not require or mutate the global /opt bind merely to edit config.yaml.
+    find_dm_root >/dev/null 2>&1 || true
+    ensure_optware_link >/dev/null 2>&1 || true
     repair_optware_abi_runtime >/dev/null 2>&1 || true
     refresh_path
 
-    for e in "$DM_ROOT/bin/nano" /opt/bin/nano /tmp/opt/bin/nano; do
+    for e in "$DM_ROOT/bin/nano" /tmp/opt/bin/nano /opt/bin/nano; do
         test -x "$e" || continue
         run_optware_runtime "$e" --version >/dev/null 2>&1 || continue
         printf '%s\n' "$e"
@@ -1726,7 +1749,7 @@ run_editor_utf8(){
     shift
     ldpath="$(optware_env_runtime)" || return 1
     editor_locale="$(editor_utf8_locale)"
-    editor_term="${TERM:-xterm-256color}"
+    editor_term="${GOSHACRASH_EDITOR_TERM:-${TERM:-xterm-256color}}"
     (
         # LC_ALL would override LC_CTYPE and is commonly inherited as C from
         # router hooks. Drop it only for nano; never change the router globally.
@@ -1735,7 +1758,8 @@ run_editor_utf8(){
         LC_CTYPE="$editor_locale"
         TERM="$editor_term"
         LD_LIBRARY_PATH="$ldpath"
-        export LANG LC_CTYPE TERM LD_LIBRARY_PATH
+        NCURSES_NO_UTF8_ACS=1
+        export LANG LC_CTYPE TERM LD_LIBRARY_PATH NCURSES_NO_UTF8_ACS
         exec "$editor" "$@"
     )
 }
@@ -1967,6 +1991,39 @@ controller_port(){
     printf '%s\n' "$p"
 }
 
+tcp_listener_exists(){
+    port="$1"
+    netstat -ln 2>/dev/null | grep -Eq "[:.]$port[[:space:]]" && return 0
+    hex="$(printf '%04X' "$port" 2>/dev/null)"
+    [ -n "$hex" ] || return 1
+    for table in /proc/net/tcp /proc/net/tcp6; do
+        [ -r "$table" ] || continue
+        awk -v p=":$hex" '$2 ~ p"$" && $4=="0A" {found=1} END {exit !found}' "$table" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+runtime_usb_device(){
+    mp="$(dirname "$BASE")"
+    awk -v m="$mp" '$2==m {print $1; exit}' /proc/mounts 2>/dev/null
+}
+
+usb_kernel_fs_errors(){
+    dev="$(runtime_usb_device 2>/dev/null)"
+    [ -n "$dev" ] || return 1
+    short="${dev##*/}"
+    dmesg 2>/dev/null | grep -Eq "EXT[234]-fs error \(device $short\)|I/O error.*$short|Buffer I/O error.*$short"
+}
+
+usb_metadata_probe_runtime(){
+    [ -n "$DM_ROOT" ] && [ -d "$DM_ROOT" ] || return 1
+    for probe_dir in "$DM_ROOT" "$DM_ROOT/scripts" "$BASE/ui"; do
+        [ -d "$probe_dir" ] || continue
+        ls -la "$probe_dir" >/dev/null 2>&1 || return 1
+    done
+    return 0
+}
+
 dashboard_plain_url(){
     ip="$(lan_ip)"
     port="$(controller_port)"
@@ -2037,7 +2094,17 @@ status(){
     echo "Конфиг: $CONFIG"
     net_link_exists "$TUN_DEVICE" && echo "TUN: $TUN_DEVICE работает" || echo "TUN: $TUN_DEVICE не найден"
     if runtime_health_ok; then echo "Runtime: OK (process + DNS + TUN + routing)"; elif [ -f "$WAN_OFFLINE" ]; then echo "Runtime: остановлен из-за отсутствия интернета"; else echo "Runtime: требует восстановления"; fi
-    echo "Zashboard: $(dashboard_base_url)"
+    dash_url="$(dashboard_base_url)"
+    dash_port="$(controller_port)"
+    if ! running_pid >/dev/null 2>&1; then
+        echo "Zashboard: недоступен (Mihomo не запущен); URL: $dash_url"
+    elif [ ! -s "$BASE/ui/index.html" ]; then
+        echo "Zashboard: UI-файлы отсутствуют; URL: $dash_url"
+    elif tcp_listener_exists "$dash_port"; then
+        echo "Zashboard: OK; URL: $dash_url"
+    else
+        echo "Zashboard: controller $dash_port не слушает; URL: $dash_url"
+    fi
 }
 
 menu_find_stty(){
@@ -2398,7 +2465,7 @@ autostart_status(){
     [ -n "$bridge_version" ] && echo "  bridge version: $bridge_version" || echo "  bridge version: old/unknown"
     [ -f "$STATE/autostart-hook-ran" ] && echo "  last hook: $(cat "$STATE/autostart-hook-ran" 2>/dev/null)" || echo "  last hook: never"
     [ -f "$LOGS/coldboot.log" ] && echo "  coldboot trace: $LOGS/coldboot.log" || echo "  coldboot trace: not written yet"
-    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall rc39)" || echo "  legacy JFFS dir: clean"
+    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall rc40-test2)" || echo "  legacy JFFS dir: clean"
     [ -f "$MANUAL_STOP" ] && echo "  manual-stop: YES" || echo "  manual-stop: no"
     return 0
 }
@@ -2533,6 +2600,31 @@ doctor(){
     [ -n "$DM_ROOT" ] && [ -x "$DM_ROOT/etc/init.d/S50usb-mount-script" ] \
         && echo "  ASUS app bridge: OK" || echo "  ASUS app bridge: FAIL"
 
+    if usb_metadata_probe_runtime; then
+        echo "  USB metadata probe: OK"
+    else
+        echo "  USB metadata probe: FAIL (offline fsck recommended)"
+    fi
+    if usb_kernel_fs_errors; then
+        echo "  kernel filesystem log: ERRORS DETECTED"
+    else
+        echo "  kernel filesystem log: no current USB ext errors found"
+    fi
+
+    if [ -s "$BASE/ui/index.html" ]; then
+        echo "  Zashboard files: OK"
+    else
+        echo "  Zashboard files: MISSING/BROKEN"
+    fi
+    dport="$(controller_port)"
+    if running_pid >/dev/null 2>&1 && tcp_listener_exists "$dport"; then
+        echo "  Zashboard controller $dport: LISTEN"
+    elif running_pid >/dev/null 2>&1; then
+        echo "  Zashboard controller $dport: NOT LISTENING"
+    else
+        echo "  Zashboard controller $dport: N/A (Mihomo down)"
+    fi
+
     state="$(cat "$WAN_STATE" 2>/dev/null)"
     [ -n "$state" ] || state="unknown"
     echo "  Internet state: $state"
@@ -2540,7 +2632,7 @@ doctor(){
 }
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.10.2-rc39 — что буквально вводить в SSH
+GoshaCrash 3.10.2-rc40-test2 — что буквально вводить в SSH
 
 КАТАЛОГ УСТАНОВКИ
   BASE="$(gc base)"

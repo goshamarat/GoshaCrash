@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc39"
+INSTALLER_VERSION="3.10.2-rc40-test2"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -286,17 +286,62 @@ fdisk_blocks_number(){
     printf '%s\n' "$1" | sed 's/[^0-9].*$//'
 }
 
+prepare_usb_fs_choice(){
+    model="$(nvram_get productid)"
+
+    # The project intentionally has two supported USB preparation profiles:
+    #   legacy RT-AC68U family -> EXT3
+    #   ZenWiFi BT10          -> EXT4
+    # Do not guess on unknown hardware before a destructive operation.
+    if legacy_hw_detect; then
+        PREPARE_USB_FS="ext3"
+        PREPARE_USB_FS_UPPER="EXT3"
+        PREPARE_USB_MKFS_NAME="mkfs.ext3"
+        return 0
+    fi
+
+    case "$model" in
+        BT10*)
+            PREPARE_USB_FS="ext4"
+            PREPARE_USB_FS_UPPER="EXT4"
+            PREPARE_USB_MKFS_NAME="mkfs.ext4"
+            return 0
+            ;;
+    esac
+
+    fail "--prepare-usb: неизвестный профиль роутера '${model:-unknown}'. Форматирование отменено"
+    echo "Поддерживаемые destructive-профили: RT-AC68U/legacy -> EXT3; ZenWiFi BT10 -> EXT4."
+    return 1
+}
+
 prepare_usb_wizard(){
     verify_asuswrt || return 1
+    prepare_usb_fs_choice || return 1
 
     FDISK_BIN="$(find_tool_basic fdisk 2>/dev/null)"
-    MKFS_BIN="$(find_tool_basic mkfs.ext3 2>/dev/null)"
-    test -n "$FDISK_BIN" || { fail "fdisk не найден в прошивке"; return 1; }
-    test -n "$MKFS_BIN" || { fail "mkfs.ext3 не найден в прошивке"; return 1; }
+    MKFS_BIN="$(find_tool_basic "$PREPARE_USB_MKFS_NAME" 2>/dev/null)"
+    MKFS_MODE="direct"
 
+    # Some firmwares expose mke2fs but no mkfs.ext4 wrapper.  Use it only for
+    # the requested filesystem; never silently fall back from EXT4 to EXT3.
+    if test -z "$MKFS_BIN" && test "$PREPARE_USB_FS" = "ext4"; then
+        MKFS_BIN="$(find_tool_basic mke2fs 2>/dev/null)"
+        test -n "$MKFS_BIN" && MKFS_MODE="mke2fs-ext4"
+    fi
+
+    test -n "$FDISK_BIN" || { fail "fdisk не найден в прошивке"; return 1; }
+    if test -z "$MKFS_BIN"; then
+        fail "$PREPARE_USB_MKFS_NAME не найден в прошивке"
+        test "$PREPARE_USB_FS" = "ext4" && echo "Для BT10 нужен mkfs.ext4 либо mke2fs с поддержкой ext4; EXT3 автоматически не подставляется."
+        return 1
+    fi
+
+    model_id="$(nvram_get productid)"
     echo
-    echo "GoshaCrash — подготовка USB в EXT3"
+    echo "GoshaCrash — подготовка USB в $PREPARE_USB_FS_UPPER"
     echo "=================================="
+    echo "Router: ${model_id:-unknown}"
+    echo "Profile: $PREPARE_USB_FS_UPPER"
     echo
     echo "Найдены USB-диски:"
     usb_list_disks
@@ -328,9 +373,16 @@ prepare_usb_wizard(){
     echo "Устройство: $USB_DEV"
     echo "Модель:     $model"
     echo "Размер:     $size_mb MB"
+    echo "Роутер:     ${model_id:-unknown}"
     echo
     echo "Целевая схема:"
-    echo "  DOS/MBR -> один primary-раздел $target_part -> EXT3 label=SANDISK"
+    echo "  DOS/MBR -> один primary-раздел $target_part -> $PREPARE_USB_FS_UPPER label=SANDISK"
+    echo
+    if test "$PREPARE_USB_FS" = "ext3"; then
+        echo "Профиль filesystem: legacy ASUS -> EXT3"
+    else
+        echo "Профиль filesystem: ZenWiFi BT10 -> EXT4"
+    fi
     echo
     printf 'Для продолжения введите точно: FORMAT %s\n> ' "$USB_DEV"
     IFS= read -r confirm
@@ -395,9 +447,6 @@ prepare_usb_wizard(){
        && test -n "$kernel_blocks" \
        && test "$fdisk_blocks" = "$kernel_blocks" \
        && test "$fdisk_type" = "83"; then
-        # BusyBox ash on this 32-bit ASUSWRT can overflow on:
-        #   disk_blocks * 98
-        # for a 120M-block USB disk. Compare in MiB-sized units instead.
         disk_mb=$((disk_blocks / 1024))
         kernel_mb=$((kernel_blocks / 1024))
         min_mb=$((disk_mb * 98 / 100))
@@ -410,7 +459,7 @@ prepare_usb_wizard(){
 
     if test "$resume_ready" -eq 1; then
         ok "MBR уже готова после reboot: $target_part, type 83, ${kernel_blocks} blocks"
-        say "[3/5] fdisk пропущен — продолжаем с mkfs.ext3"
+        say "[3/5] fdisk пропущен — продолжаем с $PREPARE_USB_MKFS_NAME"
     else
         say "[3/5] Создание новой DOS/MBR разметки и одного primary-раздела"
 
@@ -478,17 +527,24 @@ prepare_usb_wizard(){
         return 1
     fi
 
-    say "[4/5] Форматирование $target_part в EXT3 (label=SANDISK)"
-    "$MKFS_BIN" -L SANDISK "$target_part" >> "$TMP_LOG" 2>&1 || {
-        fail "mkfs.ext3 завершился с ошибкой. См. $TMP_LOG"
-        return 1
-    }
+    say "[4/5] Форматирование $target_part в $PREPARE_USB_FS_UPPER (label=SANDISK)"
+    if test "$MKFS_MODE" = "mke2fs-ext4"; then
+        "$MKFS_BIN" -t ext4 -L SANDISK "$target_part" >> "$TMP_LOG" 2>&1 || {
+            fail "mke2fs -t ext4 завершился с ошибкой. См. $TMP_LOG"
+            return 1
+        }
+    else
+        "$MKFS_BIN" -L SANDISK "$target_part" >> "$TMP_LOG" 2>&1 || {
+            fail "$PREPARE_USB_MKFS_NAME завершился с ошибкой. См. $TMP_LOG"
+            return 1
+        }
+    fi
     sync
 
-    say "[5/5] EXT3 записан. Финальное монтирование оставляем штатному ASUSWRT"
+    say "[5/5] $PREPARE_USB_FS_UPPER записан. Финальное монтирование оставляем штатному ASUSWRT"
 
     echo
-    ok "USB подготовлен: DOS/MBR + $target_part + EXT3 label=SANDISK"
+    ok "USB подготовлен: DOS/MBR + $target_part + $PREPARE_USB_FS_UPPER label=SANDISK"
     echo
     echo "Не вынимай/вставляй флешку."
     echo "Сделай один reboot:"
@@ -497,9 +553,8 @@ prepare_usb_wizard(){
     echo "После загрузки проверь:"
     echo "  mount | grep '/dev/sd'"
     echo "  df -h | grep '/tmp/mnt'"
-    echo
     echo "Ожидается:"
-    echo "  $target_part on /tmp/mnt/SANDISK type ext3 (...)"
+    echo "  $target_part on /tmp/mnt/SANDISK type $PREPARE_USB_FS (...)"
     echo
     echo "Затем установи Download Master через веб-интерфейс ASUS"
     echo "и запусти обычную установку GoshaCrash:"
@@ -507,7 +562,6 @@ prepare_usb_wizard(){
     echo
     return 0
 }
-
 
 tool_path(){
     if test "$1" = "unzip"; then
@@ -738,21 +792,54 @@ opt_namespace_write_through(){
     return 1
 }
 
+usb_storage_sanity_check(){
+    # A damaged ext filesystem can look mounted and writable while directory
+    # metadata is already unreadable (for example: "Structure needs cleaning").
+    # Refuse to touch Optware in that state: reinstalling packages cannot repair
+    # filesystem metadata and only makes the failure harder to diagnose.
+    for probe_dir in "$DM_ROOT" "$DM_ROOT/scripts" "$BASE/ui"; do
+        test -d "$probe_dir" || continue
+        if ! ls -la "$probe_dir" >/dev/null 2>> "$BASE/logs/packages.log"; then
+            fail "USB filesystem повреждена или каталог нечитаем: $probe_dir"
+            fail "Сначала останови Download Master, размонтируй USB и выполни offline fsck; затем повтори установку"
+            return 1
+        fi
+    done
+    return 0
+}
+
 preserve_stock_opt_payload(){
     # Preserve firmware-owned real files/directories that would otherwise be
     # hidden by the bind mount. Firmware symlinks to /tmp/opt need no copy.
+    # Never hide cp/ls errors: on BT10 they are the primary signal of damaged
+    # ext metadata and must remain visible in packages.log.
     for entry in /opt/*; do
         test -e "$entry" || continue
         test -L "$entry" && continue
         name="${entry##*/}"
+        target="$DM_ROOT/$name"
+
+        if test -d "$target"; then
+            if ! ls -la "$target" >/dev/null 2>> "$BASE/logs/packages.log"; then
+                fail "USB/Optware каталог $target повреждён или нечитаем; требуется offline fsck"
+                return 1
+            fi
+        fi
+
+        printf '[%s] OPT PRESERVE: %s -> %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$entry" "$target" >> "$BASE/logs/packages.log" 2>/dev/null || true
+
         if test -d "$entry"; then
-            mkdir -p "$DM_ROOT/$name" || return 1
-            cp -R "$entry/." "$DM_ROOT/$name/" 2>/dev/null || {
+            mkdir -p "$target" >> "$BASE/logs/packages.log" 2>&1 || return 1
+            cp -R "$entry/." "$target/" >> "$BASE/logs/packages.log" 2>&1 || {
                 fail "Не удалось сохранить штатный /opt/$name перед подготовкой Optware"
+                fail "Подробность сохранена в $BASE/logs/packages.log; если есть 'Structure needs cleaning' — нужен offline fsck"
                 return 1
             }
         elif test -f "$entry"; then
-            cp -f "$entry" "$DM_ROOT/$name" 2>/dev/null || return 1
+            cp -f "$entry" "$target" >> "$BASE/logs/packages.log" 2>&1 || {
+                fail "Не удалось сохранить штатный файл /opt/$name; см. packages.log"
+                return 1
+            }
         fi
     done
     return 0
@@ -1649,6 +1736,7 @@ check_usb_filesystem(){
 prepare_packages(){
     prepare_path
     check_usb_filesystem
+    usb_storage_sanity_check || return 1
     prepare_optware_namespace || return 1
     find_pkg || { fail "В Download Master не найден ipkg/opkg"; return 1; }
     say "Менеджер пакетов ASUS: $PKG"
@@ -2726,7 +2814,7 @@ json_asset_urls(){
 }
 
 pinned_official_mihomo_url(){
-    # rc39 deliberately pins the modern core. A router install must not silently
+    # rc40-test2 deliberately pins the modern core. A router install must not silently
     # switch CPU binary just because GitHub "latest" changed between runs.
     MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_VERSION"
     printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$OFFICIAL_MIHOMO_VERSION/mihomo-linux-$MIHOMO_TARGET-$OFFICIAL_MIHOMO_VERSION.gz"
@@ -2996,12 +3084,18 @@ write_nano_wrapper(){
 BASE='$BASE'
 DM_ROOT=""
 unset LC_ALL 2>/dev/null || true
+/bin/busybox test -f "\$BASE/state/platform.env" && . "\$BASE/state/platform.env"
 case "\${LC_CTYPE:-\${LANG:-}}" in
   *UTF-8*|*utf8*|*UTF8*) : ;;
-  *) LANG=en_US.UTF-8; LC_CTYPE=en_US.UTF-8; export LANG LC_CTYPE ;;
+  *) LANG=\${GOSHACRASH_EDITOR_LOCALE:-en_US.UTF-8}; LC_CTYPE="\$LANG" ;;
 esac
-/bin/busybox test -f "\$BASE/state/platform.env" && . "\$BASE/state/platform.env"
-for p in /opt/bin/nano /tmp/opt/bin/nano "\$DM_ROOT/bin/nano" "\$DM_ROOT/sbin/nano"; do
+TERM=\${GOSHACRASH_EDITOR_TERM:-\${TERM:-xterm-256color}}
+NCURSES_NO_UTF8_ACS=1
+LD_LIBRARY_PATH="/tmp/goshacrash-opt/lib:\$DM_ROOT/lib:/lib:/usr/lib"
+export LANG LC_CTYPE TERM NCURSES_NO_UTF8_ACS LD_LIBRARY_PATH
+# Prefer the persistent USB binary directly.  Editing must not depend on the
+# whole /opt bind namespace being healthy.
+for p in "\$DM_ROOT/bin/nano" "\$DM_ROOT/sbin/nano" /tmp/opt/bin/nano /opt/bin/nano; do
   /bin/busybox test -x "\$p" && exec "\$p" "\$@"
 done
 echo "nano не найден. Установи nano через пакетный менеджер Download Master" >&2
@@ -3036,7 +3130,7 @@ install_stock_usb_mount_bridge(){
     mkdir -p "$DM_ROOT/etc/init.d" "$DM_ROOT/lib/ipkg/info" || return 1
     cat > "$DM_ROOT/etc/init.d/S50usb-mount-script" <<'HOOK'
 #!/bin/sh
-# GoshaCrash Download Master bridge 3.10.2-rc39
+# GoshaCrash Download Master bridge 3.10.2-rc40-test2
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -3061,7 +3155,13 @@ case "$1" in
     } >/dev/null 2>&1 &
     ;;
   stop)
-    test -x /jffs/scripts/usb-umount-script && /jffs/scripts/usb-umount-script "$device" "$mount" &
+    # USB shutdown must be synchronous.  Returning before GoshaCrash has
+    # stopped Mihomo/watchdog and released /opt creates a race with ASUS fsck
+    # and physical unmount of the same device.
+    if test -x /jffs/scripts/usb-umount-script; then
+      /jffs/scripts/usb-umount-script "$device" "$mount"
+      exit $?
+    fi
     ;;
 esac
 HOOK
@@ -3126,7 +3226,7 @@ install_hooks(){
 
     cat > /jffs/scripts/usb-mount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB hook 3.10.2-rc39
+# GoshaCrash USB hook 3.10.2-rc40-test2
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -3193,7 +3293,7 @@ BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 UPTIME="$(cat /proc/uptime 2>/dev/null)"
 trace "controller ready after ${WAITED}s dm=${DM:-none} boot_id=${BOOT_ID:-unknown} uptime=${UPTIME:-unknown}"
 date '+%Y-%m-%d %H:%M:%S' > "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-printf '[%s] autostart hook rc39: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
+printf '[%s] autostart hook rc40-test2: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
 
 NOHUP=""
 for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup; do
@@ -3213,31 +3313,51 @@ HOOK
 
     cat > /jffs/scripts/usb-umount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB unmount hook 3.10.2-rc39
+# GoshaCrash USB unmount hook 3.10.2-rc40-test2
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 BASE="__GC_BASE__"
 MOUNT_POINT="$2"
+TRACE=/tmp/goshacrash-coldboot.log
+RC=0
+trace(){
+  printf '[%s] [usb-umount pid=%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$*" >> "$TRACE" 2>/dev/null || true
+}
 case "$BASE" in
   "$MOUNT_POINT"/*)
-    test -x "$BASE/goshacrash.sh" && GOSHACRASH_BASE="$BASE" /bin/sh "$BASE/goshacrash.sh" service-stop >/dev/null 2>&1 || true
+    trace "entered device=$1 mount=$MOUNT_POINT"
+    if test -x "$BASE/goshacrash.sh"; then
+      GOSHACRASH_BASE="$BASE" /bin/sh "$BASE/goshacrash.sh" service-stop >/dev/null 2>&1 || {
+        trace "service-stop returned nonzero"
+        RC=1
+      }
+    fi
     if test -f /tmp/goshacrash-opt-bind.state; then
       OPTDM="$(cat /tmp/goshacrash-opt-bind.state 2>/dev/null)"
       case "$OPTDM" in
         "$MOUNT_POINT"/*)
+          UNMOUNTED=0
           for u in /bin/umount /sbin/umount /usr/bin/umount /usr/sbin/umount; do
             test -x "$u" || continue
-            "$u" /opt >/dev/null 2>&1 || "$u" -l /opt >/dev/null 2>&1 || true
+            if "$u" /opt >/dev/null 2>&1; then
+              UNMOUNTED=1
+              trace "/opt released"
+            else
+              trace "ERROR: /opt is still busy; refusing lazy unmount"
+              RC=1
+            fi
             break
           done
-          rm -f /tmp/goshacrash-opt-bind.state 2>/dev/null || true
+          if test "$UNMOUNTED" = 1; then
+            rm -f /tmp/goshacrash-opt-bind.state 2>/dev/null || true
+          fi
           ;;
       esac
     fi
     ;;
 esac
-exit 0
+exit "$RC"
 HOOK
     sed -i "s#__GC_BASE__#$hook_base_esc#g" /jffs/scripts/usb-umount-script || return 1
     chmod 755 /jffs/scripts/usb-umount-script || return 1
@@ -3249,7 +3369,7 @@ HOOK
     test -d /opt/bin && test -w /opt/bin && write_command_wrapper /opt/bin/gc 2>/dev/null || true
 
     # Old rc23-rc26 used a custom /jffs/addons/goshacrash directory only to
-    # store base/start/trace. rc39 no longer needs it; remove our own residue.
+    # store base/start/trace. rc40-test2 no longer needs it; remove our own residue.
     rm -rf /jffs/addons/goshacrash 2>/dev/null || true
     grep -Fq 'exec /bin/busybox test "$@"' /jffs/scripts/test 2>/dev/null && rm -f /jffs/scripts/test 2>/dev/null || true
     grep -Fq "exec /bin/busybox '['" /jffs/scripts/'[' 2>/dev/null && rm -f /jffs/scripts/'[' 2>/dev/null || true
@@ -3354,7 +3474,7 @@ main(){
             echo
             echo "Использование:"
             echo "  /bin/sh install.sh                 установить/обновить GoshaCrash"
-            echo "  /bin/sh install.sh --prepare-usb   безопасный мастер подготовки USB в EXT3"
+            echo "  /bin/sh install.sh --prepare-usb   подготовить USB: RT-AC68U/legacy -> EXT3, BT10 -> EXT4"
             echo "  /bin/sh install.sh --help          эта справка"
             return 0
             ;;
