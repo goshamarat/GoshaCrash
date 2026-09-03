@@ -209,3 +209,11 @@ gc logs watchdog 100
 ```
 
 Они не содержат постоянного `/tmp/mnt/<имя>` пути.
+
+
+## Coldboot v2 (same public version rc40-test2)
+
+- cold boot no longer calls public `start()` after an initial successful WAN probe; this removes the second transient WAN probe that could leave Mihomo down after reboot;
+- transient WAN/offline counters are reset on each new router boot;
+- watchdog writes a heartbeat and receives an immediate recovery pass after the boot lock is released;
+- `/jffs/configs/profile.add` is the persistent shell locale source; `/jffs/etc/profile` is treated as optional because ASUS may recreate/remove it.

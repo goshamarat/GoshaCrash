@@ -4,7 +4,7 @@
 # package tools through ASUS Download Master, configuration and autostart.
 
 INSTALLER_VERSION="3.10.2-rc40-test2"
-EXPECTED_CONTROLLER_BUILD_ID="2026-09-03-dynamic-usb-relative-state-no-secret-persistent-utf8-nano"
+EXPECTED_CONTROLLER_BUILD_ID="2026-09-03-dynamic-usb-utf8-coldboot-v2"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command

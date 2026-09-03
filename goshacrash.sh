@@ -4,7 +4,7 @@
 # Zashboard updates are triggered from the native button inside Zashboard.
 
 VERSION="3.10.2-rc40-test2"
-BUILD_ID="2026-09-03-dynamic-usb-relative-state-no-secret-persistent-utf8-nano"
+BUILD_ID="2026-09-03-dynamic-usb-utf8-coldboot-v2"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -51,6 +51,7 @@ PIDFILE="$RUN/mihomo.pid"
 WATCHDOG_PIDFILE="$RUN/watchdog.pid"
 WATCHDOG_LOG="$LOGS/watchdog.log"
 WATCHDOG_START_LOCK="$RUN/watchdog-start.lock"
+WATCHDOG_HEARTBEAT="$STATE/watchdog-heartbeat"
 BOOT_PIDFILE="$RUN/boot.pid"
 BOOT_LOCK="$RUN/boot.lock"
 START_LOCK="$RUN/start.lock"
@@ -1408,6 +1409,11 @@ boot_lock_release(){
 }
 
 cleanup_stale_runtime_state(){
+    # WAN probe state is runtime-only. Keeping it on USB across a reboot can
+    # make a fresh boot inherit an old offline decision. Reset only transient
+    # connectivity state; manual-stop remains persistent by design.
+    rm -f "$WAN_OFFLINE" "$WAN_FAIL_COUNT" "$WAN_OK_COUNT" "$WAN_STATE" "$WATCHDOG_HEARTBEAT" 2>/dev/null || true
+
     # Files under run/ live on USB and survive a hard power cut.  A PID alone
     # is not proof that it still belongs to GoshaCrash after the next boot.
     running_pid >/dev/null 2>&1 || rm -f "$PIDFILE" 2>/dev/null || true
@@ -1535,9 +1541,11 @@ watchdog_loop(){
 
     # Do not sleep first: after a hard power cut recovery must start as soon as
     # the controller reaches the watchdog, not one interval later.
+    printf '%s pid=%s\n' "$(now)" "$$" > "$WATCHDOG_HEARTBEAT" 2>/dev/null || true
     watchdog_check
     while :; do
         sleep "$WATCHDOG_INTERVAL"
+        printf '%s pid=%s\n' "$(now)" "$$" > "$WATCHDOG_HEARTBEAT" 2>/dev/null || true
         watchdog_check
     done
 }
@@ -1709,29 +1717,47 @@ boot(){
         fi
     fi
 
-    if internet_probe_once || wan_nvram_up; then
-        rm -f "$WAN_OFFLINE" 2>/dev/null || true
-        set_wan_state checking
-        printf '[%s] boot: WAN available; starting runtime\n' "$(now)"
-        start
+    # Cold boot already waited for the physical uplink above. Do not call the
+    # public start() here: start() performs another independent WAN probe and a
+    # single transient miss could mark the fresh boot offline after the first
+    # probe had just succeeded. Probe once, then start the runtime directly.
+    if internet_probe_once; then
+        wan_mark_online
+        printf '[%s] boot: Internet probe OK; starting runtime directly\n' "$(now)"
+        with_start_lock start_runtime
         rc=$?
-        if [ "$rc" -eq 0 ]; then
-            printf '[%s] boot: runtime start path completed\n' "$(now)"
-        else
-            printf '[%s] boot: runtime start returned rc=%s; watchdog left enabled\n' "$(now)" "$rc"
-        fi
-        boot_lock_release
-        trap - HUP INT TERM
-        return "$rc"
+    elif wan_nvram_up; then
+        rm -f "$WAN_OFFLINE" 2>/dev/null || true
+        counter_set "$WAN_FAIL_COUNT" 0
+        counter_set "$WAN_OK_COUNT" 0
+        set_wan_state checking
+        printf '[%s] boot: ASUS WAN reports UP; starting runtime directly\n' "$(now)"
+        with_start_lock start_runtime
+        rc=$?
+    else
+        wan_mark_offline
+        stop_runtime
+        rc=0
+        printf '[%s] boot: WAN unavailable; runtime kept DIRECT and watchdog enabled\n' "$(now)"
     fi
 
-    wan_mark_offline
-    stop_runtime
-    printf '[%s] boot: WAN unavailable; runtime kept DIRECT and watchdog enabled\n' "$(now)"
-    watchdog_start || true
+    if [ "$rc" -eq 0 ] && running_pid >/dev/null 2>&1; then
+        printf '[%s] boot: runtime is UP\n' "$(now)"
+    elif [ "$rc" -ne 0 ]; then
+        printf '[%s] boot: runtime start returned rc=%s; watchdog will retry after boot lock release\n' "$(now)" "$rc"
+    fi
+
     boot_lock_release
     trap - HUP INT TERM
-    return 0
+    watchdog_start || true
+
+    # Give the already-running watchdog one immediate recovery opportunity
+    # instead of waiting for the next 10 second interval. This is safe only
+    # after BOOT_LOCK has been released.
+    if [ "$rc" -ne 0 ] || ! running_pid >/dev/null 2>&1; then
+        watchdog_check || true
+    fi
+    return "$rc"
 }
 firewall_reload(){
     load_platform || return 0
@@ -2570,17 +2596,17 @@ doctor(){
 
     [ -f "$MANUAL_STOP" ] && echo "  manual stop: YES" || echo "  manual stop: no"
     echo "  nano UTF-8 locale: $(editor_utf8_locale)"
-    if grep -Fq 'export LANG=en_US.UTF-8' /jffs/etc/profile 2>/dev/null \
-       && grep -Fq 'export LC_ALL=en_US.UTF-8' /jffs/etc/profile 2>/dev/null; then
-        echo "  shell UTF-8 locale /jffs/etc/profile: OK"
-    else
-        echo "  shell UTF-8 locale /jffs/etc/profile: MISSING"
-    fi
     if grep -Fq 'export LANG=en_US.UTF-8' /jffs/configs/profile.add 2>/dev/null \
        && grep -Fq 'export LC_ALL=en_US.UTF-8' /jffs/configs/profile.add 2>/dev/null; then
         echo "  shell UTF-8 locale profile.add: OK"
     else
         echo "  shell UTF-8 locale profile.add: MISSING"
+    fi
+    if grep -Fq 'export LANG=en_US.UTF-8' /jffs/etc/profile 2>/dev/null \
+       && grep -Fq 'export LC_ALL=en_US.UTF-8' /jffs/etc/profile 2>/dev/null; then
+        echo "  shell UTF-8 locale /jffs/etc/profile: OK (optional)"
+    else
+        echo "  shell UTF-8 locale /jffs/etc/profile: not present (optional)"
     fi
     config_utf8_valid
     utf8_rc=$?
@@ -2606,7 +2632,16 @@ doctor(){
         echo "  Mihomo TUN $TUN_DEVICE: DOWN"
         echo "  routing runtime: N/A (TUN down)"
     fi
-    watchdog_pid >/dev/null 2>&1 && echo "  watchdog: OK" || echo "  watchdog: DOWN"
+    if watchdog_pid >/dev/null 2>&1; then
+        echo "  watchdog: OK"
+        if [ -s "$WATCHDOG_HEARTBEAT" ]; then
+            echo "  watchdog heartbeat: $(cat "$WATCHDOG_HEARTBEAT" 2>/dev/null)"
+        else
+            echo "  watchdog heartbeat: not written yet"
+        fi
+    else
+        echo "  watchdog: DOWN"
+    fi
 
     find_dm_root >/dev/null 2>&1 && echo "  Download Master: $DM_ROOT" || echo "  Download Master: FAIL"
     ensure_optware_link >/dev/null 2>&1 && echo "  /tmp/opt: OK" || echo "  /tmp/opt: FAIL"
