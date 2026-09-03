@@ -4,7 +4,7 @@
 # Zashboard updates are triggered from the native button inside Zashboard.
 
 VERSION="3.10.2-rc40-test2"
-BUILD_ID="2026-09-03-dynamic-usb-utf8-coldboot-v2"
+BUILD_ID="2026-09-03-dynamic-usb-utf8-coldboot-v3-editpause"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -2408,11 +2408,7 @@ menu_basic(){
         IFS= read -r choice || return 0
         case "$choice" in
             1) status ;;
-            2)
-                edit_config
-                sleep 2
-                continue
-                ;;
+            2) edit_config ;;
             3) restart ;;
             4) stop ;;
             5) menu_logs ;;
@@ -2472,7 +2468,7 @@ menu(){
                 printf '\033[?25h\033[2J\033[H'
                 case "$selected" in
                     1) status; menu_pause ;;
-                    2) edit_config; sleep 2 ;;
+                    2) edit_config; menu_pause ;;
                     3) restart; menu_pause ;;
                     4) stop; menu_pause ;;
                     5) menu_logs ;;

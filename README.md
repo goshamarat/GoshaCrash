@@ -217,3 +217,8 @@ gc logs watchdog 100
 - transient WAN/offline counters are reset on each new router boot;
 - watchdog writes a heartbeat and receives an immediate recovery pass after the boot lock is released;
 - `/jffs/configs/profile.add` is the persistent shell locale source; `/jffs/etc/profile` is treated as optional because ASUS may recreate/remove it.
+
+
+## rc40-test2 edit pause
+
+После выхода из `Edit config` интерактивное меню больше не перерисовывается автоматически через 2 секунды. В полноэкранном меню вывод проверки конфигурации остаётся на экране до нажатия любой клавиши. В fallback line-menu — до Enter. CLI-команда `gc edit` не получает обязательную паузу и остаётся пригодной для прямого вызова.
