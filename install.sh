@@ -4,6 +4,7 @@
 # package tools through ASUS Download Master, configuration and autostart.
 
 INSTALLER_VERSION="3.10.2-rc40-test2"
+EXPECTED_CONTROLLER_BUILD_ID="2026-09-03-dynamic-usb-relative-state-no-secret-persistent-utf8-nano"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -23,6 +24,12 @@ TMP_ROOT="/tmp/goshacrash-install.$$"
 TMP_LOG="/tmp/goshacrash-install.log"
 INSTALL_LOG="$TMP_LOG"
 USB_MOUNT=""
+USB_DEVICE=""
+USB_DISK=""
+USB_NAME=""
+USB_FS=""
+DM_LAYOUT=""
+INSTALLER_PATH=""
 DM_ROOT=""
 BASE=""
 PKG=""
@@ -141,428 +148,6 @@ verify_asuswrt(){
 }
 
 
-find_tool_basic(){
-    name="$1"
-    for p in "/usr/sbin/$name" "/usr/bin/$name" "/sbin/$name" "/bin/$name"; do
-        test -x "$p" && { printf '%s\n' "$p"; return 0; }
-    done
-    return 1
-}
-
-usb_disk_size_mb(){
-    dev="$1"
-    name="${dev#/dev/}"
-    blocks="$(awk -v n="$name" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
-    case "$blocks" in
-        ''|*[!0-9]*) echo "?"; return 0 ;;
-    esac
-    echo $((blocks / 1024))
-}
-
-usb_disk_model(){
-    dev="$1"
-    name="${dev#/dev/}"
-    model="$(cat "/sys/block/$name/device/model" 2>/dev/null)"
-    vendor="$(cat "/sys/block/$name/device/vendor" 2>/dev/null)"
-    model="$(printf '%s %s' "$vendor" "$model" | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')"
-    test -n "$model" && printf '%s\n' "$model" || printf '%s\n' "USB disk"
-}
-
-usb_disk_is_mounted(){
-    dev="$1"
-    grep -q "^${dev}[0-9]* " /proc/mounts 2>/dev/null
-}
-
-usb_list_disks(){
-    found=0
-    for sys in /sys/block/sd*; do
-        test -d "$sys" || continue
-        name="${sys##*/}"
-        dev="/dev/$name"
-        test -b "$dev" || continue
-        found=$((found + 1))
-        size_mb="$(usb_disk_size_mb "$dev")"
-        model="$(usb_disk_model "$dev")"
-        mounted="нет"
-        usb_disk_is_mounted "$dev" && mounted="да"
-        printf ' [%s] %s | %s | %s MB | mounted: %s\n' "$found" "$dev" "$model" "$size_mb" "$mounted"
-        eval "GC_USB_DEV_$found='$dev'"
-    done
-    GC_USB_COUNT="$found"
-}
-
-usb_wait_partition(){
-    part="$1"
-    n=0
-    while test "$n" -lt 15; do
-        test -b "$part" && return 0
-        sleep 1
-        n=$((n + 1))
-    done
-    return 1
-}
-
-usb_symlink_test(){
-    mountpoint="$1"
-    testdir="$mountpoint/.goshacrash-symlink-test.$$"
-    rm -rf "$testdir" 2>/dev/null || true
-    mkdir -p "$testdir" || return 1
-    : > "$testdir/target" || { rm -rf "$testdir"; return 1; }
-    ln -s target "$testdir/link" 2>/dev/null || { rm -rf "$testdir"; return 1; }
-    test -L "$testdir/link" || { rm -rf "$testdir"; return 1; }
-    rm -rf "$testdir" 2>/dev/null || true
-    return 0
-}
-
-
-mount_fs_for_path(){
-    target="$1"
-    best_mp=""
-    best_fs=""
-    while read dev mp fs rest; do
-        case "$target" in
-            "$mp"|"$mp"/*)
-                if test ${#mp} -gt ${#best_mp}; then
-                    best_mp="$mp"
-                    best_fs="$fs"
-                fi
-                ;;
-        esac
-    done < /proc/mounts
-    test -n "$best_mp" || return 1
-    printf '%s|%s\n' "$best_mp" "$best_fs"
-}
-
-legacy_usb_fs_check(){
-    # DM_ROOT is already known here, so inspect the actual filesystem that
-    # backs Download Master/Optware rather than guessing from a device name.
-    candidate="${DM_ROOT:-${USB_MOUNT:-}}"
-    test -n "$candidate" || return 0
-
-    info="$(mount_fs_for_path "$candidate" 2>/dev/null)" || {
-        warn "Не удалось определить filesystem для $candidate"
-        return 0
-    }
-
-    mp="${info%%|*}"
-    fs="${info#*|}"
-
-    case "$fs" in
-        ext3)
-            ok "USB filesystem: EXT3 ($mp)"
-            return 0
-            ;;
-        *)
-            echo
-            warn "USB filesystem: $fs"
-            warn "Mount: $mp"
-            echo
-            echo "Для legacy RT-AC68U + Download Master/Optware нужна EXT3."
-            echo "Текущая файловая система '$fs' не подходит для проверенной legacy-схемы."
-            echo
-            echo "Почему:"
-            echo "  Optware использует Unix symlink, например:"
-            echo "  libipkg.so.0 -> libipkg.so.0.0.0"
-            echo "  На TFAT/FAT такие ссылки не создаются; в результате ломаются ipkg, nano и SFTP."
-            echo
-            echo "Подготовить флешку можно этим же установщиком:"
-            echo
-            echo "  /bin/sh install.sh --prepare-usb"
-            echo
-            echo "После форматирования:"
-            echo "  1. переподключи флешку;"
-            echo "  2. установи Download Master на неё заново;"
-            echo "  3. снова запусти: /bin/sh install.sh"
-            echo
-            fail "Установка остановлена до внесения изменений: требуется EXT3"
-            return 1
-            ;;
-    esac
-}
-
-fdisk_blocks_number(){
-    # BusyBox fdisk may print rounded block counts as e.g. "7566583+".
-    # Geometry comparisons must use digits only.
-    printf '%s\n' "$1" | sed 's/[^0-9].*$//'
-}
-
-prepare_usb_fs_choice(){
-    model="$(nvram_get productid)"
-
-    # The project intentionally has two supported USB preparation profiles:
-    #   legacy RT-AC68U family -> EXT3
-    #   ZenWiFi BT10          -> EXT4
-    # Do not guess on unknown hardware before a destructive operation.
-    if legacy_hw_detect; then
-        PREPARE_USB_FS="ext3"
-        PREPARE_USB_FS_UPPER="EXT3"
-        PREPARE_USB_MKFS_NAME="mkfs.ext3"
-        return 0
-    fi
-
-    case "$model" in
-        BT10*)
-            PREPARE_USB_FS="ext4"
-            PREPARE_USB_FS_UPPER="EXT4"
-            PREPARE_USB_MKFS_NAME="mkfs.ext4"
-            return 0
-            ;;
-    esac
-
-    fail "--prepare-usb: неизвестный профиль роутера '${model:-unknown}'. Форматирование отменено"
-    echo "Поддерживаемые destructive-профили: RT-AC68U/legacy -> EXT3; ZenWiFi BT10 -> EXT4."
-    return 1
-}
-
-prepare_usb_wizard(){
-    verify_asuswrt || return 1
-    prepare_usb_fs_choice || return 1
-
-    FDISK_BIN="$(find_tool_basic fdisk 2>/dev/null)"
-    MKFS_BIN="$(find_tool_basic "$PREPARE_USB_MKFS_NAME" 2>/dev/null)"
-    MKFS_MODE="direct"
-
-    # Some firmwares expose mke2fs but no mkfs.ext4 wrapper.  Use it only for
-    # the requested filesystem; never silently fall back from EXT4 to EXT3.
-    if test -z "$MKFS_BIN" && test "$PREPARE_USB_FS" = "ext4"; then
-        MKFS_BIN="$(find_tool_basic mke2fs 2>/dev/null)"
-        test -n "$MKFS_BIN" && MKFS_MODE="mke2fs-ext4"
-    fi
-
-    test -n "$FDISK_BIN" || { fail "fdisk не найден в прошивке"; return 1; }
-    if test -z "$MKFS_BIN"; then
-        fail "$PREPARE_USB_MKFS_NAME не найден в прошивке"
-        test "$PREPARE_USB_FS" = "ext4" && echo "Для BT10 нужен mkfs.ext4 либо mke2fs с поддержкой ext4; EXT3 автоматически не подставляется."
-        return 1
-    fi
-
-    model_id="$(nvram_get productid)"
-    echo
-    echo "GoshaCrash — подготовка USB в $PREPARE_USB_FS_UPPER"
-    echo "=================================="
-    echo "Router: ${model_id:-unknown}"
-    echo "Profile: $PREPARE_USB_FS_UPPER"
-    echo
-    echo "Найдены USB-диски:"
-    usb_list_disks
-    test "${GC_USB_COUNT:-0}" -gt 0 || { fail "USB-диски /dev/sdX не найдены"; return 1; }
-
-    echo
-    echo " [0] Отмена"
-    printf 'Выберите диск [0-%s]: ' "$GC_USB_COUNT"
-    IFS= read -r choice
-    case "$choice" in
-        0|'') say "Форматирование отменено"; return 0 ;;
-        *[!0-9]*) fail "Некорректный выбор"; return 1 ;;
-    esac
-    test "$choice" -ge 1 2>/dev/null && test "$choice" -le "$GC_USB_COUNT" 2>/dev/null || {
-        fail "Некорректный номер диска"
-        return 1
-    }
-
-    eval "USB_DEV=\${GC_USB_DEV_$choice}"
-    test -b "$USB_DEV" || { fail "Устройство исчезло: $USB_DEV"; return 1; }
-
-    devname="${USB_DEV#/dev/}"
-    target_part="${USB_DEV}1"
-    model="$(usb_disk_model "$USB_DEV")"
-    size_mb="$(usb_disk_size_mb "$USB_DEV")"
-
-    echo
-    echo "ВНИМАНИЕ: ВСЕ ДАННЫЕ НА ВЫБРАННОЙ ФЛЕШКЕ БУДУТ УДАЛЕНЫ."
-    echo "Устройство: $USB_DEV"
-    echo "Модель:     $model"
-    echo "Размер:     $size_mb MB"
-    echo "Роутер:     ${model_id:-unknown}"
-    echo
-    echo "Целевая схема:"
-    echo "  DOS/MBR -> один primary-раздел $target_part -> $PREPARE_USB_FS_UPPER label=SANDISK"
-    echo
-    if test "$PREPARE_USB_FS" = "ext3"; then
-        echo "Профиль filesystem: legacy ASUS -> EXT3"
-    else
-        echo "Профиль filesystem: ZenWiFi BT10 -> EXT4"
-    fi
-    echo
-    printf 'Для продолжения введите точно: FORMAT %s\n> ' "$USB_DEV"
-    IFS= read -r confirm
-    test "$confirm" = "FORMAT $USB_DEV" || { say "Форматирование отменено"; return 0; }
-
-    say "[1/5] Остановка USB-приложений и размонтирование $USB_DEV"
-
-    for mp in $(awk -v d="$USB_DEV" '$1 ~ ("^" d "[0-9]+$") {print $2}' /proc/mounts 2>/dev/null); do
-        if test -x "$mp/goshacrash/goshacrash.sh"; then
-            GOSHACRASH_BASE="$mp/goshacrash" "$mp/goshacrash/goshacrash.sh" stop >/dev/null 2>&1 || true
-        fi
-        for dmstop in \
-            "$mp/asusware.arm/S50downloadmaster.1" \
-            "$mp/asusware.arm/etc/init.d/S50downloadmaster" \
-            "$mp/asusware.arm64/S50downloadmaster.1" \
-            "$mp/asusware/S50downloadmaster.1"; do
-            test -x "$dmstop" && "$dmstop" stop >/dev/null 2>&1 || true
-        done
-    done
-
-    sync
-    sleep 1
-
-    tries=0
-    while test "$tries" -lt 8; do
-        mounted_now=0
-        for mp in $(awk -v d="$USB_DEV" '$1 ~ ("^" d "[0-9]+$") {print $2}' /proc/mounts 2>/dev/null); do
-            mounted_now=1
-            umount "$mp" >/dev/null 2>&1 || true
-        done
-        if test "$mounted_now" -eq 0; then
-            break
-        fi
-        sync
-        sleep 1
-        tries=$((tries + 1))
-    done
-
-    if awk -v d="$USB_DEV" '$1 ~ ("^" d "[0-9]+$") {found=1} END {exit found?0:1}' /proc/mounts 2>/dev/null; then
-        echo
-        fail "ASUSWRT всё ещё держит раздел флешки смонтированным. Ничего destructive не выполнено."
-        echo "В веб-интерфейсе ASUS нажми «Отсоединить» для USB-диска, не вынимай его физически,"
-        echo "и снова запусти:"
-        echo "  повторно запусти этот installer с аргументом --prepare-usb"
-        return 1
-    fi
-
-    say "[2/5] Проверка текущей MBR-разметки / resume после reboot"
-
-    disk_blocks="$(awk -v n="$devname" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
-    fdisk_line="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print; exit}')"
-    fdisk_blocks="$(printf '%s\n' "$fdisk_line" | awk '{print $4}')"
-    fdisk_type="$(printf '%s\n' "$fdisk_line" | awk '{print $(NF-1)}')"
-    kernel_blocks="$(awk -v n="${target_part#/dev/}" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
-    part_count="$(awk -v d="$devname" '$4 ~ ("^" d "[0-9]+$") {c++} END {print c+0}' /proc/partitions 2>/dev/null)"
-
-    resume_ready=0
-    if test "$part_count" -eq 1 \
-       && test -b "$target_part" \
-       && test -n "$disk_blocks" \
-       && test -n "$fdisk_blocks" \
-       && test -n "$kernel_blocks" \
-       && test "$fdisk_blocks" = "$kernel_blocks" \
-       && test "$fdisk_type" = "83"; then
-        disk_mb=$((disk_blocks / 1024))
-        kernel_mb=$((kernel_blocks / 1024))
-        min_mb=$((disk_mb * 98 / 100))
-        if test "$kernel_mb" -ge "$min_mb" 2>/dev/null; then
-            resume_ready=1
-        fi
-    fi
-
-    say "Resume check: parts=$part_count type=${fdisk_type:-?} fdisk_blocks=${fdisk_blocks:-?} kernel_blocks=${kernel_blocks:-?}"
-
-    if test "$resume_ready" -eq 1; then
-        ok "MBR уже готова после reboot: $target_part, type 83, ${kernel_blocks} blocks"
-        say "[3/5] fdisk пропущен — продолжаем с $PREPARE_USB_MKFS_NAME"
-    else
-        say "[3/5] Создание новой DOS/MBR разметки и одного primary-раздела"
-
-        {
-            echo o
-            echo n
-            echo p
-            echo 1
-            echo
-            echo
-            echo w
-        } | "$FDISK_BIN" "$USB_DEV" >> "$TMP_LOG" 2>&1
-        sync
-
-        if ! "$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | grep -q "^${target_part}[[:space:]]"; then
-            fail "Новая MBR-разметка не подтверждается через fdisk -l. См. $TMP_LOG"
-            return 1
-        fi
-
-        n=0
-        while test "$n" -lt 5; do
-            test -b "$target_part" && break
-            sleep 1
-            n=$((n + 1))
-        done
-
-        if ! test -b "$target_part"; then
-            echo
-            warn "MBR записан, но старое ядро ASUSWRT ещё не создало $target_part."
-            echo "Сделай reboot, снова скачай install.sh и повтори --prepare-usb."
-            echo "Установщик распознает готовую MBR и fdisk повторно запускать не будет."
-            return 2
-        fi
-
-        fdisk_blocks_raw="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print $4; exit}')"
-        fdisk_blocks="$(fdisk_blocks_number "$fdisk_blocks_raw")"
-        kernel_blocks="$(awk -v n="${target_part#/dev/}" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
-
-        if test -n "$fdisk_blocks" && test -n "$kernel_blocks" && test "$fdisk_blocks" != "$kernel_blocks"; then
-            echo
-            warn "MBR записан, но kernel всё ещё показывает старую геометрию $target_part."
-            echo "mkfs НЕ запускается на stale mapping."
-            echo
-            echo "Сейчас:"
-            echo "  reboot"
-            echo
-            echo "После загрузки снова:"
-            echo "  повторно запусти этот installer с аргументом --prepare-usb"
-            echo
-            echo "Установщик увидит совпавшую геометрию и ПРОПУСТИТ fdisk."
-            return 2
-        fi
-    fi
-
-    fdisk_blocks_raw="$("$FDISK_BIN" -l "$USB_DEV" 2>/dev/null | awk -v p="$target_part" '$1==p {print $4; exit}')"
-    fdisk_blocks="$(fdisk_blocks_number "$fdisk_blocks_raw")"
-    kernel_blocks="$(awk -v n="${target_part#/dev/}" '$4==n {print $3; exit}' /proc/partitions 2>/dev/null)"
-    if test -z "$fdisk_blocks" || test -z "$kernel_blocks" || test "$fdisk_blocks" != "$kernel_blocks"; then
-        fail "Перед mkfs геометрия $target_part не подтверждена. mkfs НЕ запускается."
-        return 1
-    fi
-
-    if grep -q "^$target_part " /proc/mounts 2>/dev/null; then
-        fail "$target_part снова смонтирован ASUSWRT; mkfs не запускаю"
-        return 1
-    fi
-
-    say "[4/5] Форматирование $target_part в $PREPARE_USB_FS_UPPER (label=SANDISK)"
-    if test "$MKFS_MODE" = "mke2fs-ext4"; then
-        "$MKFS_BIN" -t ext4 -L SANDISK "$target_part" >> "$TMP_LOG" 2>&1 || {
-            fail "mke2fs -t ext4 завершился с ошибкой. См. $TMP_LOG"
-            return 1
-        }
-    else
-        "$MKFS_BIN" -L SANDISK "$target_part" >> "$TMP_LOG" 2>&1 || {
-            fail "$PREPARE_USB_MKFS_NAME завершился с ошибкой. См. $TMP_LOG"
-            return 1
-        }
-    fi
-    sync
-
-    say "[5/5] $PREPARE_USB_FS_UPPER записан. Финальное монтирование оставляем штатному ASUSWRT"
-
-    echo
-    ok "USB подготовлен: DOS/MBR + $target_part + $PREPARE_USB_FS_UPPER label=SANDISK"
-    echo
-    echo "Не вынимай/вставляй флешку."
-    echo "Сделай один reboot:"
-    echo "  reboot"
-    echo
-    echo "После загрузки проверь:"
-    echo "  mount | grep '/dev/sd'"
-    echo "  df -h | grep '/tmp/mnt'"
-    echo "Ожидается:"
-    echo "  $target_part on /tmp/mnt/SANDISK type $PREPARE_USB_FS (...)"
-    echo
-    echo "Затем установи Download Master через веб-интерфейс ASUS"
-    echo "и запусти обычную установку GoshaCrash:"
-    echo "  повторно запусти обычную установку тем же способом"
-    echo
-    return 0
-}
-
 tool_path(){
     if test "$1" = "unzip"; then
         for p in /opt/bin/unzip /opt/bin/unzip-unzip; do
@@ -642,104 +227,88 @@ legacy_hw_detect(){
     return 1
 }
 
-mounted_usb_count(){
-    awk '$2 ~ "^/tmp/mnt/" {c++} END {print c+0}' /proc/mounts 2>/dev/null
-}
+# install.sh is intentionally executed from the root of the target USB mount.
+# Device names and mount names are runtime facts: /dev/sdb1 may become
+# /dev/sda1 after reboot, and a label may fall back to sda1. Never hardcode them.
+detect_installer_usb(){
+    self="$0"
+    case "$self" in
+        /*) : ;;
+        *) self="$(pwd)/$self" ;;
+    esac
+    INSTALLER_PATH="$(CDPATH= cd "$(dirname "$self")" 2>/dev/null && pwd)/$(basename "$self")"
 
-first_usb_mount(){
-    awk '$2 ~ "^/tmp/mnt/" {print $2; exit}' /proc/mounts 2>/dev/null
-}
+    test "$(basename "$INSTALLER_PATH")" = "install.sh" || {
+        fail "Установщик должен называться строго install.sh"
+        return 1
+    }
 
-fs_for_mountpoint(){
-    mp="$1"
-    awk -v m="$mp" '$2==m {print $3; exit}' /proc/mounts 2>/dev/null
+    USB_MOUNT="$(dirname "$INSTALLER_PATH")"
+    case "$USB_MOUNT" in
+        /tmp/mnt/*) ;;
+        *)
+            fail "install.sh должен лежать в корне USB: /tmp/mnt/<mount>/install.sh"
+            echo "Сейчас: $INSTALLER_PATH"
+            return 1
+            ;;
+    esac
+
+    USB_DEVICE="$(awk -v m="$USB_MOUNT" '$2==m && $1 ~ "^/dev/sd" {print $1; exit}' /proc/mounts 2>/dev/null)"
+    if test -z "$USB_DEVICE"; then
+        USB_DEVICE="$(df -P "$USB_MOUNT" 2>/dev/null | awk 'NR==2 && $1 ~ "^/dev/sd" {print $1; exit}')"
+    fi
+    case "$USB_DEVICE" in
+        /dev/sd*[0-9]) ;;
+        *)
+            fail "Не удалось связать $USB_MOUNT с реальным USB-разделом /dev/sdXN"
+            return 1
+            ;;
+    esac
+
+    USB_DISK="$(printf '%s\n' "$USB_DEVICE" | sed 's/[0-9][0-9]*$//')"
+    USB_NAME="${USB_MOUNT##*/}"
+    USB_FS="$(awk -v d="$USB_DEVICE" '$1==d {print $3; exit}' /proc/mounts 2>/dev/null)"
+
+    test -n "$USB_FS" || { fail "Не удалось определить filesystem для $USB_MOUNT"; return 1; }
+    test -w "$USB_MOUNT" || { fail "USB mountpoint не доступен на запись: $USB_MOUNT"; return 1; }
+
+    return 0
 }
 
 legacy_preflight_before_dm(){
     legacy_hw_detect || return 0
 
-    if test -n "${INSTALL_ROOT:-}"; then
-        mp="$INSTALL_ROOT"
-    else
-        count="$(mounted_usb_count)"
-        case "$count" in
-            0)
-                warn "USB-флешка не смонтирована в /tmp/mnt"
-                echo "Подключи USB-флешку и повтори установку."
-                return 1
-                ;;
-            1)
-                mp="$(first_usb_mount)"
-                ;;
-            *)
-                fail "Найдено несколько USB mountpoint. Укажи INSTALL_ROOT=/tmp/mnt/МЕТКА"
-                return 1
-                ;;
-        esac
-    fi
-
-    fs="$(fs_for_mountpoint "$mp")"
-    test -n "$fs" || {
-        warn "Не удалось определить filesystem для $mp"
-        return 1
-    }
-
+    fs="$USB_FS"
     case "$fs" in
         ext3)
-            ok "USB filesystem: EXT3 ($mp)"
+            ok "USB filesystem: EXT3 ($USB_MOUNT)"
             return 0
             ;;
         *)
             echo
-            warn "USB filesystem: $fs ($mp)"
-            echo
-            echo "Для RT-AC68U legacy-схема GoshaCrash + Download Master/Optware"
-            echo "требует EXT3. Текущая файловая система будет ломать Unix symlink."
-            echo
-            echo "Подготовить эту флешку можно самим install.sh:"
-            echo
-            echo "  повторно запусти этот installer с аргументом --prepare-usb"
-            echo
-            echo "ВНИМАНИЕ: форматирование удалит ВСЕ данные и Download Master."
-            echo "После EXT3 установи Download Master через ASUS заново,"
-            echo "а затем снова запусти обычный install.sh."
-            echo
-            fail "Установка остановлена: сначала нужна EXT3"
+            warn "USB filesystem: $fs ($USB_MOUNT)"
+            echo "Для RT-AC68U legacy-схема GoshaCrash + Download Master/Optware требует EXT3."
+            echo "Форматирование выполняется отдельной программой; install.sh диски не форматирует."
+            fail "Установка остановлена: для legacy требуется EXT3"
             return 1
             ;;
     esac
 }
 
 find_download_master(){
-    if test -n "${INSTALL_ROOT:-}"; then
-        USB_MOUNT="$INSTALL_ROOT"
-        test -d "$USB_MOUNT" || { fail "INSTALL_ROOT не существует: $USB_MOUNT"; return 1; }
-        for d in "$USB_MOUNT/asusware.arm" "$USB_MOUNT/asusware.arm64" "$USB_MOUNT/asusware"; do
-            test -d "$d" && { DM_ROOT="$d"; return 0; }
-        done
-        fail "На $USB_MOUNT не найден Download Master (asusware.arm/asusware.arm64/asusware)"
-        return 1
-    fi
+    test -n "$USB_MOUNT" && test -d "$USB_MOUNT" || return 1
 
-    count=0
-    for mount in /tmp/mnt/*; do
-        test -d "$mount" || continue
-        test -w "$mount" || continue
-        for d in "$mount/asusware.arm" "$mount/asusware.arm64" "$mount/asusware"; do
-            test -d "$d" || continue
-            count=$((count + 1))
-            USB_MOUNT="$mount"
-            DM_ROOT="$d"
-            break
-        done
+    DM_ROOT=""
+    DM_LAYOUT=""
+    for d in "$USB_MOUNT/asusware.arm" "$USB_MOUNT/asusware.arm64" "$USB_MOUNT/asusware"; do
+        test -d "$d" || continue
+        DM_ROOT="$d"
+        DM_LAYOUT="${d##*/}"
+        return 0
     done
 
-    test "$count" -eq 1 && return 0
-    if test "$count" -gt 1; then
-        fail "Найдено несколько флешек с Download Master. Укажи INSTALL_ROOT=/tmp/mnt/МЕТКА"
-    else
-        fail "Download Master не найден. Установи его через веб-интерфейс ASUS на USB-флешку"
-    fi
+    fail "На выбранной флешке $USB_MOUNT не найден Download Master (asusware.arm/asusware.arm64/asusware)"
+    echo "Сначала установи Download Master через веб-интерфейс ASUS именно на эту флешку."
     return 1
 }
 
@@ -1625,7 +1194,12 @@ install_sftp_wrapper(){
     cat > "$current" <<'SFTPWRAP'
 #!/bin/sh
 DM_ROOT="$(readlink /tmp/opt 2>/dev/null)"
-test -n "$DM_ROOT" || DM_ROOT=/tmp/mnt/SANDISK/asusware.arm
+if test -z "$DM_ROOT"; then
+  for d in /tmp/mnt/*/asusware.arm /tmp/mnt/*/asusware.arm64 /tmp/mnt/*/asusware; do
+    test -d "$d" && { DM_ROOT="$d"; break; }
+  done
+fi
+test -n "$DM_ROOT" || exit 1
 OVERLAY=/tmp/goshacrash-opt/lib
 LD_LIBRARY_PATH="$OVERLAY:$DM_ROOT/lib:/lib:/usr/lib" exec "$DM_ROOT/libexec/sftp-server.real" "$@"
 SFTPWRAP
@@ -1689,7 +1263,7 @@ detect_usb_fstype(){
     # Several parent mounts can match the same path:
     #   /                  -> rootfs
     #   /tmp               -> tmpfs
-    #   /tmp/mnt/SANDISK   -> ext3
+    #   /tmp/mnt/<current> -> ext3/ext4
     # Always choose the longest matching mountpoint.
     mount 2>/dev/null | awk -v p="$usb_mount" '
         {
@@ -2030,7 +1604,9 @@ controller_file_matches(){
     test -s "$file" || return 1
     test "$(sed -n '1p' "$file" 2>/dev/null)" = '#!/bin/sh' || return 1
     version="$(awk -F'"' '/^VERSION="/ {print $2; exit}' "$file" 2>/dev/null)"
-    test "$version" = "$INSTALLER_VERSION"
+    build_id="$(awk -F'"' '/^BUILD_ID="/ {print $2; exit}' "$file" 2>/dev/null)"
+    test "$version" = "$INSTALLER_VERSION" || return 1
+    test "$build_id" = "$EXPECTED_CONTROLLER_BUILD_ID"
 }
 
 fetch_matching_controller(){
@@ -2047,7 +1623,9 @@ fetch_matching_controller(){
                 return 0
             fi
             got="$(awk -F'"' '/^VERSION="/ {print $2; exit}' "$out" 2>/dev/null)"
-            warn "Источник отдал другую версию goshacrash.sh: ${got:-unknown}; нужен $INSTALLER_VERSION"
+            got_build="$(awk -F'"' '/^BUILD_ID="/ {print $2; exit}' "$out" 2>/dev/null)"
+            warn "Источник отдал несовместимый goshacrash.sh: version=${got:-unknown}, build=${got_build:-unknown}"
+            warn "Нужны version=$INSTALLER_VERSION, build=$EXPECTED_CONTROLLER_BUILD_ID"
         else
             warn "Источник недоступен: $url"
         fi
@@ -2106,27 +1684,6 @@ install_network_helper(){
     chmod 755 "$BASE/bin/gcnet" || return 1
     GCNET_BIN="$BASE/bin/gcnet"
     say "Установлен совместимый legacy network helper: $GCNET_BIN"
-}
-
-generate_dashboard_secret(){
-    secret=""
-    if test -r /dev/urandom; then
-        od_bin=""
-        for p in /usr/bin/od /bin/od /usr/sbin/od /sbin/od; do
-            test -x "$p" && { od_bin="$p"; break; }
-        done
-        hex_bin=""
-        for p in /usr/bin/hexdump /bin/hexdump /usr/sbin/hexdump /sbin/hexdump; do
-            test -x "$p" && { hex_bin="$p"; break; }
-        done
-        if test -n "$od_bin"; then
-            secret="$("$od_bin" -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
-        elif test -n "$hex_bin"; then
-            secret="$("$hex_bin" -n 16 -e '16/1 "%02x"' /dev/urandom 2>/dev/null)"
-        fi
-    fi
-    test -n "$secret" || secret="GC$(date +%s 2>/dev/null)$$"
-    printf '%s\n' "$secret"
 }
 
 yaml_top_raw_install(){
@@ -2308,18 +1865,9 @@ yaml_remove_top_key(){
     mv -f "$tmp" "$file"
 }
 
-ensure_dashboard_secret(){
+remove_dashboard_secret(){
     file="$1"
-    raw="$(yaml_top_raw_install "$file" secret)"
-    current="$(yaml_scalar_clean_install "$raw")"
-    case "$current" in
-      ''|CHANGE_ME|null|Null|NULL|'~')
-        secret="$(generate_dashboard_secret)"
-        test -n "$secret" || return 1
-        yaml_set_top_key "$file" secret "\"$secret\"" || return 1
-        say "Для Zashboard создан уникальный локальный secret"
-        ;;
-    esac
+    yaml_remove_top_key "$file" secret
 }
 
 configure_routing_in_config(){
@@ -2337,12 +1885,12 @@ configure_routing_in_config(){
     yaml_top_section_exists_install "$file" tun || append_default_tun_section "$file" || return 1
     yaml_top_section_exists_install "$file" dns || append_default_dns_section "$file" || return 1
 
-    # GoshaCrash-owned API/UI fields. Zashboard is served by this Mihomo core,
-    # therefore the controller must be reachable from LAN and protected.
+    # GoshaCrash-owned API/UI fields. Zashboard is LAN-local and intentionally
+    # has no Mihomo API secret in this project profile.
     yaml_set_top_key "$file" external-controller 0.0.0.0:9090 || return 1
     yaml_set_top_key "$file" external-ui ui || return 1
     yaml_set_top_key "$file" external-ui-url "\"$ZASHBOARD_PRIMARY\"" || return 1
-    ensure_dashboard_secret "$file" || return 1
+    remove_dashboard_secret "$file" || return 1
 
     # Runtime-owned TUN/DNS fields. User proxies, groups, rules and DNS resolver
     # lists are intentionally preserved.
@@ -2421,10 +1969,10 @@ utf8_validate_file_install(){
 
 strip_whole_line_comments_install(){
     src="$1"; dst="$2"
-    # Old comments are not configuration. Remove them byte-for-byte before any
-    # AWK migration so a CP1251/broken comment can never poison a UTF-8 YAML.
-    # LC_ALL=C is intentional: treat the file as bytes, not locale text.
-    LC_ALL=C awk '!/^[[:space:]]*#/' "$src" > "$dst"
+    # Diagnostic helper only: build a temporary data-only copy when Mihomo
+    # reports invalid UTF-8, so we can distinguish broken comments from broken
+    # YAML data without modifying the user's real config.
+    LC_ALL=C tr -d '\015' < "$src" | LC_ALL=C awk '!/^[[:space:]]*#/' > "$dst"
 }
 
 # Emit UTF-8 deterministically from an ASCII-only shell string. Non-ASCII
@@ -2434,90 +1982,9 @@ utf8_print_install(){
     printf '%b\n' "$1"
 }
 
-write_config_header_comments_install(){
-    utf8_print_install '# GoshaCrash \0342\0200\0224 \0320\0272\0320\0276\0320\0275\0321\0204\0320\0270\0320\0263\0321\0203\0321\0200\0320\0260\0321\0206\0320\0270\0321\0217 Mihomo.'
-    utf8_print_install '# \0320\0232\0320\0276\0320\0264\0320\0270\0321\0200\0320\0276\0320\0262\0320\0272\0320\0260 \0321\0204\0320\0260\0320\0271\0320\0273\0320\0260: UTF-8 \0320\0261\0320\0265\0320\0267 BOM.'
-    utf8_print_install '# \0320\0241\0320\0273\0321\0203\0320\0266\0320\0265\0320\0261\0320\0275\0321\0213\0320\0265 \0320\0277\0320\0276\0320\0273\0321\0217 TUN, DNS, API \0320\0270 Zashboard \0320\0277\0320\0276\0320\0264\0320\0264\0320\0265\0321\0200\0320\0266\0320\0270\0320\0262\0320\0260\0321\0216\0321\0202\0321\0201\0321\0217 GoshaCrash.'
-    utf8_print_install '# \0320\0237\0320\0276\0320\0273\0321\0214\0320\0267\0320\0276\0320\0262\0320\0260\0321\0202\0320\0265\0320\0273\0321\0214\0321\0201\0320\0272\0320\0270\0320\0265 proxies, proxy-groups, rule-providers \0320\0270 rules \0321\0201\0320\0276\0321\0205\0321\0200\0320\0260\0320\0275\0321\0217\0321\0216\0321\0202\0321\0201\0321\0217.'
-}
-
-# Add our comments only after all structural YAML rewrites are finished.
-# This keeps every migration pass ASCII/data-only and prevents a tiny ASUS
-# awk/locale implementation from ever touching Cyrillic bytes.
-decorate_config_comments_install(){
-    src="$1"; dst="$2"
-    : > "$dst" || return 1
-    write_config_header_comments_install >> "$dst" || return 1
-    section=""
-    seen_api=0; seen_profile=0; seen_ports=0; seen_dns=0; seen_tun=0
-    seen_proxies=0; seen_groups=0; seen_providers=0; seen_rules=0; seen_mark=0
-    while IFS= read -r line || test -n "$line"; do
-        case "$line" in [![:space:]]*) section="" ;; esac
-        case "$line" in
-          external-controller:*)
-            if test "$seen_api" = 0; then printf '\n' >> "$dst" || return 1
-                utf8_print_install '# API Mihomo \0320\0264\0320\0273\0321\0217 Zashboard. \0320\0224\0320\0276\0321\0201\0321\0202\0321\0203\0320\0277\0320\0265\0320\0275 \0320\0270\0320\0267 \0320\0273\0320\0276\0320\0272\0320\0260\0320\0273\0321\0214\0320\0275\0320\0276\0320\0271 \0321\0201\0320\0265\0321\0202\0320\0270 \0320\0270 \0320\0267\0320\0260\0321\0211\0320\0270\0321\0211\0321\0221\0320\0275 secret.' >> "$dst" || return 1
-                seen_api=1; fi ;;
-          profile:*) section="profile"; if test "$seen_profile" = 0; then printf '\n' >> "$dst" || return 1
-                utf8_print_install '# \0320\0241\0320\0276\0321\0205\0321\0200\0320\0260\0320\0275\0321\0217\0321\0202\0321\0214 \0320\0262\0321\0213\0320\0261\0321\0200\0320\0260\0320\0275\0320\0275\0321\0213\0320\0265 \0320\0277\0321\0200\0320\0276\0320\0272\0321\0201\0320\0270 \0320\0270 \0321\0202\0320\0260\0320\0261\0320\0273\0320\0270\0321\0206\0321\0203 Fake-IP \0320\0274\0320\0265\0320\0266\0320\0264\0321\0203 \0320\0277\0320\0265\0321\0200\0320\0265\0320\0267\0320\0260\0320\0277\0321\0203\0321\0201\0320\0272\0320\0260\0320\0274\0320\0270 Mihomo.' >> "$dst" || return 1
-                seen_profile=1; fi ;;
-          mixed-port:*) if test "$seen_ports" = 0; then printf '\n' >> "$dst" || return 1
-                utf8_print_install '# \0320\0233\0320\0276\0320\0272\0320\0260\0320\0273\0321\0214\0320\0275\0321\0213\0320\0271 mixed-\0320\0277\0320\0276\0321\0200\0321\0202 (HTTP/SOCKS) \0320\0270 \0320\0276\0321\0201\0320\0275\0320\0276\0320\0262\0320\0275\0321\0213\0320\0265 \0320\0277\0320\0260\0321\0200\0320\0260\0320\0274\0320\0265\0321\0202\0321\0200\0321\0213 Mihomo.' >> "$dst" || return 1
-                seen_ports=1; fi ;;
-          dns:*) section="dns"; if test "$seen_dns" = 0; then printf '\n' >> "$dst" || return 1
-                utf8_print_install '# DNS Mihomo. Fake-IP \0320\0270\0321\0201\0320\0277\0320\0276\0320\0273\0321\0214\0320\0267\0321\0203\0320\0265\0321\0202\0321\0201\0321\0217 \0320\0264\0320\0273\0321\0217 \0320\0277\0321\0200\0320\0276\0320\0267\0321\0200\0320\0260\0321\0207\0320\0275\0320\0276\0320\0271 \0320\0274\0320\0260\0321\0200\0321\0210\0321\0200\0321\0203\0321\0202\0320\0270\0320\0267\0320\0260\0321\0206\0320\0270\0320\0270 \0320\0272\0320\0273\0320\0270\0320\0265\0320\0275\0321\0202\0320\0276\0320\0262.' >> "$dst" || return 1
-                seen_dns=1; fi ;;
-          tun:*) section="tun"; if test "$seen_tun" = 0; then printf '\n' >> "$dst" || return 1
-                utf8_print_install '# \0320\0222\0320\0270\0321\0200\0321\0202\0321\0203\0320\0260\0320\0273\0321\0214\0320\0275\0321\0213\0320\0271 TUN-\0320\0270\0320\0275\0321\0202\0320\0265\0321\0200\0321\0204\0320\0265\0320\0271\0321\0201. \0320\0255\0321\0202\0320\0270 \0320\0277\0320\0260\0321\0200\0320\0260\0320\0274\0320\0265\0321\0202\0321\0200\0321\0213 \0320\0272\0320\0276\0320\0275\0321\0202\0321\0200\0320\0276\0320\0273\0320\0270\0321\0200\0321\0203\0320\0265\0321\0202 GoshaCrash.' >> "$dst" || return 1
-                seen_tun=1; fi ;;
-          proxies:*) section="proxies"; if test "$seen_proxies" = 0; then printf '\n' >> "$dst" || return 1
-                utf8_print_install '# \0320\0237\0321\0200\0320\0276\0320\0272\0321\0201\0320\0270-\0321\0201\0320\0265\0321\0200\0320\0262\0320\0265\0321\0200\0321\0213 \0320\0277\0320\0276\0320\0273\0321\0214\0320\0267\0320\0276\0320\0262\0320\0260\0321\0202\0320\0265\0320\0273\0321\0217.' >> "$dst" || return 1
-                seen_proxies=1; fi ;;
-          proxy-groups:*) section="proxy-groups"; if test "$seen_groups" = 0; then printf '\n' >> "$dst" || return 1
-                utf8_print_install '# \0320\0223\0321\0200\0321\0203\0320\0277\0320\0277\0321\0213 \0320\0277\0321\0200\0320\0276\0320\0272\0321\0201\0320\0270 \0320\0277\0320\0276\0320\0273\0321\0214\0320\0267\0320\0276\0320\0262\0320\0260\0321\0202\0320\0265\0320\0273\0321\0217.' >> "$dst" || return 1
-                seen_groups=1; fi ;;
-          rule-providers:*) section="rule-providers"; if test "$seen_providers" = 0; then printf '\n' >> "$dst" || return 1
-                utf8_print_install '# \0320\0237\0321\0200\0320\0276\0320\0262\0320\0260\0320\0271\0320\0264\0320\0265\0321\0200\0321\0213 \0320\0277\0321\0200\0320\0260\0320\0262\0320\0270\0320\0273 \0320\0277\0320\0276\0320\0273\0321\0214\0320\0267\0320\0276\0320\0262\0320\0260\0321\0202\0320\0265\0320\0273\0321\0217.' >> "$dst" || return 1
-                seen_providers=1; fi ;;
-          rules:*) section="rules"; if test "$seen_rules" = 0; then printf '\n' >> "$dst" || return 1
-                utf8_print_install '# \0320\0237\0321\0200\0320\0260\0320\0262\0320\0270\0320\0273\0320\0260 \0320\0274\0320\0260\0321\0200\0321\0210\0321\0200\0321\0203\0321\0202\0320\0270\0320\0267\0320\0260\0321\0206\0320\0270\0320\0270. \0320\0237\0320\0276\0321\0200\0321\0217\0320\0264\0320\0276\0320\0272 \0320\0277\0321\0200\0320\0260\0320\0262\0320\0270\0320\0273 \0320\0270\0320\0274\0320\0265\0320\0265\0321\0202 \0320\0267\0320\0275\0320\0260\0321\0207\0320\0265\0320\0275\0320\0270\0320\0265.' >> "$dst" || return 1
-                seen_rules=1; fi ;;
-          routing-mark:*) if test "$seen_mark" = 0; then printf '\n' >> "$dst" || return 1
-                utf8_print_install '# \0320\0234\0320\0265\0321\0202\0320\0272\0320\0260 \0320\0270\0321\0201\0321\0205\0320\0276\0320\0264\0321\0217\0321\0211\0320\0270\0321\0205 \0321\0201\0320\0276\0320\0265\0320\0264\0320\0270\0320\0275\0320\0265\0320\0275\0320\0270\0320\0271 Mihomo \0320\0264\0320\0273\0321\0217 \0321\0200\0321\0203\0321\0207\0320\0275\0320\0276\0320\0271 policy routing.' >> "$dst" || return 1
-                seen_mark=1; fi ;;
-        esac
-        case "$section|$line" in
-          'dns|  enhanced-mode:'*)
-            utf8_print_install '  # Fake-IP \0320\0277\0320\0276\0320\0267\0320\0262\0320\0276\0320\0273\0321\0217\0320\0265\0321\0202 Mihomo \0320\0277\0321\0200\0320\0276\0320\0267\0321\0200\0320\0260\0321\0207\0320\0275\0320\0276 \0321\0201\0320\0276\0320\0277\0320\0276\0321\0201\0321\0202\0320\0260\0320\0262\0320\0273\0321\0217\0321\0202\0321\0214 DNS-\0320\0276\0321\0202\0320\0262\0320\0265\0321\0202\0321\0213 \0321\0201 \0321\0201\0320\0276\0320\0265\0320\0264\0320\0270\0320\0275\0320\0265\0320\0275\0320\0270\0321\0217\0320\0274\0320\0270.' >> "$dst" || return 1
-            ;;
-          'dns|  default-nameserver:'*)
-            utf8_print_install '  # DNS \0320\0264\0320\0273\0321\0217 \0320\0275\0320\0260\0321\0207\0320\0260\0320\0273\0321\0214\0320\0275\0320\0276\0320\0263\0320\0276 \0321\0200\0320\0260\0320\0267\0321\0200\0320\0265\0321\0210\0320\0265\0320\0275\0320\0270\0321\0217 \0320\0270\0320\0274\0321\0221\0320\0275 \0320\0264\0320\0276 \0320\0267\0320\0260\0320\0277\0321\0203\0321\0201\0320\0272\0320\0260 \0320\0276\0321\0201\0320\0275\0320\0276\0320\0262\0320\0275\0320\0276\0320\0271 DNS-\0320\0273\0320\0276\0320\0263\0320\0270\0320\0272\0320\0270.' >> "$dst" || return 1
-            ;;
-          'dns|  nameserver:'*)
-            utf8_print_install '  # \0320\0236\0321\0201\0320\0275\0320\0276\0320\0262\0320\0275\0321\0213\0320\0265 DNS-\0321\0201\0320\0265\0321\0200\0320\0262\0320\0265\0321\0200\0321\0213.' >> "$dst" || return 1
-            ;;
-          'tun|  auto-route:'*)
-            utf8_print_install '  # \0320\0220\0320\0262\0321\0202\0320\0276\0320\0274\0320\0260\0321\0202\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270 \0321\0201\0320\0276\0320\0267\0320\0264\0320\0260\0320\0262\0320\0260\0321\0202\0321\0214 \0321\0201\0320\0270\0321\0201\0321\0202\0320\0265\0320\0274\0320\0275\0321\0213\0320\0265 \0320\0274\0320\0260\0321\0200\0321\0210\0321\0200\0321\0203\0321\0202\0321\0213 \0320\0264\0320\0273\0321\0217 TUN.' >> "$dst" || return 1
-            ;;
-          'tun|  auto-redirect:'*)
-            utf8_print_install '  # \0320\0220\0320\0262\0321\0202\0320\0276\0320\0274\0320\0260\0321\0202\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270 \0320\0275\0320\0260\0321\0201\0321\0202\0321\0200\0320\0260\0320\0270\0320\0262\0320\0260\0321\0202\0321\0214 \0320\0277\0321\0200\0320\0276\0320\0267\0321\0200\0320\0260\0321\0207\0320\0275\0321\0213\0320\0271 TCP/UDP-\0320\0277\0320\0265\0321\0200\0320\0265\0321\0205\0320\0262\0320\0260\0321\0202 \0320\0275\0320\0260 Linux.' >> "$dst" || return 1
-            ;;
-          'tun|  auto-detect-interface:'*)
-            utf8_print_install '  # \0320\0220\0320\0262\0321\0202\0320\0276\0320\0274\0320\0260\0321\0202\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270 \0320\0276\0320\0277\0321\0200\0320\0265\0320\0264\0320\0265\0320\0273\0321\0217\0321\0202\0321\0214 \0321\0204\0320\0270\0320\0267\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270\0320\0271 \0320\0270\0320\0275\0321\0202\0320\0265\0321\0200\0321\0204\0320\0265\0320\0271\0321\0201 \0320\0262\0321\0213\0321\0205\0320\0276\0320\0264\0320\0260 \0320\0262 \0320\0270\0320\0275\0321\0202\0320\0265\0321\0200\0320\0275\0320\0265\0321\0202.' >> "$dst" || return 1
-            ;;
-          'tun|  dns-hijack:'*)
-            utf8_print_install '  # \0320\0237\0320\0265\0321\0200\0320\0265\0321\0205\0320\0262\0320\0260\0321\0202\0321\0213\0320\0262\0320\0260\0321\0202\0321\0214 \0320\0276\0320\0261\0321\0213\0321\0207\0320\0275\0321\0213\0320\0265 DNS-\0320\0267\0320\0260\0320\0277\0321\0200\0320\0276\0321\0201\0321\0213 \0320\0272\0320\0273\0320\0270\0320\0265\0320\0275\0321\0202\0320\0276\0320\0262 \0321\0207\0320\0265\0321\0200\0320\0265\0320\0267 TUN.' >> "$dst" || return 1
-            ;;
-        esac
-        printf '%s\n' "$line" >> "$dst" || return 1
-    done < "$src"
-    return 0
-}
-
 generate_base_config(){
-    file="$1"
-    secret="$(generate_dashboard_secret)"
-    test -n "$secret" || { fail "Не удалось создать secret для Zashboard"; return 1; }
+    gbc_file="$1"
+    file="$gbc_file"
     if test "$ROUTING_MODE" = manual; then cfg_auto_route=false; cfg_auto_redirect=false; cfg_auto_detect=false
     else cfg_auto_route=true; cfg_auto_redirect=true; cfg_auto_detect=true; fi
     : > "$file" || return 1
@@ -2530,7 +1997,6 @@ generate_base_config(){
     utf8_print_install '# API Mihomo \0320\0264\0320\0273\0321\0217 Zashboard. \0320\0224\0320\0276\0321\0201\0321\0202\0321\0203\0320\0277\0320\0265\0320\0275 \0320\0270\0320\0267 \0320\0273\0320\0276\0320\0272\0320\0260\0320\0273\0321\0214\0320\0275\0320\0276\0320\0271 \0321\0201\0320\0265\0321\0202\0320\0270 \0320\0270 \0320\0267\0320\0260\0321\0211\0320\0270\0321\0211\0321\0221\0320\0275 \0321\0203\0320\0275\0320\0270\0320\0272\0320\0260\0320\0273\0321\0214\0320\0275\0321\0213\0320\0274 secret.' >> "$file" || return 1
     cat >> "$file" <<EOF
 external-controller: 0.0.0.0:9090
-secret: "$secret"
 external-ui: ui
 external-ui-url: "$ZASHBOARD_PRIMARY"
 
@@ -2609,10 +2075,14 @@ rules:
 EOF
     if test "$ROUTING_MODE" = manual; then
         printf '\n' >> "$file" || return 1
-        utf8_print_install '# \0320\0234\0320\0265\0321\0202\0320\0272\0320\0260 \0320\0270\0321\0201\0321\0205\0320\0276\0320\0264\0321\0217\0321\0211\0320\0270\0321\0205 \0321\0201\0320\0276\0320\0265\0320\0264\0320\0270\0320\0275\0320\0265\0320\0275\0320\0270\0320\0271 Mihomo \0320\0264\0320\0273\0321\0217 \0321\0200\0321\0203\0321\0207\0320\0275\0320\0276\0320\0271 policy routing.' >> "$file" || return 1
         printf 'routing-mark: 9012\n' >> "$file" || return 1
     fi
-    chmod 600 "$file" 2>/dev/null || true
+
+    # Keep the generated UTF-8 comments intact.  The nano wrapper and gc edit
+    # always run nano with a real UTF-8 locale on the tested ASUSWRT/Optware
+    # stack, so Cyrillic comments no longer need to be stripped or rewritten.
+    yaml_remove_top_key "$gbc_file" secret || return 1
+    chmod 600 "$gbc_file" 2>/dev/null || true
     return 0
 }
 
@@ -2663,16 +2133,19 @@ install_configs(){
         CONFIG_ROLLBACK_TMP="$TMP_ROOT/config-before-migration.yaml"
         cp -f "$ACTIVE_CONFIG" "$CONFIG_ROLLBACK_TMP" || return 1
         CONFIG_MIGRATION_PENDING="1"
-        say "Существующий $ACTIVE_CONFIG сохранён; YAML-данные остаются, комментарии будут заново созданы в UTF-8"
+        say "Существующий $ACTIVE_CONFIG сохранён; UTF-8 комментарии и YAML-данные пользователя сохраняются"
 
-        clean="$TMP_ROOT/config-data-no-comments.$$"
-        if ! strip_whole_line_comments_install "$ACTIVE_CONFIG" "$clean"; then
+        # Normalize only Windows CRLF -> LF.  Do not remove or rewrite UTF-8
+        # comments: nano is launched with LANG/LC_ALL=en_US.UTF-8.
+        normalized="$TMP_ROOT/config-normalized.$$"
+        if ! LC_ALL=C tr -d '\015' < "$ACTIVE_CONFIG" > "$normalized"; then
             cp -f "$CONFIG_ROLLBACK_TMP" "$ACTIVE_CONFIG" 2>/dev/null || true
             CONFIG_MIGRATION_PENDING="0"
-            fail "Не удалось удалить старые строки-комментарии из config.yaml"
+            rm -f "$normalized" 2>/dev/null || true
+            fail "Не удалось нормализовать окончания строк config.yaml"
             return 1
         fi
-        mv -f "$clean" "$ACTIVE_CONFIG" || return 1
+        mv -f "$normalized" "$ACTIVE_CONFIG" || return 1
 
         if ! configure_routing_in_config "$ACTIVE_CONFIG"; then
             cp -f "$CONFIG_ROLLBACK_TMP" "$ACTIVE_CONFIG" 2>/dev/null || true
@@ -2681,14 +2154,6 @@ install_configs(){
             return 1
         fi
 
-        decorated="$TMP_ROOT/config-decorated.$$"
-        if ! decorate_config_comments_install "$ACTIVE_CONFIG" "$decorated"; then
-            cp -f "$CONFIG_ROLLBACK_TMP" "$ACTIVE_CONFIG" 2>/dev/null || true
-            CONFIG_MIGRATION_PENDING="0"
-            fail "Не удалось создать русские UTF-8 комментарии config.yaml"
-            return 1
-        fi
-        mv -f "$decorated" "$ACTIVE_CONFIG" || return 1
         chmod 600 "$ACTIVE_CONFIG" 2>/dev/null || true
     fi
 }
@@ -3066,37 +2531,67 @@ remove_legacy_hook_lines(){
 
 write_command_wrapper(){
     dst="$1"
-    cat > "$dst" <<WRAP
+    cat > "$dst" <<'WRAP'
 #!/bin/sh
-BASE='$BASE'
-/bin/busybox test -x "\$BASE/goshacrash.sh" || { echo "GoshaCrash не найден на USB" >&2; exit 1; }
-GOSHACRASH_BASE="\$BASE"
+resolve_gc_base(){
+  if /bin/busybox test -s /tmp/goshacrash-base; then
+    b="$(cat /tmp/goshacrash-base 2>/dev/null)"
+    /bin/busybox test -x "$b/goshacrash.sh" && { printf '%s\n' "$b"; return 0; }
+  fi
+  count=0
+  found=""
+  for b in /tmp/mnt/*/goshacrash; do
+    /bin/busybox test -x "$b/goshacrash.sh" || continue
+    count=$((count + 1))
+    found="$b"
+  done
+  /bin/busybox test "$count" -eq 1 || return 1
+  printf '%s\n' "$found"
+}
+BASE="$(resolve_gc_base)" || { echo "GoshaCrash: не удалось однозначно найти USB" >&2; exit 1; }
+printf '%s\n' "$BASE" > /tmp/goshacrash-base 2>/dev/null || true
+GOSHACRASH_BASE="$BASE"
 export GOSHACRASH_BASE
-exec /bin/sh "\$BASE/goshacrash.sh" "\$@"
+exec /bin/sh "$BASE/goshacrash.sh" "$@"
 WRAP
     chmod 755 "$dst"
 }
 
 write_nano_wrapper(){
     dst="$1"
-    cat > "$dst" <<WRAP
+    cat > "$dst" <<'WRAP'
 #!/bin/sh
-BASE='$BASE'
+resolve_gc_base(){
+  if /bin/busybox test -s /tmp/goshacrash-base; then
+    b="$(cat /tmp/goshacrash-base 2>/dev/null)"
+    /bin/busybox test -x "$b/goshacrash.sh" && { printf '%s\n' "$b"; return 0; }
+  fi
+  count=0; found=""
+  for b in /tmp/mnt/*/goshacrash; do
+    /bin/busybox test -x "$b/goshacrash.sh" || continue
+    count=$((count + 1)); found="$b"
+  done
+  /bin/busybox test "$count" -eq 1 || return 1
+  printf '%s\n' "$found"
+}
+BASE="$(resolve_gc_base)" || { echo "nano: GoshaCrash USB не найден" >&2; exit 1; }
+USB_MOUNT="$(dirname "$BASE")"
 DM_ROOT=""
-unset LC_ALL 2>/dev/null || true
-/bin/busybox test -f "\$BASE/state/platform.env" && . "\$BASE/state/platform.env"
-case "\${LC_CTYPE:-\${LANG:-}}" in
-  *UTF-8*|*utf8*|*UTF8*) : ;;
-  *) LANG=\${GOSHACRASH_EDITOR_LOCALE:-en_US.UTF-8}; LC_CTYPE="\$LANG" ;;
-esac
-TERM=\${GOSHACRASH_EDITOR_TERM:-\${TERM:-xterm-256color}}
-NCURSES_NO_UTF8_ACS=1
-LD_LIBRARY_PATH="/tmp/goshacrash-opt/lib:\$DM_ROOT/lib:/lib:/usr/lib"
-export LANG LC_CTYPE TERM NCURSES_NO_UTF8_ACS LD_LIBRARY_PATH
-# Prefer the persistent USB binary directly.  Editing must not depend on the
-# whole /opt bind namespace being healthy.
-for p in "\$DM_ROOT/bin/nano" "\$DM_ROOT/sbin/nano" /tmp/opt/bin/nano /opt/bin/nano; do
-  /bin/busybox test -x "\$p" && exec "\$p" "\$@"
+for d in "$USB_MOUNT/asusware.arm" "$USB_MOUNT/asusware.arm64" "$USB_MOUNT/asusware"; do
+  /bin/busybox test -d "$d" && { DM_ROOT="$d"; break; }
+done
+/bin/busybox test -n "$DM_ROOT" || { echo "nano: Download Master не найден на $USB_MOUNT" >&2; exit 1; }
+
+# Tested fix for Optware nano 3.1 on BT10: keep the editor in a UTF-8 locale.
+# These values are also persisted by install_hooks(), but the wrapper exports
+# them explicitly so nano works immediately and independently of SSH profile loading.
+LANG=en_US.UTF-8
+LC_ALL=en_US.UTF-8
+TERM=${GOSHACRASH_EDITOR_TERM:-${TERM:-xterm-256color}}
+LD_LIBRARY_PATH="/tmp/goshacrash-opt/lib:$DM_ROOT/lib:/lib:/usr/lib"
+export LANG LC_ALL TERM LD_LIBRARY_PATH
+for p in "$DM_ROOT/bin/nano" "$DM_ROOT/sbin/nano" /tmp/opt/bin/nano /opt/bin/nano; do
+  /bin/busybox test -x "$p" && exec "$p" "$@"
 done
 echo "nano не найден. Установи nano через пакетный менеджер Download Master" >&2
 exit 1
@@ -3230,8 +2725,8 @@ install_hooks(){
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
-BASE="__GC_BASE__"
 MOUNT_POINT="$2"
+BASE="$MOUNT_POINT/goshacrash"
 TRACE="$BASE/logs/coldboot.log"
 TMP_TRACE=/tmp/goshacrash-coldboot.log
 WAITED=0
@@ -3240,10 +2735,8 @@ trace(){
   printf '[%s] [usb-mount pid=%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$*" >> "$TRACE" 2>/dev/null || true
 }
 
-case "$BASE" in
-  "$MOUNT_POINT"/*) ;;
-  *) exit 0 ;;
-esac
+test -x "$BASE/goshacrash.sh" || exit 0
+printf '%s\n' "$BASE" > /tmp/goshacrash-base 2>/dev/null || true
 
 mkdir -p "$BASE/logs" "$BASE/run" "$BASE/state" 2>/dev/null || true
 if test -s "$TMP_TRACE"; then
@@ -3307,8 +2800,6 @@ fi
 trace "boot worker launched pid=$!"
 exit 0
 HOOK
-    hook_base_esc="$(printf '%s' "$BASE" | sed 's/[\\&#]/\\&/g')"
-    sed -i "s#__GC_BASE__#$hook_base_esc#g" /jffs/scripts/usb-mount-script || return 1
     chmod 755 /jffs/scripts/usb-mount-script || return 1
 
     cat > /jffs/scripts/usb-umount-script <<'HOOK'
@@ -3317,49 +2808,48 @@ HOOK
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
-BASE="__GC_BASE__"
 MOUNT_POINT="$2"
+BASE="$MOUNT_POINT/goshacrash"
 TRACE=/tmp/goshacrash-coldboot.log
 RC=0
 trace(){
   printf '[%s] [usb-umount pid=%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$*" >> "$TRACE" 2>/dev/null || true
 }
-case "$BASE" in
-  "$MOUNT_POINT"/*)
-    trace "entered device=$1 mount=$MOUNT_POINT"
-    if test -x "$BASE/goshacrash.sh"; then
-      GOSHACRASH_BASE="$BASE" /bin/sh "$BASE/goshacrash.sh" service-stop >/dev/null 2>&1 || {
-        trace "service-stop returned nonzero"
-        RC=1
-      }
-    fi
-    if test -f /tmp/goshacrash-opt-bind.state; then
-      OPTDM="$(cat /tmp/goshacrash-opt-bind.state 2>/dev/null)"
-      case "$OPTDM" in
-        "$MOUNT_POINT"/*)
-          UNMOUNTED=0
-          for u in /bin/umount /sbin/umount /usr/bin/umount /usr/sbin/umount; do
-            test -x "$u" || continue
-            if "$u" /opt >/dev/null 2>&1; then
-              UNMOUNTED=1
-              trace "/opt released"
-            else
-              trace "ERROR: /opt is still busy; refusing lazy unmount"
-              RC=1
-            fi
-            break
-          done
-          if test "$UNMOUNTED" = 1; then
-            rm -f /tmp/goshacrash-opt-bind.state 2>/dev/null || true
-          fi
-          ;;
-      esac
-    fi
-    ;;
-esac
+
+if test -x "$BASE/goshacrash.sh"; then
+  trace "entered device=$1 mount=$MOUNT_POINT"
+  GOSHACRASH_BASE="$BASE" /bin/sh "$BASE/goshacrash.sh" service-stop >/dev/null 2>&1 || {
+    trace "service-stop returned nonzero"
+    RC=1
+  }
+fi
+
+if test -f /tmp/goshacrash-opt-bind.state; then
+  OPTDM="$(cat /tmp/goshacrash-opt-bind.state 2>/dev/null)"
+  case "$OPTDM" in
+    "$MOUNT_POINT"/*)
+      UNMOUNTED=0
+      for u in /bin/umount /sbin/umount /usr/bin/umount /usr/sbin/umount; do
+        test -x "$u" || continue
+        if "$u" /opt >/dev/null 2>&1; then
+          UNMOUNTED=1
+          trace "/opt released"
+        else
+          trace "ERROR: /opt is still busy; refusing lazy unmount"
+          RC=1
+        fi
+        break
+      done
+      if test "$UNMOUNTED" = 1; then
+        rm -f /tmp/goshacrash-opt-bind.state 2>/dev/null || true
+      fi
+      ;;
+  esac
+fi
+
+rm -f /tmp/goshacrash-base 2>/dev/null || true
 exit "$RC"
 HOOK
-    sed -i "s#__GC_BASE__#$hook_base_esc#g" /jffs/scripts/usb-umount-script || return 1
     chmod 755 /jffs/scripts/usb-umount-script || return 1
 
     rm -f /jffs/scripts/gc /jffs/scripts/nano "$DM_ROOT/bin/gc" /opt/bin/gc 2>/dev/null || true
@@ -3376,6 +2866,13 @@ HOOK
 
     add_once /jffs/etc/profile 'export PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"'
     add_once /jffs/configs/profile.add 'export PATH="/jffs/scripts:/opt/bin:/opt/sbin:/tmp/opt/bin:/tmp/opt/sbin:$PATH"'
+
+    # Persist the locale across reboot/new SSH sessions.  Both locations are
+    # maintained because ASUSWRT variants source different profile hooks.
+    add_once /jffs/etc/profile 'export LANG=en_US.UTF-8'
+    add_once /jffs/etc/profile 'export LC_ALL=en_US.UTF-8'
+    add_once /jffs/configs/profile.add 'export LANG=en_US.UTF-8'
+    add_once /jffs/configs/profile.add 'export LC_ALL=en_US.UTF-8'
 
     remove_pre3712_autostart
     install_stock_usb_mount_bridge || return 1
@@ -3422,16 +2919,27 @@ MIHOMO_TARGET='$MIHOMO_TARGET'
 MIHOMO_SOURCE='$MIHOMO_SOURCE'
 MIHOMO_VERSION='$MIHOMO_VERSION_SELECTED'
 MIHOMO_URL='$MIHOMO_URL_SELECTED'
-GCNET_BIN='$GCNET_BIN'
-CONFIG_FILE='$ACTIVE_CONFIG'
-DM_ROOT='$DM_ROOT'
-PKG_PATH='$PKG'
+CONFIG_REL='config.yaml'
+GCNET_REL='bin/gcnet'
+DM_LAYOUT='${DM_ROOT##*/}'
 ROUTER_MODEL='$(nvram_get productid)'
 ROUTER_ARCH='$(uname -m 2>/dev/null)'
 ROUTER_KERNEL='$(uname -r 2>/dev/null)'
 INSTALLED_BY='$INSTALLER_VERSION'
 EOF
     chmod 600 "$BASE/state/platform.env" 2>/dev/null || true
+
+    # Human-readable last-known identity only; runtime never trusts it after reboot.
+    cat > "$BASE/state/storage.last" <<EOF
+USB_DEVICE=$USB_DEVICE
+USB_DISK=$USB_DISK
+USB_MOUNT=$USB_MOUNT
+USB_NAME=$USB_NAME
+USB_FS=$USB_FS
+DM_ROOT=$DM_ROOT
+INSTALLER_PATH=$INSTALLER_PATH
+EOF
+    chmod 600 "$BASE/state/storage.last" 2>/dev/null || true
 }
 
 save_install_log(){
@@ -3463,19 +2971,15 @@ main(){
     : > "$TMP_LOG"
 
     case "${1:-}" in
-        --prepare-usb)
-            test "$#" -eq 1 || { fail "Использование: /bin/sh install.sh --prepare-usb"; return 1; }
-            acquire_lock || return 1
-            prepare_usb_wizard
-            return $?
-            ;;
         --help|-h)
             echo "GoshaCrash installer $INSTALLER_VERSION"
             echo
             echo "Использование:"
-            echo "  /bin/sh install.sh                 установить/обновить GoshaCrash"
-            echo "  /bin/sh install.sh --prepare-usb   подготовить USB: RT-AC68U/legacy -> EXT3, BT10 -> EXT4"
-            echo "  /bin/sh install.sh --help          эта справка"
+            echo "  /bin/sh /tmp/mnt/<mount>/install.sh                 установить/обновить GoshaCrash"
+            echo "  /bin/sh /tmp/mnt/<mount>/install.sh --reset-config  сбросить config.yaml"
+            echo "  /bin/sh /tmp/mnt/<mount>/install.sh --help          эта справка"
+            echo
+            echo "Форматирование USB удалено из install.sh и выполняется отдельной программой."
             return 0
             ;;
         --reset-config)
@@ -3498,17 +3002,10 @@ main(){
     acquire_lock || return 1
 
     verify_asuswrt || return 1
+    detect_installer_usb || return 1
     legacy_preflight_before_dm || return 1
-    find_download_master || {
-        if legacy_hw_detect; then
-            echo
-            echo "EXT3 уже подходит, но Download Master не найден."
-            echo "Установи Download Master через веб-интерфейс ASUS на эту флешку,"
-            echo "затем снова запусти обычную установку тем же способом"
-        fi
-        return 1
-    }
-    BASE="${INSTALL_DIR:-$USB_MOUNT/goshacrash}"
+    find_download_master || return 1
+    BASE="$USB_MOUNT/goshacrash"
     mkdir -p "$TMP_ROOT" "$BASE/bin" "$BASE/logs" "$BASE/run" "$BASE/state" || return 1
     # Keep the persistent tree minimal. Remove only empty legacy directories;
     # never delete existing user files automatically.
@@ -3516,7 +3013,11 @@ main(){
     save_install_log
 
     say "GoshaCrash installer $INSTALLER_VERSION"
-    say "USB: $USB_MOUNT"
+    say "USB device: $USB_DEVICE"
+    say "USB disk: $USB_DISK"
+    say "USB mount: $USB_MOUNT"
+    say "USB name: $USB_NAME"
+    say "USB filesystem: $USB_FS"
     say "Download Master: $DM_ROOT"
     say "Каталог установки: $BASE"
 

@@ -4,7 +4,7 @@
 # Zashboard updates are triggered from the native button inside Zashboard.
 
 VERSION="3.10.2-rc40-test2"
-BUILD_ID="2026-09-02-bt10-fs-opt-unmount-ui-nano-rc40-test2"
+BUILD_ID="2026-09-03-dynamic-usb-relative-state-no-secret-persistent-utf8-nano"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -34,6 +34,12 @@ hash -r 2>/dev/null || true
 SCRIPT_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
 BASE="${GOSHACRASH_BASE:-$SCRIPT_DIR}"
 USB_MOUNT="$(dirname "$BASE")"
+USB_DEVICE=""
+USB_DISK=""
+USB_NAME="${USB_MOUNT##*/}"
+USB_FS=""
+DM_LAYOUT=""
+RUNTIME_BASE_FILE="/tmp/goshacrash-base"
 BIN="$BASE/bin/mihomo"
 UI="$BASE/ui"
 CONFIG="$BASE/config.yaml"
@@ -138,22 +144,47 @@ ok(){ printf '%s\n' "[GoshaCrash:OK] $*"; log_event OK main "$*"; }
 warn(){ printf '%s\n' "[GoshaCrash:WARN] $*" >&2; log_event WARN main "$*"; }
 fail(){ printf '%s\n' "[GoshaCrash:ERROR] $*" >&2; log_event ERROR main "$*"; return 1; }
 
+refresh_storage_identity(){
+    USB_MOUNT="$(dirname "$BASE")"
+    USB_NAME="${USB_MOUNT##*/}"
+    USB_DEVICE="$(awk -v m="$USB_MOUNT" '$2==m && $1 ~ "^/dev/sd" {print $1; exit}' /proc/mounts 2>/dev/null)"
+    if [ -z "$USB_DEVICE" ]; then
+        USB_DEVICE="$(df -P "$USB_MOUNT" 2>/dev/null | awk 'NR==2 && $1 ~ "^/dev/sd" {print $1; exit}')"
+    fi
+    USB_DISK="$(printf '%s\n' "$USB_DEVICE" | sed 's/[0-9][0-9]*$//')"
+    USB_FS="$(awk -v d="$USB_DEVICE" '$1==d {print $3; exit}' /proc/mounts 2>/dev/null)"
+
+    DM_ROOT=""
+    DM_LAYOUT=""
+    for d in "$USB_MOUNT/asusware.arm" "$USB_MOUNT/asusware.arm64" "$USB_MOUNT/asusware"; do
+        [ -d "$d" ] || continue
+        DM_ROOT="$d"
+        DM_LAYOUT="${d##*/}"
+        break
+    done
+
+    printf '%s\n' "$BASE" > "$RUNTIME_BASE_FILE" 2>/dev/null || true
+    return 0
+}
+
 load_platform(){
     [ -f "$PLATFORM_FILE" ] || { fail "Не найден $PLATFORM_FILE. Повтори установку через install.sh"; return 1; }
     . "$PLATFORM_FILE"
-    [ -n "${CONFIG_FILE:-}" ] && CONFIG="$CONFIG_FILE"
-    [ -n "${GCNET_BIN:-}" ] || GCNET_BIN="$BASE/bin/gcnet"
-    [ -n "${DM_ROOT:-}" ] || DM_ROOT=""
+
+    # Old builds persisted absolute /tmp/mnt/<name> paths. They are invalid as
+    # soon as /dev/sdb1 becomes /dev/sda1 or ASUS changes the mount name.
+    # Runtime paths are always rebuilt from the current script location.
+    CONFIG="$BASE/${CONFIG_REL:-config.yaml}"
+    GCNET_BIN="$BASE/${GCNET_REL:-bin/gcnet}"
+    PKG_PATH=""
+    DM_ROOT=""
+    refresh_storage_identity
     return 0
 }
 
 find_dm_root(){
-    if [ -n "$DM_ROOT" ] && [ -d "$DM_ROOT" ]; then return 0; fi
-    DM_ROOT=""
-    for d in "$USB_MOUNT/asusware.arm" "$USB_MOUNT/asusware.arm64" "$USB_MOUNT/asusware"; do
-        [ -d "$d" ] && { DM_ROOT="$d"; return 0; }
-    done
-    return 1
+    refresh_storage_identity >/dev/null 2>&1 || true
+    [ -n "$DM_ROOT" ] && [ -d "$DM_ROOT" ]
 }
 
 refresh_path(){
@@ -812,8 +843,6 @@ required_config(){
     [ "$(yaml_section "$CONFIG" dns listen)" = "127.0.0.1:$DNS_PORT" ] || { fail "dns.listen должен быть 127.0.0.1:$DNS_PORT"; return 1; }
 
     [ -n "$(yaml_top "$CONFIG" external-controller)" ] || { fail "external-controller не задан"; return 1; }
-    secret="$(yaml_top "$CONFIG" secret)"
-    case "$secret" in ''|CHANGE_ME|null|Null|NULL|'~') fail "secret для API/Zashboard должен быть задан"; return 1;; esac
     [ "$(yaml_top "$CONFIG" external-ui)" = "ui" ] || { fail "external-ui должен быть ui"; return 1; }
     [ -n "$(yaml_top "$CONFIG" external-ui-url)" ] || { fail "Добавь external-ui-url для обновления Zashboard из самой панели"; return 1; }
 
@@ -1634,7 +1663,7 @@ boot(){
     printf '%s\n' "$$" > "$BOOT_PIDFILE" 2>/dev/null || true
     trap 'boot_lock_release; exit 0' HUP INT TERM
 
-    printf '[%s] boot: entered pid=%s profile=%s boot-token=%s\n' "$(now)" "$$" "${PLATFORM:-unknown}" "$(current_boot_token 2>/dev/null)"
+    printf '[%s] boot: entered pid=%s profile=%s device=%s mount=%s name=%s fs=%s boot-token=%s\n' "$(now)" "$$" "${PLATFORM:-unknown}" "${USB_DEVICE:-unknown}" "$USB_MOUNT" "$USB_NAME" "${USB_FS:-unknown}" "$(current_boot_token 2>/dev/null)"
     cleanup_stale_runtime_state
 
     # Keep the recovery worker alive from the beginning of a cold boot.  It
@@ -1729,18 +1758,6 @@ find_editor(){
 }
 
 editor_utf8_locale(){
-    # nano handles Unicode only when its wide-curses build sees a UTF-8 locale.
-    # Preserve a UTF-8 locale from the SSH client when present; otherwise use
-    # the conventional Optware locale name. The user may override it explicitly.
-    if test -n "${GOSHACRASH_EDITOR_LOCALE:-}"; then
-        printf '%s\n' "$GOSHACRASH_EDITOR_LOCALE"
-        return 0
-    fi
-    for loc in "${LC_CTYPE:-}" "${LANG:-}"; do
-        case "$loc" in
-            *UTF-8*|*utf8*|*UTF8*) printf '%s\n' "$loc"; return 0 ;;
-        esac
-    done
     printf '%s\n' 'en_US.UTF-8'
 }
 
@@ -1748,18 +1765,13 @@ run_editor_utf8(){
     editor="$1"
     shift
     ldpath="$(optware_env_runtime)" || return 1
-    editor_locale="$(editor_utf8_locale)"
     editor_term="${GOSHACRASH_EDITOR_TERM:-${TERM:-xterm-256color}}"
     (
-        # LC_ALL would override LC_CTYPE and is commonly inherited as C from
-        # router hooks. Drop it only for nano; never change the router globally.
-        unset LC_ALL
-        LANG="$editor_locale"
-        LC_CTYPE="$editor_locale"
+        LANG=en_US.UTF-8
+        LC_ALL=en_US.UTF-8
         TERM="$editor_term"
         LD_LIBRARY_PATH="$ldpath"
-        NCURSES_NO_UTF8_ACS=1
-        export LANG LC_CTYPE TERM LD_LIBRARY_PATH NCURSES_NO_UTF8_ACS
+        export LANG LC_ALL TERM LD_LIBRARY_PATH
         exec "$editor" "$@"
     )
 }
@@ -2037,9 +2049,7 @@ dashboard_url(){
     load_platform >/dev/null 2>&1 || true
     ip="$(lan_ip)"
     port="$(controller_port)"
-    secret="$(yaml_top "$CONFIG" secret)"
     url="http://$ip:$port/ui/#/setup?hostname=$ip&port=$port"
-    [ -n "$secret" ] && url="$url&secret=$secret"
     if [ "${MIHOMO_TARGET:-}" = armv5 ] || [ "${LEGACY:-0}" = 1 ]; then
         url="$url&disableUpgradeCore=1"
     fi
@@ -2091,6 +2101,7 @@ status(){
     if p="$(watchdog_pid 2>/dev/null)"; then echo "Watchdog: работает, PID=$p"; else echo "Watchdog: не запущен"; fi
     if [ "${LEGACY:-0}" = 1 ] && [ "${MIHOMO_TARGET:-}" = armv5 ]; then echo "Совместимость: legacy ARMv5 + gVisor"; fi
     echo "Режим маршрутизации: $ROUTING_MODE"
+    echo "USB: ${USB_DEVICE:-?} -> $USB_MOUNT (name=$USB_NAME, fs=${USB_FS:-?})"
     echo "Конфиг: $CONFIG"
     net_link_exists "$TUN_DEVICE" && echo "TUN: $TUN_DEVICE работает" || echo "TUN: $TUN_DEVICE не найден"
     if runtime_health_ok; then echo "Runtime: OK (process + DNS + TUN + routing)"; elif [ -f "$WAN_OFFLINE" ]; then echo "Runtime: остановлен из-за отсутствия интернета"; else echo "Runtime: требует восстановления"; fi
@@ -2520,6 +2531,11 @@ doctor(){
     echo "  kernel: $(uname -r 2>/dev/null)"
     echo "  arch: $(uname -m 2>/dev/null)"
     echo "  PATH: $PATH"
+    echo "  USB device: ${USB_DEVICE:-unknown}"
+    echo "  USB disk: ${USB_DISK:-unknown}"
+    echo "  USB mount: $USB_MOUNT"
+    echo "  USB name: $USB_NAME"
+    echo "  USB filesystem: ${USB_FS:-unknown}"
     echo "  Persistent Optware: ${DM_ROOT:-not-found}"
     if test -n "$DM_ROOT"; then
         test -f "$DM_ROOT/lib/libipkg.so.0" && echo "  libipkg.so.0: OK" || echo "  libipkg.so.0: MISSING"
@@ -2553,6 +2569,19 @@ doctor(){
     fi
 
     [ -f "$MANUAL_STOP" ] && echo "  manual stop: YES" || echo "  manual stop: no"
+    echo "  nano UTF-8 locale: $(editor_utf8_locale)"
+    if grep -Fq 'export LANG=en_US.UTF-8' /jffs/etc/profile 2>/dev/null \
+       && grep -Fq 'export LC_ALL=en_US.UTF-8' /jffs/etc/profile 2>/dev/null; then
+        echo "  shell UTF-8 locale /jffs/etc/profile: OK"
+    else
+        echo "  shell UTF-8 locale /jffs/etc/profile: MISSING"
+    fi
+    if grep -Fq 'export LANG=en_US.UTF-8' /jffs/configs/profile.add 2>/dev/null \
+       && grep -Fq 'export LC_ALL=en_US.UTF-8' /jffs/configs/profile.add 2>/dev/null; then
+        echo "  shell UTF-8 locale profile.add: OK"
+    else
+        echo "  shell UTF-8 locale profile.add: MISSING"
+    fi
     config_utf8_valid
     utf8_rc=$?
     if [ "$utf8_rc" = 0 ]; then
@@ -2747,7 +2776,7 @@ ROUTING STATUS
   gc routing status
 
 ПРОВЕРИТЬ MANUAL ROUTING-ФУНКЦИЮ
-  grep -n '^manual_route_start()' /tmp/mnt/SANDISK/goshacrash/goshacrash.sh
+  grep -n '^manual_route_start()' $BASE/goshacrash.sh
 
 
 MANUAL ROUTING
@@ -2784,19 +2813,19 @@ HOOK AUTOSTART
 ПРОВЕРИТЬ /opt ПОСЛЕ REBOOT
   ls -ld /opt /tmp/opt
   readlink /tmp/opt 2>/dev/null
-  mount | grep -E '/opt|asusware|SANDISK'
+  mount | grep -E '/opt|asusware|/tmp/mnt/'
 
 NANO
   which nano
   ls -l /opt/bin/nano /tmp/opt/bin/nano 2>/dev/null
 
 NANO ЧЕРЕЗ IPKG НА RT-AC68U
-  IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
+  IPKG=$DM_ROOT/bin/ipkg
   "$IPKG" list_installed | grep '^nano '
   "$IPKG" files nano
 
 ПЕРЕУСТАНОВИТЬ NANO
-  IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
+  IPKG=$DM_ROOT/bin/ipkg
   "$IPKG" update
   "$IPKG" remove nano
   "$IPKG" install nano
@@ -2806,12 +2835,12 @@ UNZIP
   ls -l /opt/bin/unzip /opt/bin/unzip-unzip /tmp/opt/bin/unzip-unzip 2>/dev/null
 
 UNZIP ЧЕРЕЗ IPKG НА RT-AC68U
-  IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
+  IPKG=$DM_ROOT/bin/ipkg
   "$IPKG" list_installed | grep '^unzip '
   "$IPKG" files unzip
 
 ПЕРЕУСТАНОВИТЬ UNZIP
-  IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
+  IPKG=$DM_ROOT/bin/ipkg
   "$IPKG" update
   "$IPKG" remove unzip
   "$IPKG" install unzip
@@ -2820,13 +2849,13 @@ SFTP
   gc sftp status
 
 SFTP ЧЕРЕЗ IPKG
-  IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
+  IPKG=$DM_ROOT/bin/ipkg
   "$IPKG" list | grep '^openssh-sftp-server '
   "$IPKG" list_installed | grep '^openssh-sftp-server '
   "$IPKG" files openssh-sftp-server
 
 УСТАНОВИТЬ SFTP
-  IPKG=/tmp/mnt/SANDISK/asusware.arm/bin/ipkg
+  IPKG=$DM_ROOT/bin/ipkg
   "$IPKG" update
   "$IPKG" install openssh-sftp-server
 
@@ -2836,10 +2865,9 @@ SFTP С WINDOWS
 ZASHBOARD
   gc dashboard
 
-CONTROLLER И SECRET
+CONTROLLER
   BASE="$(gc base)"
   grep '^external-controller:' "$BASE/config.yaml"
-  grep '^secret:' "$BASE/config.yaml"
 
 РУЧНОЙ RESTART ТОЛЬКО MIHOMO
   BASE="$(gc base)"
