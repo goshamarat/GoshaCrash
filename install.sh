@@ -4,7 +4,7 @@
 # package tools through ASUS Download Master, configuration and autostart.
 
 INSTALLER_VERSION="3.10.2-rc40-test2"
-EXPECTED_CONTROLLER_BUILD_ID="2026-09-03-dynamic-usb-utf8-coldboot-v3-editpause"
+EXPECTED_CONTROLLER_BUILD_ID="2026-09-04-simple-config-native-auto-v1"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -72,8 +72,6 @@ MIHOMO_VERSION_SELECTED=""
 MIHOMO_URL_SELECTED=""
 ACTIVE_CONFIG=""
 GCNET_BIN=""
-CONFIG_ROLLBACK_TMP=""
-CONFIG_MIGRATION_PENDING="0"
 RESET_CONFIG="0"
 
 now(){ date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date; }
@@ -83,13 +81,25 @@ ok(){ _emit OK "$@"; }
 warn(){ _emit WARN "$@" >&2; }
 fail(){ _emit ERROR "$@" >&2; return 1; }
 
+disable_mptcp_install(){
+    for p in /proc/sys/net/mptcp/mptcp_enabled /proc/sys/net/mptcp/enabled; do
+        test -e "$p" || continue
+        v="$(cat "$p" 2>/dev/null)"
+        if test "$v" != 0 && test -w "$p"; then
+            printf '0\n' > "$p" 2>/dev/null || { warn "Не удалось отключить MPTCP через $p"; return 1; }
+            say "MPTCP отключён для совместимости с transparent proxy: $p"
+        else
+            say "MPTCP: ${v:-unknown} ($p)"
+        fi
+        return 0
+    done
+    say "MPTCP sysctl отсутствует: дополнительная настройка не требуется"
+    return 0
+}
+
 cleanup(){
-    # Existing user config is only committed after the new Mihomo validates it.
-    # Until then the rollback copy lives only in /tmp and is restored on any
-    # installer abort. No persistent backup directory is created.
-    if test "$CONFIG_MIGRATION_PENDING" = 1 && test -n "$CONFIG_ROLLBACK_TMP" && test -f "$CONFIG_ROLLBACK_TMP" && test -n "$ACTIVE_CONFIG"; then
-        cp -f "$CONFIG_ROLLBACK_TMP" "$ACTIVE_CONFIG" 2>/dev/null || true
-    fi
+    # User config is never restored/replaced automatically. Installer temp
+    # files and locks are the only things cleaned up here.
     rm -rf "$TMP_ROOT" 2>/dev/null || true
     test "$LOCK_HELD" = 1 && rm -rf "$LOCK_DIR" 2>/dev/null || true
 }
@@ -1507,6 +1517,26 @@ detect_platform(){
 }
 
 existing_routing_mode(){
+    cfg="$BASE/config.yaml"
+    if test -f "$cfg"; then
+        ar="$(LC_ALL=C awk '
+          /^tun:[[:space:]]*($|#)/ {inside=1; next}
+          inside && /^[^[:space:]]/ {inside=0}
+          inside && /^[[:space:]]+auto-route:[[:space:]]*/ {
+            line=$0; sub(/^[^:]*:[[:space:]]*/, "", line); sub(/[[:space:]]*#.*/, "", line); gsub(/[[:space:]"\047]/, "", line); print tolower(line); exit
+          }' "$cfg" 2>/dev/null)"
+        ad="$(LC_ALL=C awk '
+          /^tun:[[:space:]]*($|#)/ {inside=1; next}
+          inside && /^[^[:space:]]/ {inside=0}
+          inside && /^[[:space:]]+auto-redirect:[[:space:]]*/ {
+            line=$0; sub(/^[^:]*:[[:space:]]*/, "", line); sub(/[[:space:]]*#.*/, "", line); gsub(/[[:space:]"\047]/, "", line); print tolower(line); exit
+          }' "$cfg" 2>/dev/null)"
+        case "$ar:$ad" in
+            true:true|yes:yes|1:1|on:on) printf '%s\n' auto; return 0 ;;
+            *) if test -n "$ar" || test -n "$ad"; then printf '%s\n' manual; return 0; fi ;;
+        esac
+    fi
+
     f="$BASE/state/platform.env"
     test -f "$f" || return 1
     mode="$( ( . "$f" 2>/dev/null; printf '%s\n' "${ROUTING_MODE:-}" ) 2>/dev/null )"
@@ -1568,6 +1598,11 @@ choose_routing_mode(){
         say "Маршрутизация: manual (ARMv5: auto-route запрещён)"
         return 0
     fi
+
+    model="$(nvram_get productid)"
+    case "$model" in
+        *BT10*) say "BT10: native Mihomo auto-route/auto-redirect используется без GoshaCrash fallback" ;;
+    esac
 
     case "$ROUTING_REQUEST" in
         manual|auto) ROUTING_MODE="$ROUTING_REQUEST" ;;
@@ -1686,402 +1721,62 @@ install_network_helper(){
     say "Установлен совместимый legacy network helper: $GCNET_BIN"
 }
 
-yaml_top_raw_install(){
-    file="$1"; key="$2"
-    LC_ALL=C awk -v key="$key" '
-      $0 ~ "^" key ":[[:space:]]*" {
-        line=$0
-        sub("^" key ":[[:space:]]*", "", line)
-        print line
-        exit
-      }
-    ' "$file" 2>/dev/null
-}
-
-yaml_scalar_clean_install(){
-    printf '%s\n' "$1" | sed 's/[[:space:]]*#.*$//; s/^[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//; s/^'"'"'//; s/'"'"'$//'
-}
-
-config_block_section_preflight(){
-    file="$1"; section="$2"
-    state="$(LC_ALL=C awk -v section="$section" '
-      BEGIN{count=0; bad=0}
-      $0 ~ "^" section ":" {
-        count++
-        line=$0
-        sub("^" section ":[[:space:]]*", "", line)
-        if (line !~ "^($|#)") bad=1
-      }
-      END{print count ":" bad}
-    ' "$file" 2>/dev/null)"
-    case "$state" in
-      0:0|1:0) return 0;;
-      *:1)
-        fail "Секция $section должна быть обычным YAML-блоком ($section: с ключами ниже), flow-формат $section: {...} не поддерживается безопасной миграцией"
-        return 1
-        ;;
-      *)
-        fail "В config.yaml найдено несколько верхнеуровневых секций $section:. Убери дубликаты перед обновлением"
-        return 1
-        ;;
-    esac
-}
-
-
-yaml_top_section_exists_install(){
-    file="$1"; section="$2"
-    LC_ALL=C awk -v section="$section" '$0 ~ "^" section ":[[:space:]]*($|#)" {found=1; exit} END{exit found ? 0 : 1}' "$file" >/dev/null 2>&1
-}
-
-append_default_dns_section(){
-    file="$1"
-    cat >> "$file" <<'EOF'
-
-dns:
-  enable: true
-  listen: 127.0.0.1:1053
-  ipv6: false
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-  default-nameserver:
-    - 1.1.1.1
-    - 8.8.8.8
-  nameserver:
-    - 1.1.1.1
-    - 8.8.8.8
-EOF
-}
-
-append_default_tun_section(){
-    file="$1"
-    if test "$ROUTING_MODE" = manual; then
-        ar=false; ard=false; adi=false
-    else
-        ar=true; ard=true; adi=true
-    fi
-    cat >> "$file" <<EOF
-
-tun:
-  enable: true
-  stack: $TUN_STACK
-  device: tun0
-  auto-route: $ar
-  auto-redirect: $ard
-  auto-detect-interface: $adi
-  dns-hijack:
-    - any:53
-    - tcp://any:53
-EOF
-}
-
-yaml_set_section_key(){
-    file="$1"; section="$2"; key="$3"; value="$4"; tmp="$file.gc.$$"
-    # Update an existing scalar key, add it to an existing block section, or
-    # create the whole section when upgrading an older user config.
-    LC_ALL=C awk -v section="$section" -v key="$key" -v value="$value" '
-      BEGIN {inside=0; found=0; section_seen=0}
-      $0 ~ "^" section ":[[:space:]]*($|#)" {
-        inside=1
-        found=0
-        section_seen=1
-        print
-        next
-      }
-      inside && /^[^[:space:]]/ {
-        if (!found) print "  " key ": " value
-        inside=0
-      }
-      inside && $0 ~ "^[[:space:]]+" key ":[[:space:]]*" {
-        indent=$0
-        sub(/[^[:space:]].*$/, "", indent)
-        print indent key ": " value
-        found=1
-        next
-      }
-      {print}
-      END {
-        if (inside && !found) {
-          print "  " key ": " value
-        } else if (!section_seen) {
-          if (NR > 0) print ""
-          print section ":"
-          print "  " key ": " value
-        }
-      }
-    ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
-    mv -f "$tmp" "$file"
-}
-
-yaml_section_has_key_install(){
-    file="$1"; section="$2"; key="$3"
-    LC_ALL=C awk -v section="$section" -v key="$key" '
-      $0 ~ "^" section ":[[:space:]]*($|#)" {inside=1; next}
-      inside && /^[^[:space:]]/ {exit}
-      inside && $0 ~ "^[[:space:]]+" key ":[[:space:]]*" {found=1; exit}
-      END{exit found ? 0 : 1}
-    ' "$file" >/dev/null 2>&1
-}
-
-yaml_ensure_tun_dns_hijack(){
-    file="$1"
-    yaml_section_has_key_install "$file" tun dns-hijack && return 0
-    tmp="$file.gc.$$"
-    LC_ALL=C awk '
-      BEGIN{inside=0; inserted=0}
-      $0 ~ "^tun:[[:space:]]*($|#)" {inside=1; print; next}
-      inside && /^[^[:space:]]/ {
-        print "  dns-hijack:"
-        print "    - any:53"
-        print "    - tcp://any:53"
-        inserted=1
-        inside=0
-      }
-      {print}
-      END{
-        if (inside && !inserted) {
-          print "  dns-hijack:"
-          print "    - any:53"
-          print "    - tcp://any:53"
-        }
-      }
-    ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
-    mv -f "$tmp" "$file"
-}
-
-yaml_set_top_key(){
-    file="$1"; key="$2"; value="$3"; tmp="$file.gc.$$"
-    LC_ALL=C awk -v key="$key" -v value="$value" '
-      BEGIN{done=0}
-      $0 ~ "^" key ":[[:space:]]*" {if(!done){print key ": " value; done=1}; next}
-      {print}
-      END{if(!done) print key ": " value}
-    ' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
-    mv -f "$tmp" "$file"
-}
-
-yaml_remove_top_key(){
-    file="$1"; key="$2"; tmp="$file.gc.$$"
-    LC_ALL=C awk -v key="$key" '$0 !~ "^" key ":[[:space:]]*" {print}' "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
-    mv -f "$tmp" "$file"
-}
-
-remove_dashboard_secret(){
-    file="$1"
-    yaml_remove_top_key "$file" secret
-}
-
-configure_routing_in_config(){
-    file="$1"
-    test -f "$file" || return 1
-
-    # Safe shell migration only handles normal block-style tun:/dns: sections.
-    # Refuse ambiguous duplicate/flow mappings instead of silently producing
-    # duplicate YAML keys and damaging a user config.
-    config_block_section_preflight "$file" tun || return 1
-    config_block_section_preflight "$file" dns || return 1
-
-    # If an old/imported config has no TUN or DNS section at all, create the
-    # complete minimal GoshaCrash blocks instead of only two scalar keys.
-    yaml_top_section_exists_install "$file" tun || append_default_tun_section "$file" || return 1
-    yaml_top_section_exists_install "$file" dns || append_default_dns_section "$file" || return 1
-
-    # GoshaCrash-owned API/UI fields. Zashboard is LAN-local and intentionally
-    # has no Mihomo API secret in this project profile.
-    yaml_set_top_key "$file" external-controller 0.0.0.0:9090 || return 1
-    yaml_set_top_key "$file" external-ui ui || return 1
-    yaml_set_top_key "$file" external-ui-url "\"$ZASHBOARD_PRIMARY\"" || return 1
-    remove_dashboard_secret "$file" || return 1
-
-    # Runtime-owned TUN/DNS fields. User proxies, groups, rules and DNS resolver
-    # lists are intentionally preserved.
-    yaml_set_section_key "$file" tun enable true || return 1
-    yaml_set_section_key "$file" tun stack "$TUN_STACK" || return 1
-    yaml_set_section_key "$file" tun device tun0 || return 1
-    yaml_ensure_tun_dns_hijack "$file" || return 1
-    yaml_set_section_key "$file" dns enable true || return 1
-    yaml_set_section_key "$file" dns listen 127.0.0.1:1053 || return 1
-
-    if test "$ROUTING_MODE" = manual; then
-        yaml_set_section_key "$file" tun auto-route false || return 1
-        yaml_set_section_key "$file" tun auto-redirect false || return 1
-        yaml_set_section_key "$file" tun auto-detect-interface false || return 1
-        yaml_set_top_key "$file" routing-mark 9012 || return 1
-    else
-        yaml_set_section_key "$file" tun auto-route true || return 1
-        yaml_set_section_key "$file" tun auto-redirect true || return 1
-        # Mihomo auto-redirect supports iptables or nftables on Linux.
-        yaml_set_section_key "$file" tun auto-detect-interface true || return 1
-        yaml_remove_top_key "$file" routing-mark || return 1
-    fi
-}
-
-find_od_install(){
-    for od_candidate in /usr/bin/od /bin/od /usr/sbin/od /sbin/od /bin/busybox; do
-        test -x "$od_candidate" || continue
-        if test "$od_candidate" = /bin/busybox; then
-            "$od_candidate" od -An -tu1 -v /dev/null >/dev/null 2>&1 && { printf '%s\n' "$od_candidate od"; return 0; }
-        else
-            "$od_candidate" -An -tu1 -v /dev/null >/dev/null 2>&1 && { printf '%s\n' "$od_candidate"; return 0; }
-        fi
-    done
-    return 1
-}
-
-utf8_validate_file_install(){
-    uv_file="$1"
-    uv_od_cmd="$(find_od_install 2>/dev/null)" || return 2
-    if test "$uv_od_cmd" = "/bin/busybox od"; then
-        /bin/busybox od -An -tu1 -v "$uv_file" 2>/dev/null
-    else
-        "$uv_od_cmd" -An -tu1 -v "$uv_file" 2>/dev/null
-    fi | LC_ALL=C awk '
-      BEGIN { need=0; ok=1; minc=128; maxc=191 }
-      {
-        for (i=1; i<=NF; i++) {
-          b=$i+0
-          if (need == 0) {
-            if (b <= 127) continue
-            if (b >= 194 && b <= 223) { need=1; minc=128; maxc=191; continue }
-            if (b >= 224 && b <= 239) {
-              need=2
-              if (b == 224) { minc=160; maxc=191 }
-              else if (b == 237) { minc=128; maxc=159 }
-              else { minc=128; maxc=191 }
-              continue
-            }
-            if (b >= 240 && b <= 244) {
-              need=3
-              if (b == 240) { minc=144; maxc=191 }
-              else if (b == 244) { minc=128; maxc=143 }
-              else { minc=128; maxc=191 }
-              continue
-            }
-            ok=0; exit
-          }
-          if (b < minc || b > maxc) { ok=0; exit }
-          need--
-          minc=128; maxc=191
-        }
-      }
-      END { if (!ok || need != 0) exit 1; exit 0 }
-    '
-}
-
-strip_whole_line_comments_install(){
-    src="$1"; dst="$2"
-    # Diagnostic helper only: build a temporary data-only copy when Mihomo
-    # reports invalid UTF-8, so we can distinguish broken comments from broken
-    # YAML data without modifying the user's real config.
-    LC_ALL=C tr -d '\015' < "$src" | LC_ALL=C awk '!/^[[:space:]]*#/' > "$dst"
-}
-
-# Emit UTF-8 deterministically from an ASCII-only shell string. Non-ASCII
-# bytes are stored as POSIX printf %b octal escapes (\0ddd), so generated
-# config comments do not depend on locale, terminal encoding or awk/sed.
-utf8_print_install(){
-    printf '%b\n' "$1"
-}
-
 generate_base_config(){
     gbc_file="$1"
-    file="$gbc_file"
-    if test "$ROUTING_MODE" = manual; then cfg_auto_route=false; cfg_auto_redirect=false; cfg_auto_detect=false
-    else cfg_auto_route=true; cfg_auto_redirect=true; cfg_auto_detect=true; fi
-    : > "$file" || return 1
-    utf8_print_install '# GoshaCrash \0342\0200\0224 \0320\0261\0320\0260\0320\0267\0320\0276\0320\0262\0320\0260\0321\0217 \0320\0272\0320\0276\0320\0275\0321\0204\0320\0270\0320\0263\0321\0203\0321\0200\0320\0260\0321\0206\0320\0270\0321\0217 Mihomo.' >> "$file" || return 1
-    utf8_print_install '# \0320\0232\0320\0276\0320\0264\0320\0270\0321\0200\0320\0276\0320\0262\0320\0272\0320\0260 \0321\0204\0320\0260\0320\0271\0320\0273\0320\0260: UTF-8 \0320\0261\0320\0265\0320\0267 BOM.' >> "$file" || return 1
-    utf8_print_install '# \0320\0255\0321\0202\0320\0276 \0320\0261\0320\0265\0320\0267\0320\0276\0320\0277\0320\0260\0321\0201\0320\0275\0320\0260\0321\0217 \0321\0201\0321\0202\0320\0260\0321\0200\0321\0202\0320\0276\0320\0262\0320\0260\0321\0217 \0320\0267\0320\0260\0320\0263\0320\0273\0321\0203\0321\0210\0320\0272\0320\0260: \0320\0277\0320\0276\0320\0272\0320\0260 \0320\0277\0321\0200\0320\0276\0320\0272\0321\0201\0320\0270 \0320\0275\0320\0265 \0320\0264\0320\0276\0320\0261\0320\0260\0320\0262\0320\0273\0320\0265\0320\0275\0321\0213, \0320\0262\0320\0265\0321\0201\0321\0214 \0321\0202\0321\0200\0320\0260\0321\0204\0320\0270\0320\0272 \0320\0270\0320\0264\0321\0221\0321\0202 DIRECT.' >> "$file" || return 1
-    utf8_print_install '# \0320\0224\0320\0276\0320\0261\0320\0260\0320\0262\0321\0214 \0321\0201\0320\0262\0320\0276\0320\0270 proxies / proxy-groups / rules, \0321\0201\0320\0276\0321\0205\0321\0200\0320\0260\0320\0275\0320\0270 \0321\0204\0320\0260\0320\0271\0320\0273 \0320\0270 \0320\0277\0321\0200\0320\0276\0320\0262\0320\0265\0321\0200\0321\0214 \0320\0265\0320\0263\0320\0276 \0321\0207\0320\0265\0321\0200\0320\0265\0320\0267 gc check.' >> "$file" || return 1
-    utf8_print_install '# \0320\0241\0320\0273\0321\0203\0320\0266\0320\0265\0320\0261\0320\0275\0321\0213\0320\0265 \0320\0277\0320\0260\0321\0200\0320\0260\0320\0274\0320\0265\0321\0202\0321\0200\0321\0213 TUN, DNS, API \0320\0270 Zashboard \0320\0277\0320\0276\0320\0264\0320\0264\0320\0265\0321\0200\0320\0266\0320\0270\0320\0262\0320\0260\0321\0216\0321\0202\0321\0201\0321\0217 GoshaCrash \0320\0260\0320\0262\0321\0202\0320\0276\0320\0274\0320\0260\0321\0202\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270.' >> "$file" || return 1
-    printf '\n' >> "$file" || return 1
-    utf8_print_install '# API Mihomo \0320\0264\0320\0273\0321\0217 Zashboard. \0320\0224\0320\0276\0321\0201\0321\0202\0321\0203\0320\0277\0320\0265\0320\0275 \0320\0270\0320\0267 \0320\0273\0320\0276\0320\0272\0320\0260\0320\0273\0321\0214\0320\0275\0320\0276\0320\0271 \0321\0201\0320\0265\0321\0202\0320\0270 \0320\0270 \0320\0267\0320\0260\0321\0211\0320\0270\0321\0211\0321\0221\0320\0275 \0321\0203\0320\0275\0320\0270\0320\0272\0320\0260\0320\0273\0321\0214\0320\0275\0321\0213\0320\0274 secret.' >> "$file" || return 1
-    cat >> "$file" <<EOF
+    if test "$ROUTING_MODE" = manual; then
+        cfg_auto_route=false
+        cfg_auto_redirect=false
+        cfg_auto_detect=false
+    else
+        cfg_auto_route=true
+        cfg_auto_redirect=true
+        cfg_auto_detect=true
+    fi
+
+    cat > "$gbc_file" <<EOF
 external-controller: 0.0.0.0:9090
 external-ui: ui
 external-ui-url: "$ZASHBOARD_PRIMARY"
 
-EOF
-    utf8_print_install '# \0320\0241\0320\0276\0321\0205\0321\0200\0320\0260\0320\0275\0321\0217\0321\0202\0321\0214 \0320\0262\0321\0213\0320\0261\0321\0200\0320\0260\0320\0275\0320\0275\0321\0213\0320\0265 \0320\0277\0321\0200\0320\0276\0320\0272\0321\0201\0320\0270 \0320\0270 \0321\0202\0320\0260\0320\0261\0320\0273\0320\0270\0321\0206\0321\0203 Fake-IP \0320\0274\0320\0265\0320\0266\0320\0264\0321\0203 \0320\0277\0320\0265\0321\0200\0320\0265\0320\0267\0320\0260\0320\0277\0321\0203\0321\0201\0320\0272\0320\0260\0320\0274\0320\0270 Mihomo.' >> "$file" || return 1
-    cat >> "$file" <<'EOF'
+mixed-port: 7892
+allow-lan: true
+mode: rule
+log-level: info
+ipv6: false
+
 profile:
   store-selected: true
   store-fake-ip: true
 
-EOF
-    utf8_print_install '# \0320\0233\0320\0276\0320\0272\0320\0260\0320\0273\0321\0214\0320\0275\0321\0213\0320\0271 mixed-\0320\0277\0320\0276\0321\0200\0321\0202 (HTTP/SOCKS) \0320\0270 \0320\0276\0321\0201\0320\0275\0320\0276\0320\0262\0320\0275\0321\0213\0320\0265 \0320\0277\0320\0260\0321\0200\0320\0260\0320\0274\0320\0265\0321\0202\0321\0200\0321\0213 Mihomo.' >> "$file" || return 1
-    cat >> "$file" <<'EOF'
-mixed-port: 7892
-allow-lan: true
-bind-address: "*"
-mode: rule
-log-level: info
-ipv6: false
-find-process-mode: "off"
-
-EOF
-    utf8_print_install '# DNS Mihomo. Fake-IP \0320\0270\0321\0201\0320\0277\0320\0276\0320\0273\0321\0214\0320\0267\0321\0203\0320\0265\0321\0202\0321\0201\0321\0217 \0320\0264\0320\0273\0321\0217 \0320\0277\0321\0200\0320\0276\0320\0267\0321\0200\0320\0260\0321\0207\0320\0275\0320\0276\0320\0271 \0320\0274\0320\0260\0321\0200\0321\0210\0321\0200\0321\0203\0321\0202\0320\0270\0320\0267\0320\0260\0321\0206\0320\0270\0320\0270 \0320\0272\0320\0273\0320\0270\0320\0265\0320\0275\0321\0202\0320\0276\0320\0262.' >> "$file" || return 1
-    cat >> "$file" <<'EOF'
 dns:
   enable: true
   listen: 127.0.0.1:1053
   ipv6: false
-
-EOF
-    utf8_print_install '  # Fake-IP \0320\0277\0320\0276\0320\0267\0320\0262\0320\0276\0320\0273\0321\0217\0320\0265\0321\0202 Mihomo \0320\0277\0321\0200\0320\0276\0320\0267\0321\0200\0320\0260\0321\0207\0320\0275\0320\0276 \0321\0201\0320\0276\0320\0277\0320\0276\0321\0201\0321\0202\0320\0260\0320\0262\0320\0273\0321\0217\0321\0202\0321\0214 DNS-\0320\0276\0321\0202\0320\0262\0320\0265\0321\0202\0321\0213 \0321\0201 \0321\0201\0320\0276\0320\0265\0320\0264\0320\0270\0320\0275\0320\0265\0320\0275\0320\0270\0321\0217\0320\0274\0320\0270.' >> "$file" || return 1
-    cat >> "$file" <<'EOF'
-  enhanced-mode: fake-ip
-  fake-ip-range: 198.18.0.1/16
-
-EOF
-    utf8_print_install '  # DNS \0320\0264\0320\0273\0321\0217 \0320\0275\0320\0260\0321\0207\0320\0260\0320\0273\0321\0214\0320\0275\0320\0276\0320\0263\0320\0276 \0321\0200\0320\0260\0320\0267\0321\0200\0320\0265\0321\0210\0320\0265\0320\0275\0320\0270\0321\0217 \0320\0270\0320\0274\0321\0221\0320\0275 \0320\0264\0320\0276 \0320\0267\0320\0260\0320\0277\0321\0203\0321\0201\0320\0272\0320\0260 \0320\0276\0321\0201\0320\0275\0320\0276\0320\0262\0320\0275\0320\0276\0320\0271 DNS-\0320\0273\0320\0276\0320\0263\0320\0270\0320\0272\0320\0270.' >> "$file" || return 1
-    cat >> "$file" <<'EOF'
+  enhanced-mode: redir-host
   default-nameserver:
-    - 1.1.1.1
-    - 8.8.8.8
-
-EOF
-    utf8_print_install '  # \0320\0236\0321\0201\0320\0275\0320\0276\0320\0262\0320\0275\0321\0213\0320\0265 DNS-\0321\0201\0320\0265\0321\0200\0320\0262\0320\0265\0321\0200\0321\0213.' >> "$file" || return 1
-    cat >> "$file" <<'EOF'
+    - 217.174.227.102
   nameserver:
-    - 1.1.1.1
-    - 8.8.8.8
+    - tls://77.88.8.8:853
+  direct-nameserver:
+    - 217.174.227.102
 
-EOF
-    utf8_print_install '# \0320\0222\0320\0270\0321\0200\0321\0202\0321\0203\0320\0260\0320\0273\0321\0214\0320\0275\0321\0213\0320\0271 TUN-\0320\0270\0320\0275\0321\0202\0320\0265\0321\0200\0321\0204\0320\0265\0320\0271\0321\0201. \0320\0255\0321\0202\0320\0270 \0320\0277\0320\0260\0321\0200\0320\0260\0320\0274\0320\0265\0321\0202\0321\0200\0321\0213 \0320\0272\0320\0276\0320\0275\0321\0202\0321\0200\0320\0276\0320\0273\0320\0270\0321\0200\0321\0203\0320\0265\0321\0202 GoshaCrash.' >> "$file" || return 1
-    cat >> "$file" <<EOF
 tun:
   enable: true
   stack: $TUN_STACK
   device: tun0
-
-EOF
-    utf8_print_install '  # \0320\0220\0320\0262\0321\0202\0320\0276\0320\0274\0320\0260\0321\0202\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270 \0321\0201\0320\0276\0320\0267\0320\0264\0320\0260\0320\0262\0320\0260\0321\0202\0321\0214 \0321\0201\0320\0270\0321\0201\0321\0202\0320\0265\0320\0274\0320\0275\0321\0213\0320\0265 \0320\0274\0320\0260\0321\0200\0321\0210\0321\0200\0321\0203\0321\0202\0321\0213 \0320\0264\0320\0273\0321\0217 TUN.' >> "$file" || return 1
-    printf '  auto-route: %s\n\n' "$cfg_auto_route" >> "$file" || return 1
-    utf8_print_install '  # \0320\0220\0320\0262\0321\0202\0320\0276\0320\0274\0320\0260\0321\0202\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270 \0320\0275\0320\0260\0321\0201\0321\0202\0321\0200\0320\0260\0320\0270\0320\0262\0320\0260\0321\0202\0321\0214 \0320\0277\0321\0200\0320\0276\0320\0267\0321\0200\0320\0260\0321\0207\0320\0275\0321\0213\0320\0271 TCP/UDP-\0320\0277\0320\0265\0321\0200\0320\0265\0321\0205\0320\0262\0320\0260\0321\0202 \0320\0275\0320\0260 Linux.' >> "$file" || return 1
-    printf '  auto-redirect: %s\n\n' "$cfg_auto_redirect" >> "$file" || return 1
-    utf8_print_install '  # \0320\0220\0320\0262\0321\0202\0320\0276\0320\0274\0320\0260\0321\0202\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270 \0320\0276\0320\0277\0321\0200\0320\0265\0320\0264\0320\0265\0320\0273\0321\0217\0321\0202\0321\0214 \0321\0204\0320\0270\0320\0267\0320\0270\0321\0207\0320\0265\0321\0201\0320\0272\0320\0270\0320\0271 \0320\0270\0320\0275\0321\0202\0320\0265\0321\0200\0321\0204\0320\0265\0320\0271\0321\0201 \0320\0262\0321\0213\0321\0205\0320\0276\0320\0264\0320\0260 \0320\0262 \0320\0270\0320\0275\0321\0202\0320\0265\0321\0200\0320\0275\0320\0265\0321\0202.' >> "$file" || return 1
-    printf '  auto-detect-interface: %s\n\n' "$cfg_auto_detect" >> "$file" || return 1
-    utf8_print_install '  # \0320\0237\0320\0265\0321\0200\0320\0265\0321\0205\0320\0262\0320\0260\0321\0202\0321\0213\0320\0262\0320\0260\0321\0202\0321\0214 \0320\0276\0320\0261\0321\0213\0321\0207\0320\0275\0321\0213\0320\0265 DNS-\0320\0267\0320\0260\0320\0277\0321\0200\0320\0276\0321\0201\0321\0213 \0320\0272\0320\0273\0320\0270\0320\0265\0320\0275\0321\0202\0320\0276\0320\0262 \0321\0207\0320\0265\0321\0200\0320\0265\0320\0267 TUN.' >> "$file" || return 1
-    cat >> "$file" <<'EOF'
+  auto-route: $cfg_auto_route
+  auto-redirect: $cfg_auto_redirect
+  auto-detect-interface: $cfg_auto_detect
   dns-hijack:
     - any:53
     - tcp://any:53
 
-EOF
-    utf8_print_install '# \0320\0241\0321\0202\0320\0260\0321\0200\0321\0202\0320\0276\0320\0262\0320\0276\0320\0265 \0320\0277\0321\0200\0320\0260\0320\0262\0320\0270\0320\0273\0320\0276-\0320\0267\0320\0260\0320\0263\0320\0273\0321\0203\0321\0210\0320\0272\0320\0260: \0320\0264\0320\0276 \0320\0264\0320\0276\0320\0261\0320\0260\0320\0262\0320\0273\0320\0265\0320\0275\0320\0270\0321\0217 \0320\0277\0321\0200\0320\0276\0320\0272\0321\0201\0320\0270 \0320\0262\0320\0265\0321\0201\0321\0214 \0321\0202\0321\0200\0320\0260\0321\0204\0320\0270\0320\0272 \0320\0270\0320\0264\0321\0221\0321\0202 \0320\0275\0320\0260\0320\0277\0321\0200\0321\0217\0320\0274\0321\0203\0321\0216.' >> "$file" || return 1
-    cat >> "$file" <<'EOF'
 rules:
   - MATCH,DIRECT
 EOF
     if test "$ROUTING_MODE" = manual; then
-        printf '\n' >> "$file" || return 1
-        printf 'routing-mark: 9012\n' >> "$file" || return 1
+        printf '\nrouting-mark: 9012\n' >> "$gbc_file" || return 1
     fi
-
-    # Keep the generated UTF-8 comments intact.  The nano wrapper and gc edit
-    # always run nano with a real UTF-8 locale on the tested ASUSWRT/Optware
-    # stack, so Cyrillic comments no longer need to be stripped or rewritten.
-    yaml_remove_top_key "$gbc_file" secret || return 1
     chmod 600 "$gbc_file" 2>/dev/null || true
     return 0
 }
@@ -2090,72 +1785,37 @@ install_configs(){
     test -n "$ACTIVE_CONFIG" || ACTIVE_CONFIG="$BASE/config.yaml"
 
     if test "$RESET_CONFIG" = 1; then
-        old_config=""
         if test -f "$ACTIVE_CONFIG"; then
-            old_config="$ACTIVE_CONFIG"
-        elif test -f "$BASE/config-legacy.yaml"; then
-            old_config="$BASE/config-legacy.yaml"
+            mkdir -p "$BASE/backups" 2>/dev/null || true
+            stamp="$(date '+%Y%m%d-%H%M%S' 2>/dev/null || echo reset)"
+            cp -f "$ACTIVE_CONFIG" "$BASE/backups/config-before-reset-$stamp.yaml" 2>/dev/null || true
         fi
-        if test -n "$old_config"; then
-            CONFIG_ROLLBACK_TMP="$TMP_ROOT/config-before-reset.yaml"
-            cp -f "$old_config" "$CONFIG_ROLLBACK_TMP" || return 1
-            CONFIG_MIGRATION_PENDING="1"
-        fi
-        rm -f "$ACTIVE_CONFIG" "$BASE/config-legacy.yaml" 2>/dev/null || true
+        rm -f "$ACTIVE_CONFIG" 2>/dev/null || true
         generate_base_config "$ACTIVE_CONFIG" || { fail "Не удалось сгенерировать новый config.yaml"; return 1; }
-        chmod 600 "$ACTIVE_CONFIG" 2>/dev/null || true
         mkdir -p "$BASE/state" 2>/dev/null || true
         printf '%s\n' generated-stub > "$BASE/state/config-origin" 2>/dev/null || true
-        say "config.yaml сброшен явно: создана новая UTF-8 заглушка (старый файл хранится только временно до успешной проверки)"
+        say "config.yaml сброшен явно; предыдущий файл, если был, оставлен только как пассивный backup"
         return 0
     fi
 
-    # Migration from GoshaCrash <= 3.5.x: move the old active config to the
-    # unified name instead of creating a second persistent copy.
+    # One-time legacy filename migration only. This does not alter YAML bytes.
     if test ! -f "$ACTIVE_CONFIG" && test -f "$BASE/config-legacy.yaml"; then
         mv -f "$BASE/config-legacy.yaml" "$ACTIVE_CONFIG" || return 1
-        say "Legacy-конфиг перенесён в единый $ACTIVE_CONFIG"
+        say "Legacy config перенесён в $ACTIVE_CONFIG без изменения содержимого"
     fi
 
     if test ! -f "$ACTIVE_CONFIG"; then
         generate_base_config "$ACTIVE_CONFIG" || { fail "Не удалось сгенерировать базовый config.yaml"; return 1; }
-        utf8_validate_file_install "$ACTIVE_CONFIG"
-        utf8_rc=$?
-        if test "$utf8_rc" = 1; then
-            fail "Внутренняя ошибка: только что созданный config.yaml не является корректным UTF-8"
-            return 1
-        fi
         mkdir -p "$BASE/state" 2>/dev/null || true
         printf '%s\n' generated-stub > "$BASE/state/config-origin" 2>/dev/null || true
-        say "Базовый config.yaml создан install.sh для $PLATFORM (routing=$ROUTING_MODE, tun.stack=$TUN_STACK)"
-        warn "VPN ещё не настроен: добавь свои proxy/rules и выполни gc restart"
+        say "Создан один базовый config.yaml. Дальше файл принадлежит пользователю"
+        warn "Добавь свои proxies/groups/rules и выполни gc restart"
     else
-        CONFIG_ROLLBACK_TMP="$TMP_ROOT/config-before-migration.yaml"
-        cp -f "$ACTIVE_CONFIG" "$CONFIG_ROLLBACK_TMP" || return 1
-        CONFIG_MIGRATION_PENDING="1"
-        say "Существующий $ACTIVE_CONFIG сохранён; UTF-8 комментарии и YAML-данные пользователя сохраняются"
-
-        # Normalize only Windows CRLF -> LF.  Do not remove or rewrite UTF-8
-        # comments: nano is launched with LANG/LC_ALL=en_US.UTF-8.
-        normalized="$TMP_ROOT/config-normalized.$$"
-        if ! LC_ALL=C tr -d '\015' < "$ACTIVE_CONFIG" > "$normalized"; then
-            cp -f "$CONFIG_ROLLBACK_TMP" "$ACTIVE_CONFIG" 2>/dev/null || true
-            CONFIG_MIGRATION_PENDING="0"
-            rm -f "$normalized" 2>/dev/null || true
-            fail "Не удалось нормализовать окончания строк config.yaml"
-            return 1
-        fi
-        mv -f "$normalized" "$ACTIVE_CONFIG" || return 1
-
-        if ! configure_routing_in_config "$ACTIVE_CONFIG"; then
-            cp -f "$CONFIG_ROLLBACK_TMP" "$ACTIVE_CONFIG" 2>/dev/null || true
-            CONFIG_MIGRATION_PENDING="0"
-            fail "Не удалось безопасно нормализовать config.yaml"
-            return 1
-        fi
-
-        chmod 600 "$ACTIVE_CONFIG" 2>/dev/null || true
+        # Reinstall/update never rewrites a user config.
+        say "Существующий config.yaml оставлен без изменений"
     fi
+    chmod 600 "$ACTIVE_CONFIG" 2>/dev/null || true
+    return 0
 }
 
 mihomo_config_test_install(){
@@ -2165,109 +1825,16 @@ mihomo_config_test_install(){
     "$BASE/bin/mihomo" -t -d "$BASE" -f "$mct_file" >"$mct_log" 2>&1
 }
 
-config_test_has_utf8_error_install(){
-    ctu_log="$1"
-    grep -Eiq 'invalid[^[:cntrl:]]*UTF-8|UTF-8[^[:cntrl:]]*invalid|invalid trailing UTF-8 octet|invalid UTF-8|invalid utf-8' "$ctu_log" 2>/dev/null
-}
-
-config_has_user_payload_install(){
-    chp_file="$1"
-    if LC_ALL=C awk '
-      /^[[:space:]]*(proxies|proxy-groups|proxy-providers|rule-providers):[[:space:]]*/ {found=1; exit}
-      END{exit found ? 0 : 1}
-    ' "$chp_file" >/dev/null 2>&1; then return 0; fi
-    LC_ALL=C awk '
-      BEGIN{inrules=0; user=0}
-      /^rules:[[:space:]]*($|#)/ {inrules=1; next}
-      inrules && /^[^[:space:]]/ {inrules=0}
-      inrules && /^[[:space:]]*-[[:space:]]*/ {
-        line=$0; sub(/^[[:space:]]*-[[:space:]]*/, "", line); sub(/[[:space:]]*#.*/, "", line); gsub(/[[:space:]]/, "", line)
-        if (line != "MATCH,DIRECT" && line != "") user=1
-      }
-      END{exit user ? 0 : 1}
-    ' "$chp_file" >/dev/null 2>&1
-}
-
-config_looks_like_factory_stub_install(){
-    cls_file="$1"
-    config_has_user_payload_install "$cls_file" && return 1
-    LC_ALL=C grep -q 'MATCH,DIRECT' "$cls_file" 2>/dev/null && return 0
-    LC_ALL=C grep -q 'GoshaCrash' "$cls_file" 2>/dev/null && return 0
-    return 1
-}
-
-rebuild_factory_stub_install(){
-    rfs_tmp="$TMP_ROOT/config-factory-clean.$$"
-    rfs_log="$TMP_ROOT/config-factory-clean.log.$$"
-    rm -f "$rfs_tmp" "$rfs_log" 2>/dev/null || true
-    generate_base_config "$rfs_tmp" || return 1
-    if ! mihomo_config_test_install "$rfs_tmp" "$rfs_log"; then
-        cat "$rfs_log" >&2 2>/dev/null || true
-        rm -f "$rfs_tmp" "$rfs_log" 2>/dev/null || true
-        fail "Внутренняя ошибка: новая стартовая заглушка не проходит mihomo -t"
-        return 1
-    fi
-    mv -f "$rfs_tmp" "$ACTIVE_CONFIG" || return 1
-    chmod 600 "$ACTIVE_CONFIG" 2>/dev/null || true
-    mkdir -p "$BASE/state" 2>/dev/null || true
-    printf '%s\n' generated-stub > "$BASE/state/config-origin" 2>/dev/null || true
-    CONFIG_MIGRATION_PENDING="0"
-    test -n "$CONFIG_ROLLBACK_TMP" && rm -f "$CONFIG_ROLLBACK_TMP" 2>/dev/null || true
-    rm -f "$rfs_log" 2>/dev/null || true
-    ok "Повреждённая стартовая заглушка автоматически создана заново в UTF-8"
-    return 0
-}
-
 authoritative_config_preflight(){
     acp_log="$TMP_ROOT/config-mihomo-preflight.$$"
     if mihomo_config_test_install "$ACTIVE_CONFIG" "$acp_log"; then
         rm -f "$acp_log" 2>/dev/null || true
         return 0
     fi
-
-    if config_test_has_utf8_error_install "$acp_log"; then
-        # A broken factory DIRECT placeholder has no user VPN payload, so repair
-        # it automatically. Real proxies/groups/providers/custom rules are never overwritten.
-        if config_looks_like_factory_stub_install "$ACTIVE_CONFIG"; then
-            warn "Стартовая заглушка повреждена; создаю чистый config.yaml заново"
-            rm -f "$acp_log" 2>/dev/null || true
-            rebuild_factory_stub_install && return 0
-            return 1
-        fi
-        data_only="$TMP_ROOT/config-data-only-test.$$"
-        data_log="$acp_log.data"
-        strip_whole_line_comments_install "$ACTIVE_CONFIG" "$data_only" || true
-        if test -s "$data_only"; then
-            if mihomo_config_test_install "$data_only" "$data_log"; then
-                cat "$acp_log" >&2 2>/dev/null || true
-                rm -f "$acp_log" "$data_log" "$data_only" 2>/dev/null || true
-                fail "Внутренняя ошибка: YAML без комментариев валиден, но русские комментарии в итоговом config.yaml повреждены"
-                fail "Установка остановлена: комментарии должны оставаться нормальным UTF-8"
-                return 1
-            fi
-            if config_test_has_utf8_error_install "$data_log"; then
-                cat "$acp_log" >&2 2>/dev/null || true
-                rm -f "$acp_log" "$data_log" "$data_only" 2>/dev/null || true
-                fail "config.yaml действительно содержит невалидный UTF-8 внутри YAML-данных"
-                fail "Повреждены пользовательские YAML-данные; автоматическая замена отключена, чтобы не потерять настройки"
-                return 1
-            fi
-            # Do not mislabel a second, unrelated Mihomo validation failure as
-            # bad UTF-8.  Surface the real parser/semantic error instead.
-            cat "$data_log" >&2 2>/dev/null || true
-            rm -f "$acp_log" "$data_log" "$data_only" 2>/dev/null || true
-            fail "После удаления комментариев Mihomo отклонил YAML уже по другой причине; смотри ошибку выше"
-            return 1
-        fi
-        cat "$acp_log" >&2 2>/dev/null || true
-        rm -f "$acp_log" "$data_log" "$data_only" 2>/dev/null || true
-        fail "Не удалось построить временный config.yaml без комментариев для UTF-8 диагностики"
-        return 1
-    fi
-
     cat "$acp_log" >&2 2>/dev/null || true
     rm -f "$acp_log" 2>/dev/null || true
-    fail "Mihomo отклонил config.yaml"
+    fail "config.yaml не прошёл mihomo -t. Файл НЕ заменён и НЕ восстановлен автоматически"
+    fail "Исправь config.yaml вручную; passive backups лежат в $BASE/backups, если ты их создавал"
     return 1
 }
 
@@ -2714,6 +2281,37 @@ remove_pre3712_autostart(){
     fi
 }
 
+wrap_persistent_nano_utf8(){
+    nano="$DM_ROOT/bin/nano"
+    real="$DM_ROOT/bin/nano.real"
+
+    test -x "$nano" || { fail "nano не найден: $nano"; return 1; }
+
+    if grep -Fq '# GoshaCrash persistent UTF-8 nano wrapper' "$nano" 2>/dev/null; then
+        test -x "$real" || { fail "nano wrapper есть, но $real отсутствует"; return 1; }
+        return 0
+    fi
+
+    if test -e "$real"; then rm -f "$real" || return 1; fi
+    mv -f "$nano" "$real" || { fail "Не удалось сохранить реальный nano в $real"; return 1; }
+
+    cat > "$nano" <<'NANO_WRAP'
+#!/bin/sh
+# GoshaCrash persistent UTF-8 nano wrapper
+LANG=en_US.UTF-8
+LC_ALL=en_US.UTF-8
+TERM=${TERM:-xterm-256color}
+SELF_DIR="$(CDPATH= cd "$(dirname "$0")" 2>/dev/null && pwd)"
+DM_ROOT="$(dirname "$SELF_DIR")"
+LD_LIBRARY_PATH="/tmp/goshacrash-opt/lib:$DM_ROOT/lib:/lib:/usr/lib"
+export LANG LC_ALL TERM LD_LIBRARY_PATH
+exec "$SELF_DIR/nano.real" "$@"
+NANO_WRAP
+    chmod 755 "$nano" "$real" || return 1
+    say "nano обёрнут один раз на USB: любой вызов nano работает с UTF-8"
+    return 0
+}
+
 install_hooks(){
     # Keep GoshaCrash-owned persistent data inside $BASE. Outside it we leave
     # only the standard ASUS hook/wrapper files that firmware actually calls.
@@ -2851,6 +2449,8 @@ rm -f /tmp/goshacrash-base 2>/dev/null || true
 exit "$RC"
 HOOK
     chmod 755 /jffs/scripts/usb-umount-script || return 1
+
+    wrap_persistent_nano_utf8 || return 1
 
     rm -f /jffs/scripts/gc /jffs/scripts/nano "$DM_ROOT/bin/gc" /opt/bin/gc 2>/dev/null || true
     write_command_wrapper /jffs/scripts/gc
@@ -3002,6 +2602,7 @@ main(){
     acquire_lock || return 1
 
     verify_asuswrt || return 1
+    disable_mptcp_install || return 1
     detect_installer_usb || return 1
     legacy_preflight_before_dm || return 1
     find_download_master || return 1
@@ -3061,13 +2662,9 @@ main(){
     install_hooks || return 1
     if test "${LEGACY:-0}" = 1; then verify_shell_compat || return 1; fi
     if ! GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" check; then
-        fail "Новый config.yaml не прошёл встроенную проверку Mihomo; исходный пользовательский конфиг будет восстановлен"
+        fail "config.yaml не прошёл проверку Mihomo. Файл оставлен как есть; исправь его вручную"
         return 1
     fi
-    # Syntax/semantic validation succeeded. Commit the in-place migration now;
-    # a later runtime failure must not roll back a syntactically valid config.
-    CONFIG_MIGRATION_PENDING="0"
-    test -n "$CONFIG_ROLLBACK_TMP" && rm -f "$CONFIG_ROLLBACK_TMP" 2>/dev/null || true
 
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" restart || {
         fail "Первый запуск не удался. Проверь $BASE/logs/mihomo.log и команду gc logs"

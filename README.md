@@ -1,3 +1,11 @@
+# rc40-test2 — simplified config/native auto build
+
+В этой сборке config.yaml не восстанавливается и не переписывается автоматически. install.sh создаёт базовый файл только при отсутствии config.yaml; дальше пользователь владеет файлом. AUTO использует только native Mihomo auto-route/auto-redirect/dns-hijack. Nano на USB обёрнут постоянным UTF-8 wrapper.
+
+Подробности: `FIX-SIMPLE-CONFIG-AUTO.txt`.
+
+---
+
 # GoshaCrash 3.10.2-rc40-test2
 
 Текущая схема для ASUS RT-AC68U и ZenWiFi BT10.

@@ -4,7 +4,7 @@
 # Zashboard updates are triggered from the native button inside Zashboard.
 
 VERSION="3.10.2-rc40-test2"
-BUILD_ID="2026-09-03-dynamic-usb-utf8-coldboot-v3-editpause"
+BUILD_ID="2026-09-04-simple-config-native-auto-v1"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -180,6 +180,22 @@ load_platform(){
     PKG_PATH=""
     DM_ROOT=""
     refresh_storage_identity
+
+    # config.yaml is user-owned and is the routing source of truth. platform.env
+    # stores hardware facts, but must not force a stale routing mode after the
+    # user edits tun.auto-route/auto-redirect directly.
+    if [ "${MIHOMO_TARGET:-}" = armv5 ]; then
+        ROUTING_MODE="manual"
+        TUN_STACK="gvisor"
+    elif [ -f "$CONFIG" ]; then
+        ar="$(yaml_section "$CONFIG" tun auto-route 2>/dev/null)"
+        ad="$(yaml_section "$CONFIG" tun auto-redirect 2>/dev/null)"
+        if is_true "$ar" && is_true "$ad"; then
+            ROUTING_MODE="auto"
+        else
+            ROUTING_MODE="manual"
+        fi
+    fi
     return 0
 }
 
@@ -950,6 +966,63 @@ reserved_destinations(){
 NETS
 }
 
+mptcp_knob(){
+    for p in "$PROC_SYS/net/mptcp/mptcp_enabled" "$PROC_SYS/net/mptcp/enabled"; do
+        [ -e "$p" ] && { printf '%s\n' "$p"; return 0; }
+    done
+    return 1
+}
+
+mptcp_disable_compat(){
+    p="$(mptcp_knob 2>/dev/null)" || return 0
+    [ -w "$p" ] || return 0
+    v="$(cat "$p" 2>/dev/null)"
+    [ "$v" = 0 ] && return 0
+    printf '0\n' > "$p" 2>/dev/null || return 1
+    log_event OK compat "MPTCP disabled via $p"
+    return 0
+}
+
+mptcp_status(){
+    p="$(mptcp_knob 2>/dev/null)" || { printf '%s\n' unavailable; return 0; }
+    v="$(cat "$p" 2>/dev/null)"
+    case "$v" in 0) printf '%s\n' disabled;; 1) printf '%s\n' ENABLED;; *) printf 'unknown(%s)\n' "$v";; esac
+}
+
+auto_route_policy_ok(){
+    [ -n "$IP_BIN" ] && [ -x "$IP_BIN" ] || return 1
+    "$IP_BIN" route show default 2>/dev/null | grep -Eq "^default .*dev[[:space:]]+$TUN_DEVICE([[:space:]]|$)" && return 0
+    for table in $("$IP_BIN" rule show 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(($i=="lookup" || $i=="table") && (i+1)<=NF){print $(i+1)}}'); do
+        case "$table" in local|main|default) continue;; esac
+        "$IP_BIN" route show table "$table" 2>/dev/null | grep -Eq "^default .*dev[[:space:]]+$TUN_DEVICE([[:space:]]|$)" && return 0
+    done
+    return 1
+}
+
+auto_redirect_ok(){
+    for save in /usr/sbin/iptables-save /sbin/iptables-save /usr/bin/iptables-save /bin/iptables-save; do
+        [ -x "$save" ] || continue
+        "$save" 2>/dev/null | grep -Eq "mihomo-(prerouting|output)|REDIRECT.*--to-ports" && return 0
+    done
+    for nft in /usr/sbin/nft /sbin/nft /usr/bin/nft /bin/nft; do
+        [ -x "$nft" ] || continue
+        "$nft" list ruleset 2>/dev/null | grep -Eq "table[[:space:]]+inet[[:space:]]+mihomo|redirect[[:space:]]+to" && return 0
+    done
+    return 1
+}
+
+auto_dns_hijack_ok(){
+    for save in /usr/sbin/iptables-save /sbin/iptables-save /usr/bin/iptables-save /bin/iptables-save; do
+        [ -x "$save" ] || continue
+        "$save" 2>/dev/null | grep -Eq -- '-A mihomo-prerouting .*--dport 53 .*-(j DNAT|j REDIRECT)' && return 0
+    done
+    for nft in /usr/sbin/nft /sbin/nft /usr/bin/nft /bin/nft; do
+        [ -x "$nft" ] || continue
+        "$nft" list ruleset 2>/dev/null | grep -Eq 'mihomo|th dport 53.*(dnat|redirect)' &&         "$nft" list ruleset 2>/dev/null | grep -Eq 'th dport 53.*(dnat|redirect)' && return 0
+    done
+    return 1
+}
+
 save_sysctl(){ name="$1"; path="$2"; [ -r "$path" ] || return 0; mkdir -p "$ROUTE_STATE" || return 1; file="$ROUTE_STATE/sysctl.$name"; [ -f "$file" ] || cat "$path" > "$file"; }
 set_sysctl_zero(){ name="$1"; path="$2"; save_sysctl "$name" "$path" || return 1; [ -w "$path" ] && printf '0\n' > "$path" 2>/dev/null || true; }
 prepare_sysctls(){
@@ -1117,6 +1190,7 @@ runtime_health_ok(){
     running_pid >/dev/null 2>&1 || return 1
     netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" || return 1
     net_link_exists "$TUN_DEVICE" || return 1
+    [ "$(mptcp_status)" != ENABLED ] || return 1
     route_status >/dev/null 2>&1 || return 1
 }
 watchdog_connectivity_step(){
@@ -1185,21 +1259,39 @@ manual_route_status(){
 
 modern_route_start(){
     prepare_sysctls || true
+    mptcp_disable_compat || { fail "Не удалось отключить MPTCP"; return 1; }
     net_link_exists "$TUN_DEVICE" || { fail "Mihomo не создал $TUN_DEVICE"; return 1; }
     is_true "$(yaml_section "$CONFIG" tun auto-route)" || { fail "В конфиге выключен auto-route"; return 1; }
     is_true "$(yaml_section "$CONFIG" tun auto-redirect)" || { fail "В конфиге выключен auto-redirect"; return 1; }
-    printf 'mode=auto\ndevice=%s\n' "$TUN_DEVICE" > "$ROUTE_ACTIVE"
-    log_event OK route "automatic routing управляется Mihomo"
+
+    # Native Mihomo auto mode is the only implementation. Do not edit
+    # /tmp/resolv.dnsmasq and do not create fallback policy tables.
+    n=0
+    while [ "$n" -lt 15 ]; do
+        if auto_route_policy_ok && auto_redirect_ok && auto_dns_hijack_ok; then
+            printf 'mode=auto\ndevice=%s\nimplementation=native\n' "$TUN_DEVICE" > "$ROUTE_ACTIVE"
+            log_event OK route "native Mihomo auto-route + auto-redirect + DNS hijack"
+            return 0
+        fi
+        sleep 1
+        n=$((n + 1))
+    done
+
+    auto_route_policy_ok || warn "native auto-route policy отсутствует (ожидались rules/table Mihomo)"
+    auto_redirect_ok || warn "native auto-redirect TCP отсутствует"
+    auto_dns_hijack_ok || warn "native dns-hijack :53 отсутствует"
+    return 1
 }
 modern_route_stop(){ restore_sysctls; rm -f "$ROUTE_ACTIVE"; }
 modern_route_status(){
     net_link_exists "$TUN_DEVICE" || return 1
     is_true "$(yaml_section "$CONFIG" tun auto-route)" || return 1
     is_true "$(yaml_section "$CONFIG" tun auto-redirect)" || return 1
-    if [ -n "$IP_BIN" ]; then
-        "$IP_BIN" route show table all 2>/dev/null | grep -Eq "dev[[:space:]]+$TUN_DEVICE([[:space:]]|$)" || return 1
-    fi
+    auto_route_policy_ok || return 1
+    auto_redirect_ok || return 1
+    auto_dns_hijack_ok || return 1
 }
+
 route_start(){
     if [ "$ROUTING_MODE" = manual ]; then manual_route_start; else modern_route_start; fi
 }
@@ -1271,9 +1363,18 @@ start_runtime(){
     load_platform || return 1
     repair_opt >/dev/null 2>&1 || true
     refresh_path
+    mptcp_disable_compat || { fail "Не удалось отключить MPTCP"; return 1; }
     check_config || return 1
     ensure_tun || { fail "/dev/net/tun недоступен"; return 1; }
-    if p="$(running_pid)"; then route_start || return 1; say "Mihomo уже работает, PID=$p"; return 0; fi
+    if p="$(running_pid)"; then
+        if route_start; then
+            say "Mihomo уже работает, PID=$p; runtime проверен"
+            return 0
+        fi
+        warn "Mihomo PID=$p есть, но runtime неполный; выполняю чистый перезапуск ядра"
+        kill_mihomo
+        sleep 1
+    fi
     if [ "${LEGACY:-1}" = 0 ]; then
         wait_modern_uplink 60 || { fail "Modern uplink ещё не готов: стабильный ip route get не получен"; return 1; }
     fi
@@ -1438,7 +1539,8 @@ cleanup_stale_runtime_state(){
 }
 
 stop_runtime(){
-    if [ "$ROUTING_MODE" = auto ]; then kill_mihomo; route_stop >/dev/null 2>&1 || true; else route_stop >/dev/null 2>&1 || true; kill_mihomo; fi
+    route_stop >/dev/null 2>&1 || true
+    kill_mihomo
     rm -rf "$START_LOCK" 2>/dev/null || true
 }
 
@@ -1513,6 +1615,7 @@ watchdog_check(){
     boot_lock_active && return 0
     control_lock_active && return 0
     start_lock_active && return 0
+    mptcp_disable_compat >/dev/null 2>&1 || true
     watchdog_connectivity_step || true
     [ -f "$WAN_OFFLINE" ] && return 0
     if ! running_pid >/dev/null 2>&1; then
@@ -1554,6 +1657,7 @@ start(){
     ensure_dirs || return 1
     load_platform || return 1
     refresh_path
+    mptcp_disable_compat || { fail "Не удалось отключить MPTCP"; return 1; }
     check_config || return 1
 
     rm -f "$MANUAL_STOP"
@@ -1604,6 +1708,7 @@ restart(){
     ensure_dirs || return 1
     load_platform || return 1
     refresh_path
+    mptcp_disable_compat || { fail "Не удалось отключить MPTCP"; return 1; }
 
     check_config || return 1
     rm -f "$MANUAL_STOP"
@@ -1658,6 +1763,7 @@ boot(){
     ensure_dirs || return 1
     load_platform || return 1
     refresh_path
+    mptcp_disable_compat >/dev/null 2>&1 || true
 
     if [ -f "$MANUAL_STOP" ]; then
         printf '[%s] boot: manual-stop present; autostart skipped\n' "$(now)"
@@ -1821,51 +1927,40 @@ repair_nano_runtime(){
     find_editor >/dev/null 2>&1
 }
 
+passive_config_backup(){
+    tag="${1:-manual}"
+    [ -f "$CONFIG" ] || return 1
+    mkdir -p "$BASE/backups" 2>/dev/null || return 1
+    stamp="$(date '+%Y%m%d-%H%M%S' 2>/dev/null || echo now)"
+    dst="$BASE/backups/config-$tag-$stamp.yaml"
+    cp -f "$CONFIG" "$dst" || return 1
+    printf '%s\n' "$dst"
+}
+
 edit_config(){
     load_platform || return 1
     refresh_path
 
     editor="$(find_editor 2>/dev/null)"
     if [ -z "$editor" ]; then
-        repair_nano_runtime || {
-            fail "nano не удалось восстановить. См. $PACKAGES_LOG"
-            return 1
-        }
-        editor="$(find_editor 2>/dev/null)" || {
-            fail "nano не найден после восстановления Optware"
-            return 1
-        }
+        repair_nano_runtime || { fail "nano не удалось восстановить. См. $PACKAGES_LOG"; return 1; }
+        editor="$(find_editor 2>/dev/null)" || { fail "nano не найден после восстановления Optware"; return 1; }
     fi
 
-    # Только временная копия для отката невалидной правки. Она живёт в /tmp
-    # и удаляется сразу после проверки; постоянные backup-файлы не создаются.
-    original="/tmp/goshacrash-config-edit.$$"
-    rm -f "$original" 2>/dev/null || true
-    cp -f "$CONFIG" "$original" || {
-        fail "Не удалось подготовить временную копию config.yaml"
-        return 1
-    }
+    backup="$(passive_config_backup edit 2>/dev/null)"
+    [ -n "$backup" ] && say "Passive backup: $backup"
 
-    run_editor_utf8 "$editor" "$CONFIG" || {
-        cp -f "$original" "$CONFIG" 2>/dev/null || true
-        rm -f "$original" 2>/dev/null || true
-        warn "Редактор завершился с ошибкой; исходный config.yaml восстановлен"
-        return 1
-    }
+    run_editor_utf8 "$editor" "$CONFIG"
+    edit_rc=$?
+    [ "$edit_rc" -eq 0 ] || warn "Редактор завершился с кодом $edit_rc; config.yaml оставлен как есть"
 
     say "Проверяю config.yaml встроенной проверкой Mihomo (-t)..."
     if ! check_config; then
-        cp -f "$original" "$CONFIG" || {
-            rm -f "$original" 2>/dev/null || true
-            fail "Конфиг некорректен, и не удалось восстановить предыдущую версию"
-            return 1
-        }
-        rm -f "$original" 2>/dev/null || true
-        fail "Проверка не пройдена; предыдущий config.yaml восстановлен. Неудачная правка не сохранялась."
+        fail "config.yaml сохранён, но проверку не прошёл. Автовосстановления нет"
+        [ -n "$backup" ] && fail "При необходимости восстанови вручную: cp '$backup' '$CONFIG'"
         return 1
     fi
 
-    rm -f "$original" 2>/dev/null || true
     mkdir -p "$STATE" 2>/dev/null || true
     printf '%s\n' user > "$STATE/config-origin" 2>/dev/null || true
     ok "Синтаксис config.yaml: OK"
@@ -1972,44 +2067,37 @@ set_routing_mode(){
     fi
 
     ensure_dirs || return 1
-    cfg_snapshot="/tmp/goshacrash-routing-config.$$"
-    state_snapshot="/tmp/goshacrash-routing-platform.$$"
-    rm -f "$cfg_snapshot" "$state_snapshot" 2>/dev/null || true
-    cp -f "$CONFIG" "$cfg_snapshot" || return 1
-    cp -f "$PLATFORM_FILE" "$state_snapshot" || { rm -f "$cfg_snapshot"; return 1; }
+    backup="$(passive_config_backup routing-$ROUTING_MODE-to-$mode 2>/dev/null)"
+    [ -n "$backup" ] && say "Passive backup: $backup"
 
     watchdog_stop
     stop_runtime
     if ! rewrite_config_for_routing "$mode"; then
-        cp -f "$cfg_snapshot" "$CONFIG" 2>/dev/null || true
-        rm -f "$cfg_snapshot" "$state_snapshot" 2>/dev/null || true
-        return 1
-    fi
-    stack="system"; [ "$MIHOMO_TARGET" = armv5 ] && stack="gvisor"
-    if ! platform_set ROUTING_MODE "$mode" || ! platform_set TUN_STACK "$stack" || ! load_platform; then
-        cp -f "$cfg_snapshot" "$CONFIG" 2>/dev/null || true
-        cp -f "$state_snapshot" "$PLATFORM_FILE" 2>/dev/null || true
-        rm -f "$cfg_snapshot" "$state_snapshot" 2>/dev/null || true
-        load_platform >/dev/null 2>&1 || true
+        fail "Не удалось изменить routing-поля config.yaml; автоматического отката нет"
+        [ -n "$backup" ] && fail "Backup: $backup"
         return 1
     fi
 
-    if check_config && with_start_lock start_runtime; then
+    stack="system"; [ "$MIHOMO_TARGET" = armv5 ] && stack="gvisor"
+    platform_set ROUTING_MODE "$mode" >/dev/null 2>&1 || true
+    platform_set TUN_STACK "$stack" >/dev/null 2>&1 || true
+    load_platform >/dev/null 2>&1 || true
+
+    if ! check_config; then
+        fail "После переключения routing config.yaml не проходит проверку; автоматического отката нет"
+        [ -n "$backup" ] && fail "Восстановить вручную: cp '$backup' '$CONFIG'"
+        return 1
+    fi
+
+    if with_start_lock start_runtime; then
         rm -f "$MANUAL_STOP"
         watchdog_start
-        rm -f "$cfg_snapshot" "$state_snapshot" 2>/dev/null || true
         ok "Маршрутизация переключена на $mode"
         return 0
     fi
 
-    warn "Новый режим не запустился; возвращаю предыдущую конфигурацию"
-    stop_runtime >/dev/null 2>&1 || true
-    cp -f "$cfg_snapshot" "$CONFIG" 2>/dev/null || true
-    cp -f "$state_snapshot" "$PLATFORM_FILE" 2>/dev/null || true
-    rm -f "$cfg_snapshot" "$state_snapshot" 2>/dev/null || true
-    load_platform >/dev/null 2>&1 || true
-    with_start_lock start_runtime >/dev/null 2>&1 || true
-    watchdog_start >/dev/null 2>&1 || true
+    fail "Режим $mode записан, но runtime не поднялся. Конфиг не откатывался; исправь причину и выполни gc restart"
+    [ -n "$backup" ] && warn "Backup предыдущего config: $backup"
     return 1
 }
 
@@ -2120,6 +2208,15 @@ follow_logs(){
     tail -n "$lines" -f "$MIHOMO_LOG"
 }
 
+controller_api_ok(){
+    port="$(controller_port)"
+    for w in /usr/sbin/wget /usr/bin/wget /bin/wget; do
+        [ -x "$w" ] || continue
+        "$w" -q -T 2 -O - "http://127.0.0.1:$port/version" 2>/dev/null | grep -q '"version"' && return 0
+    done
+    return 1
+}
+
 status(){
     ensure_dirs >/dev/null 2>&1 || true; load_platform >/dev/null 2>&1 || true; refresh_path
     if p="$(running_pid 2>/dev/null)"; then echo "Mihomo: работает, PID=$p"; else echo "Mihomo: не запущен"; fi
@@ -2127,6 +2224,7 @@ status(){
     if p="$(watchdog_pid 2>/dev/null)"; then echo "Watchdog: работает, PID=$p"; else echo "Watchdog: не запущен"; fi
     if [ "${LEGACY:-0}" = 1 ] && [ "${MIHOMO_TARGET:-}" = armv5 ]; then echo "Совместимость: legacy ARMv5 + gVisor"; fi
     echo "Режим маршрутизации: $ROUTING_MODE"
+    echo "MPTCP: $(mptcp_status)"
     echo "USB: ${USB_DEVICE:-?} -> $USB_MOUNT (name=$USB_NAME, fs=${USB_FS:-?})"
     echo "Конфиг: $CONFIG"
     net_link_exists "$TUN_DEVICE" && echo "TUN: $TUN_DEVICE работает" || echo "TUN: $TUN_DEVICE не найден"
@@ -2137,10 +2235,12 @@ status(){
         echo "Zashboard: недоступен (Mihomo не запущен); URL: $dash_url"
     elif [ ! -s "$BASE/ui/index.html" ]; then
         echo "Zashboard: UI-файлы отсутствуют; URL: $dash_url"
-    elif tcp_listener_exists "$dash_port"; then
-        echo "Zashboard: OK; URL: $dash_url"
-    else
+    elif ! tcp_listener_exists "$dash_port"; then
         echo "Zashboard: controller $dash_port не слушает; URL: $dash_url"
+    elif controller_api_ok; then
+        echo "Zashboard: UI + API OK; URL: $dash_url"
+    else
+        echo "Zashboard: UI есть, но API /version не отвечает; URL: $dash_url"
     fi
 }
 
@@ -2621,6 +2721,12 @@ doctor(){
     fi
     netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" \
         && echo "  Mihomo DNS: OK" || echo "  Mihomo DNS: DOWN"
+    echo "  MPTCP: $(mptcp_status)"
+    if [ "$ROUTING_MODE" = auto ]; then
+        auto_route_policy_ok && echo "  auto-route policy: OK (native Mihomo)" || echo "  auto-route policy: FAIL"
+        auto_redirect_ok && echo "  auto-redirect TCP: OK (native Mihomo)" || echo "  auto-redirect TCP: FAIL"
+        auto_dns_hijack_ok && echo "  dns-hijack :53: OK (native Mihomo)" || echo "  dns-hijack :53: FAIL"
+    fi
     if net_link_exists "$TUN_DEVICE"; then
         echo "  Mihomo TUN $TUN_DEVICE: UP"
         route_status >/dev/null 2>&1 && echo "  routing runtime: OK" || echo "  routing runtime: FAIL"
