@@ -4,7 +4,7 @@
 # package tools through ASUS Download Master, configuration and autostart.
 
 INSTALLER_VERSION="3.10.2-rc40-test2"
-EXPECTED_CONTROLLER_BUILD_ID="2026-09-04-simple-config-native-auto-v1"
+EXPECTED_CONTROLLER_BUILD_ID="2026-09-09-simple-config-native-auto-mptcp-passive-logs-nav-v1"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -81,19 +81,14 @@ ok(){ _emit OK "$@"; }
 warn(){ _emit WARN "$@" >&2; }
 fail(){ _emit ERROR "$@" >&2; return 1; }
 
-disable_mptcp_install(){
+report_mptcp_install(){
     for p in /proc/sys/net/mptcp/mptcp_enabled /proc/sys/net/mptcp/enabled; do
         test -e "$p" || continue
         v="$(cat "$p" 2>/dev/null)"
-        if test "$v" != 0 && test -w "$p"; then
-            printf '0\n' > "$p" 2>/dev/null || { warn "Не удалось отключить MPTCP через $p"; return 1; }
-            say "MPTCP отключён для совместимости с transparent proxy: $p"
-        else
-            say "MPTCP: ${v:-unknown} ($p)"
-        fi
+        say "MPTCP оставлен без изменений: ${v:-unknown} ($p)"
         return 0
     done
-    say "MPTCP sysctl отсутствует: дополнительная настройка не требуется"
+    say "MPTCP sysctl отсутствует: состояние не меняется"
     return 0
 }
 
@@ -1684,7 +1679,7 @@ install_controller(){
     else
         fetch_matching_controller "$tmp" || {
             fail "Не удалось получить goshacrash.sh версии $INSTALLER_VERSION"
-            fail "Загрузи install.sh и goshacrash.sh из одной сборки либо дождись обновления main на GitHub"
+            fail "Загрузи install.sh и goshacrash.sh из одной сборки либо дождись обновления ветки $BRANCH на GitHub"
             return 1
         }
     fi
@@ -2602,7 +2597,7 @@ main(){
     acquire_lock || return 1
 
     verify_asuswrt || return 1
-    disable_mptcp_install || return 1
+    report_mptcp_install || return 1
     detect_installer_usb || return 1
     legacy_preflight_before_dm || return 1
     find_download_master || return 1

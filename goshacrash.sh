@@ -4,7 +4,7 @@
 # Zashboard updates are triggered from the native button inside Zashboard.
 
 VERSION="3.10.2-rc40-test2"
-BUILD_ID="2026-09-04-simple-config-native-auto-v1"
+BUILD_ID="2026-09-09-simple-config-native-auto-mptcp-passive-logs-nav-v1"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -973,16 +973,6 @@ mptcp_knob(){
     return 1
 }
 
-mptcp_disable_compat(){
-    p="$(mptcp_knob 2>/dev/null)" || return 0
-    [ -w "$p" ] || return 0
-    v="$(cat "$p" 2>/dev/null)"
-    [ "$v" = 0 ] && return 0
-    printf '0\n' > "$p" 2>/dev/null || return 1
-    log_event OK compat "MPTCP disabled via $p"
-    return 0
-}
-
 mptcp_status(){
     p="$(mptcp_knob 2>/dev/null)" || { printf '%s\n' unavailable; return 0; }
     v="$(cat "$p" 2>/dev/null)"
@@ -1190,7 +1180,6 @@ runtime_health_ok(){
     running_pid >/dev/null 2>&1 || return 1
     netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" || return 1
     net_link_exists "$TUN_DEVICE" || return 1
-    [ "$(mptcp_status)" != ENABLED ] || return 1
     route_status >/dev/null 2>&1 || return 1
 }
 watchdog_connectivity_step(){
@@ -1259,7 +1248,6 @@ manual_route_status(){
 
 modern_route_start(){
     prepare_sysctls || true
-    mptcp_disable_compat || { fail "Не удалось отключить MPTCP"; return 1; }
     net_link_exists "$TUN_DEVICE" || { fail "Mihomo не создал $TUN_DEVICE"; return 1; }
     is_true "$(yaml_section "$CONFIG" tun auto-route)" || { fail "В конфиге выключен auto-route"; return 1; }
     is_true "$(yaml_section "$CONFIG" tun auto-redirect)" || { fail "В конфиге выключен auto-redirect"; return 1; }
@@ -1363,7 +1351,6 @@ start_runtime(){
     load_platform || return 1
     repair_opt >/dev/null 2>&1 || true
     refresh_path
-    mptcp_disable_compat || { fail "Не удалось отключить MPTCP"; return 1; }
     check_config || return 1
     ensure_tun || { fail "/dev/net/tun недоступен"; return 1; }
     if p="$(running_pid)"; then
@@ -1615,7 +1602,6 @@ watchdog_check(){
     boot_lock_active && return 0
     control_lock_active && return 0
     start_lock_active && return 0
-    mptcp_disable_compat >/dev/null 2>&1 || true
     watchdog_connectivity_step || true
     [ -f "$WAN_OFFLINE" ] && return 0
     if ! running_pid >/dev/null 2>&1; then
@@ -1657,7 +1643,6 @@ start(){
     ensure_dirs || return 1
     load_platform || return 1
     refresh_path
-    mptcp_disable_compat || { fail "Не удалось отключить MPTCP"; return 1; }
     check_config || return 1
 
     rm -f "$MANUAL_STOP"
@@ -1708,7 +1693,6 @@ restart(){
     ensure_dirs || return 1
     load_platform || return 1
     refresh_path
-    mptcp_disable_compat || { fail "Не удалось отключить MPTCP"; return 1; }
 
     check_config || return 1
     rm -f "$MANUAL_STOP"
@@ -1763,7 +1747,6 @@ boot(){
     ensure_dirs || return 1
     load_platform || return 1
     refresh_path
-    mptcp_disable_compat >/dev/null 2>&1 || true
 
     if [ -f "$MANUAL_STOP" ]; then
         printf '[%s] boot: manual-stop present; autostart skipped\n' "$(now)"
@@ -2473,23 +2456,86 @@ menu_read_key(){
     esac
 }
 
+menu_logs_draw(){
+    log_selected="$1"
+    printf '\033[?25l\033[2J\033[H'
+    printf '\033[1;36m'
+    printf '┌───────────────────────────────────────────┐\n'
+    printf '│                   LOGS                    │\n'
+    printf '├───────────────────────────────────────────┤\n'
+    printf '\033[0m'
+    menu_item "$log_selected" 1 "Mihomo: last 100 lines"
+    menu_item "$log_selected" 2 "Mihomo: live"
+    printf '\033[1;36m'
+    printf '├───────────────────────────────────────────┤\n'
+    printf '\033[0m'
+    printf '│  \033[2m↑/↓ Navigate   Enter Select   Esc Main\033[0m   │\n'
+    printf '\033[1;36m'
+    printf '└───────────────────────────────────────────┘\n'
+    printf '\033[0m'
+}
+
 menu_logs(){
+    # The normal full-screen menu has already restored canonical terminal mode
+    # before entering this submenu. Switch back to raw mode only while we read
+    # Up/Down/Enter/Esc, then restore it before showing log output.
+    if [ -z "${MENU_TTY_MODE:-}" ] || [ -z "${MENU_STTY_BACKEND:-}" ]; then
+        # Portable fallback for very old terminals where raw key reading is not
+        # available. The normal ASUS SSH path uses the arrow-key menu below.
+        while :; do
+            printf '\n=== MIHOMO LOG ===\n'
+            echo "  u) Последние 100 строк"
+            echo "  l) LIVE"
+            echo "  q) Главное меню"
+            printf 'Выбор [u/l/q]: '
+            IFS= read -r log_choice || return 0
+            case "$log_choice" in
+                u|U) show_logs mihomo 100; printf '\nНажми Enter, чтобы вернуться...'; IFS= read -r _gc_log_dummy || return 0 ;;
+                l|L) follow_logs mihomo 100 ;;
+                q|Q) return 0 ;;
+                *) echo "Неверный выбор" ;;
+            esac
+        done
+    fi
+
+    log_old_stty="$(menu_stty -g 2>/dev/null)"
+    [ -n "$log_old_stty" ] || log_old_stty="$MENU_OLD_STTY"
+    log_selected=1
+    menu_stty -echo -icanon min 1 time 0 >/dev/null 2>&1 || return 0
+    menu_logs_draw "$log_selected"
+
     while :; do
-      printf '\033[2J\033[H'
-      printf '\033[1;36m=== MIHOMO LOG ===\033[0m\n\n'
-      echo "  1) Последние 100 строк"
-      echo "  2) LIVE"
-      echo "  3) Назад"
-      echo
-      printf "Выбор [1-3]: "
-      IFS= read -r log_choice || return 0
-      case "$log_choice" in
-        1) show_logs mihomo 100; menu_pause ;;
-        2) follow_logs mihomo 100; menu_pause ;;
-        3) return 0 ;;
-        *) echo "Неверный выбор"; sleep 1 ;;
-      esac
+        log_key="$(menu_read_key)"
+        case "$log_key" in
+            up)
+                log_selected=$((log_selected - 1))
+                [ "$log_selected" -lt 1 ] && log_selected=2
+                menu_logs_draw "$log_selected"
+                ;;
+            down)
+                log_selected=$((log_selected + 1))
+                [ "$log_selected" -gt 2 ] && log_selected=1
+                menu_logs_draw "$log_selected"
+                ;;
+            quit)
+                break
+                ;;
+            enter)
+                menu_stty "$log_old_stty" >/dev/null 2>&1 || true
+                printf '\033[?25h\033[2J\033[H'
+                case "$log_selected" in
+                    1) show_logs mihomo 100; menu_pause ;;
+                    2) follow_logs mihomo 100; menu_pause ;;
+                esac
+                menu_stty -echo -icanon min 1 time 0 >/dev/null 2>&1 || true
+                menu_logs_draw "$log_selected"
+                ;;
+        esac
     done
+
+    menu_stty "$log_old_stty" >/dev/null 2>&1 || true
+    printf '\033[0m\033[?25h'
+    return 0
 }
 
 menu_basic(){
