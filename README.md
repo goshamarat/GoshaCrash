@@ -1,202 +1,227 @@
-# rc40-test2 — simplified config/native auto build
+# GoshaCrash
 
-В этой сборке config.yaml не восстанавливается и не переписывается автоматически. install.sh создаёт базовый файл только при отсутствии config.yaml; дальше пользователь владеет файлом. AUTO использует только native Mihomo auto-route/auto-redirect/dns-hijack. Nano на USB обёрнут постоянным UTF-8 wrapper.
+**Mihomo + Zashboard для ASUSWRT-роутеров.**  
+Установка, TUN-маршрутизация, автозапуск, watchdog, диагностика и управление из одного `gc`.
 
-Подробности: `FIX-SIMPLE-CONFIG-AUTO.txt`.
+> Текущая публичная сборка: **3.10.2-rc40-test2**
 
----
+## Поддерживаемые роутеры
 
-# GoshaCrash 3.10.2-rc40-test2
+| Роутер | Архитектура | Mihomo | Routing | TUN stack | USB |
+|---|---|---|---|---|---|
+| ASUS RT-AC68U и совместимые legacy-модели | ARMv5 profile | legacy build with gVisor | manual | gVisor | EXT3 |
+| ASUS ZenWiFi BT10 | ARMv7 | official ARMv7 build | native auto-route / auto-redirect | system | EXT4 |
 
-Текущая схема для ASUS RT-AC68U и ZenWiFi BT10.
+Для других ASUSWRT-устройств установщик определяет архитектуру автоматически, но основные проверенные профили проекта — RT-AC68U и BT10.
 
-## Главное
+## Что делает GoshaCrash
 
-`install.sh` больше **не форматирует USB**. Подготовка/форматирование флешки выполняется отдельной программой.
+- устанавливает и запускает Mihomo;
+- устанавливает Zashboard;
+- поднимает TUN и нужную маршрутизацию;
+- восстанавливает runtime после reboot через штатные ASUS USB hooks;
+- следит за Mihomo через watchdog;
+- динамически определяет USB после каждого монтирования;
+- поддерживает Optware / Download Master;
+- ставит UTF-8 окружение для `nano`;
+- даёт меню `gc` со стрелками, `Enter` и `Esc`;
+- содержит `gc status`, `gc doctor`, логи, редактор конфига и диагностику автозапуска.
 
-Установщик должен называться строго:
+## Важные принципы текущей сборки
 
-```text
-install.sh
-```
+### USB не форматируется установщиком
 
-и лежать строго в корне текущего USB mountpoint:
+`install.sh` **не форматирует флешку**. Подготовка USB выполняется отдельно.
 
-```text
-/tmp/mnt/<текущее_имя>/install.sh
-```
-
-Ни `SANDISK`, ни `/dev/sda1`, ни `/dev/sdb1` нигде не считаются постоянными значениями.
-
-ASUSWRT может после reboot изменить одновременно и устройство, и mountpoint, например:
-
-```text
-до reboot:    /dev/sdb1 -> /tmp/mnt/Sandisk
-после reboot: /dev/sda1 -> /tmp/mnt/sda1
-```
-
-Это штатно для новой логики GoshaCrash.
-
-## Какие значения определяются автоматически
-
-При каждом запуске install/runtime определяются заново:
+Установщик должен лежать в корне текущего USB mountpoint:
 
 ```text
-USB_DEVICE   /dev/sdXN
-USB_DISK     /dev/sdX
-USB_MOUNT    /tmp/mnt/<текущее_имя>
-USB_NAME     <текущее_имя>
-USB_FS       ext3/ext4/...
-DM_ROOT      <USB_MOUNT>/asusware.arm|asusware.arm64|asusware
-BASE         <USB_MOUNT>/goshacrash
-CONFIG       <BASE>/config.yaml
+/tmp/mnt/<mount>/install.sh
 ```
 
-Абсолютные `/tmp/mnt/...` пути больше не сохраняются как источник истины в `platform.env`.
-В `platform.env` сохраняются только относительные значения (`CONFIG_REL`, `GCNET_REL`, `DM_LAYOUT`).
-
-Текущая база дополнительно публикуется в RAM:
+Имя устройства не считается постоянным. Одна и та же флешка после reboot может быть, например:
 
 ```text
-/tmp/goshacrash-base
+/dev/sdb1 -> /tmp/mnt/Sandisk
+/dev/sda1 -> /tmp/mnt/sda1
 ```
 
-`gc`, USB hooks и nano wrapper сначала используют текущую базу из RAM, а при необходимости находят единственный `/tmp/mnt/*/goshacrash` заново.
+GoshaCrash заново определяет реальный USB device и mountpoint во время работы.
 
-## Установка на уже подготовленную флешку
+### `config.yaml` принадлежит пользователю
 
-После того как ASUS смонтировал флешку и на ней установлен Download Master:
+Если `config.yaml` отсутствует, установщик создаёт базовый файл один раз. При обычной переустановке существующий конфиг не заменяется и не восстанавливается автоматически.
+
+`gc edit` создаёт только пассивную резервную копию, открывает конфиг в `nano` и после сохранения запускает проверку `mihomo -t`. Если конфиг невалиден, файл остаётся как есть — автоматического rollback нет.
+
+Исключение: команды `gc routing auto` и `gc routing manual` изменяют только поля, связанные с режимом маршрутизации.
+
+Явный сброс конфига выполняется только вручную:
 
 ```sh
-USB_MOUNT="$(mount | awk '$1 ~ "^/dev/sd" && $3 ~ "^/tmp/mnt/" {print $3; exit}')"
+/bin/sh install.sh --reset-config
+```
 
-echo "USB_MOUNT=$USB_MOUNT"
+### MPTCP
+
+GoshaCrash **не включает и не выключает MPTCP автоматически**. Состояние sysctl остаётся таким, каким его выставило ядро или пользователь.
+
+Проверить состояние:
+
+```sh
+cat /proc/sys/net/mptcp/mptcp_enabled
+```
+
+Включить до следующей перезагрузки:
+
+```sh
+echo 1 > /proc/sys/net/mptcp/mptcp_enabled
+```
+
+Выключить до следующей перезагрузки:
+
+```sh
+echo 0 > /proc/sys/net/mptcp/mptcp_enabled
+```
+
+### Native AUTO на BT10
+
+На BT10 режим `auto` использует штатные механизмы Mihomo:
+
+```yaml
+tun:
+  enable: true
+  stack: system
+  auto-route: true
+  auto-redirect: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+    - tcp://any:53
+```
+
+`gc doctor` проверяет TUN, policy routing, TCP redirect и DNS hijack отдельно.
+
+## Требования перед установкой
+
+1. ASUSWRT с включённым SSH.
+2. Подготовленная USB-флешка.
+3. Установленный на эту флешку ASUS Download Master / Optware.
+4. `install.sh` в корне текущего USB mountpoint.
+
+Для RT-AC68U legacy-профиль требует EXT3. Для BT10 используется EXT4.
+
+## Установка
+
+Сначала посмотреть текущий USB mountpoint:
+
+```sh
 mount | grep '/dev/sd'
+```
 
-rm -f "$USB_MOUNT/install.sh"
-/usr/sbin/wget --no-check-certificate \
-  -O "$USB_MOUNT/install.sh" \
-  'https://raw.githubusercontent.com/goshamarat/GoshaCrash/refs/heads/main/install.sh'
+Определить его автоматически:
 
-grep '^INSTALLER_VERSION=' "$USB_MOUNT/install.sh"
+```sh
+USB_MOUNT="$(awk '$1 ~ /^\/dev\/sd[a-z][0-9]+$/ && $2 ~ /^\/tmp\/mnt\// {print $2; exit}' /proc/mounts)"
+```
+
+Скачать установщик из `main`:
+
+```sh
+/usr/sbin/wget --no-check-certificate -O "$USB_MOUNT/install.sh" 'https://raw.githubusercontent.com/goshamarat/GoshaCrash/refs/heads/main/install.sh'
+```
+
+Запустить:
+
+```sh
 chmod 700 "$USB_MOUNT/install.sh"
+```
+
+```sh
 /bin/sh "$USB_MOUNT/install.sh"
 ```
 
-Если используется схема от внешнего formatter/installer и он уже вычисляет имя каталога через `df`, это тоже нормально. Важно только, чтобы итоговый путь был реальным текущим mountpoint и файл назывался `install.sh`.
+Если рядом с `install.sh` лежит совместимый `goshacrash.sh` из этой же сборки, установщик использует локальный файл и не скачивает controller повторно.
 
-## USB filesystem
+## Управление
 
-Форматированием занимается отдельная программа. Сам `install.sh` только проверяет уже смонтированную файловую систему.
-
-Для legacy RT-AC68U проверенная схема остаётся EXT3.
-Для BT10 поддерживается современный Linux filesystem, в текущей тестовой схеме — EXT4.
-
-## Почему после reboot больше не должен ломаться путь
-
-Старые сборки могли сохранить, например:
-
-```text
-CONFIG_FILE=/tmp/mnt/Sandisk/goshacrash/config.yaml
-DM_ROOT=/tmp/mnt/Sandisk/asusware.arm
-```
-
-После reboot ASUS мог смонтировать ту же флешку как `/tmp/mnt/sda1`, и controller продолжал смотреть в старый путь. Типичный результат: watchdog жив, а Mihomo не стартует.
-
-В этой ревизии runtime каждый раз строит пути от фактического местоположения `goshacrash.sh`, поэтому текущий путь становится:
-
-```text
-BASE=/tmp/mnt/sda1/goshacrash
-CONFIG=/tmp/mnt/sda1/goshacrash/config.yaml
-DM_ROOT=/tmp/mnt/sda1/asusware.arm
-```
-
-без переустановки из-за смены `sda/sdb` или имени mountpoint.
-
-## Nano и config.yaml
-
-На BT10 экспериментально подтверждён рабочий фикс для Optware nano 3.1:
+Открыть интерактивное меню:
 
 ```sh
-export LANG=en_US.UTF-8
-export LC_ALL=en_US.UTF-8
+gc
 ```
 
-Эта ревизия закрепляет его в трёх местах:
-
-- `/jffs/etc/profile` — постоянные переменные после reboot/нового SSH login;
-- `/jffs/configs/profile.add` — дополнительный ASUSWRT profile hook;
-- `/jffs/scripts/nano` и `gc edit` — nano получает UTF-8 locale явно даже в текущей сессии.
-
-`config.yaml` больше не переводится в ASCII и русские комментарии не удаляются. При install/upgrade сохраняются UTF-8 комментарии и YAML-данные пользователя; нормализуется только CRLF -> LF. После `gc edit` конфиг по-прежнему проходит `mihomo -t`, а невалидная правка откатывается.
-
-После установки можно проверить:
-
-```sh
-gc doctor
-grep 'UTF-8' /jffs/etc/profile /jffs/configs/profile.add
-```
-
-Ожидается:
+В полноэкранном меню:
 
 ```text
-nano UTF-8 locale: en_US.UTF-8
-shell UTF-8 locale /jffs/etc/profile: OK
-shell UTF-8 locale profile.add: OK
-config UTF-8: OK
+↑ / ↓   выбор
+Enter   открыть
+Esc     назад / выход
 ```
 
-Для уже открытой SSH-сессии profile сам по себе не перечитывается, но `nano`/`gc edit` уже работают правильно через wrapper. Для глобальных `$LANG`/`$LC_ALL` в shell нужно открыть новую SSH-сессию или выполнить:
+Раздел **Logs** также управляется стрелками; `Esc` возвращает в главное меню.
 
-```sh
-. /jffs/etc/profile
-```
+Основные команды:
+
+| Команда | Назначение |
+|---|---|
+| `gc status` | краткий статус |
+| `gc doctor` | полная диагностика |
+| `gc edit` | редактировать `config.yaml` |
+| `gc start` | запустить runtime |
+| `gc restart` | перезапустить runtime |
+| `gc stop` | остановить runtime и поставить manual-stop |
+| `gc routing status` | текущий режим маршрутизации |
+| `gc routing auto` | native AUTO на поддерживаемых modern-профилях |
+| `gc routing manual` | manual routing |
+| `gc logs` | последние строки Mihomo |
+| `gc logs live mihomo 100` | live log Mihomo |
+| `gc dashboard` | адрес Zashboard |
+| `gc autostart status` | диагностика автозапуска |
 
 ## Zashboard
 
-Mihomo API остаётся:
+Базовый controller:
 
 ```yaml
 external-controller: 0.0.0.0:9090
 external-ui: ui
 ```
 
-`secret` в текущем профиле GoshaCrash удалён полностью. При upgrade существующий top-level `secret:` также удаляется.
+`secret:` в базовом профиле не используется.
 
-URL:
+Открыть адрес панели:
 
 ```sh
 gc dashboard
 ```
 
-## После установки
+## После reboot
 
-```sh
-gc version
-gc status
-gc doctor
-gc dashboard
-```
-
-После reboot особенно полезно проверить:
+Проверить, куда ASUS смонтировал USB:
 
 ```sh
 mount | grep '/dev/sd'
-gc doctor
-gc logs mihomo 100
-gc logs watchdog 100
 ```
 
-В `gc doctor` должны отражаться **текущие**, а не install-time значения USB device/mount/name.
+Проверить весь runtime:
+
+```sh
+gc doctor
+```
+
+Проверить автозапуск:
+
+```sh
+gc autostart status
+```
 
 ## Persistent layout
-
-На флешке:
 
 ```text
 /tmp/mnt/<current>/
 ├── install.sh
-├── asusware.arm/        # или другой штатный layout Download Master
+├── asusware.arm/            # или другой layout Download Master
 └── goshacrash/
     ├── goshacrash.sh
     ├── config.yaml
@@ -207,7 +232,7 @@ gc logs watchdog 100
     └── state/
 ```
 
-В JFFS остаются только ASUS hooks/wrappers, которые нужны firmware:
+В JFFS остаются только необходимые hooks/wrappers:
 
 ```text
 /jffs/scripts/gc
@@ -216,17 +241,39 @@ gc logs watchdog 100
 /jffs/scripts/usb-umount-script
 ```
 
-Они не содержат постоянного `/tmp/mnt/<имя>` пути.
+В них не должен храниться постоянный `/tmp/mnt/<имя>` как источник истины.
 
+## Если USB внезапно заполнен на 100%
 
-## Coldboot v2 (same public version rc40-test2)
+Сначала сравнить `df` и `du`:
 
-- cold boot no longer calls public `start()` after an initial successful WAN probe; this removes the second transient WAN probe that could leave Mihomo down after reboot;
-- transient WAN/offline counters are reset on each new router boot;
-- watchdog writes a heartbeat and receives an immediate recovery pass after the boot lock is released;
-- `/jffs/configs/profile.add` is the persistent shell locale source; `/jffs/etc/profile` is treated as optional because ASUS may recreate/remove it.
+```sh
+df -h | grep '/dev/sd'
+```
 
+```sh
+du -sh /tmp/mnt/*/* /tmp/mnt/*/.[!.]* 2>/dev/null
+```
 
-## rc40-test2 edit pause
+На ASUS скрытая папка `.minidlna` может занимать почти всю флешку, если включался Media Server / DLNA. Если DLNA не используется, его следует отключить в ASUS и удалить ненужный кэш.
 
-После выхода из `Edit config` интерактивное меню больше не перерисовывается автоматически через 2 секунды. В полноэкранном меню вывод проверки конфигурации остаётся на экране до нажатия любой клавиши. В fallback line-menu — до Enter. CLI-команда `gc edit` не получает обязательную паузу и остаётся пригодной для прямого вызова.
+Если `df` показывает занятое место, которого нет в `du`, либо ядро пишет ошибки EXT4/I/O, файловую систему нужно проверять `e2fsck` **только на размонтированном разделе**.
+
+## Ветки репозитория
+
+Сейчас online bootstrap по умолчанию использует ветку `main`.
+
+Если production будет вынесен в отдельную ветку, безопасная схема описана в [docs/BRANCHES.md](docs/BRANCHES.md). До фактического переноса ветки код этой сборки оставлен на `main`, чтобы не сломать установку.
+
+## Файлы проекта
+
+```text
+README.md
+CHANGELOG.md
+install.sh
+goshacrash.sh
+assets/
+└── gcnet-armv5
+docs/
+└── BRANCHES.md
+```
