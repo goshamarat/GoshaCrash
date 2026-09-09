@@ -3,7 +3,7 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="3.10.2-rc40-test2"
+VERSION="4.0.0"
 BUILD_ID="2026-09-09-simple-config-native-auto-mptcp-passive-logs-nav-v1"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
@@ -775,13 +775,13 @@ validate_binary_arch(){
     [ "$magic" = 7f454c46 ] || { fail "Mihomo повреждён: файл не является ELF (header=${hex:-empty})"; return 1; }
     case "$MIHOMO_TARGET" in
       armv5|armv7)
-        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку rc40-test2"; return 1; }
+        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку 4.0.0"; return 1; }
         ;;
       arm64|aarch64)
-        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку rc40-test2"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку 4.0.0"; return 1; }
         ;;
       amd64|amd64-compatible|x86_64)
-        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку rc40-test2"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку 4.0.0"; return 1; }
         ;;
     esac
     return 0
@@ -2644,7 +2644,7 @@ autostart_status(){
     [ -n "$bridge_version" ] && echo "  bridge version: $bridge_version" || echo "  bridge version: old/unknown"
     [ -f "$STATE/autostart-hook-ran" ] && echo "  last hook: $(cat "$STATE/autostart-hook-ran" 2>/dev/null)" || echo "  last hook: never"
     [ -f "$LOGS/coldboot.log" ] && echo "  coldboot trace: $LOGS/coldboot.log" || echo "  coldboot trace: not written yet"
-    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall rc40-test2)" || echo "  legacy JFFS dir: clean"
+    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall 4.0.0)" || echo "  legacy JFFS dir: clean"
     [ -f "$MANUAL_STOP" ] && echo "  manual-stop: YES" || echo "  manual-stop: no"
     return 0
 }
@@ -2844,7 +2844,7 @@ doctor(){
 }
 usage(){
 cat <<'USAGE'
-GoshaCrash 3.10.2-rc40-test2 — что буквально вводить в SSH
+GoshaCrash 4.0.0 — что буквально вводить в SSH
 
 КАТАЛОГ УСТАНОВКИ
   BASE="$(gc base)"

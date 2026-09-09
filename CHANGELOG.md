@@ -1,26 +1,26 @@
 # Changelog
 
-## 3.10.2-rc40-test2
+## 4.0.0 production
 
-Текущая публичная версия намеренно остаётся **3.10.2-rc40-test2**.
+Первая чистая production-сборка **GoshaCrash 4.0.0**.
 
-- Публичный online bootstrap переведён на ветку `production`; `main` остаётся для разработки и тестов.
+- Ветка `production` используется как рабочий канал для реальных роутеров.
+- Ветка `main` остаётся для разработки, тестов и полной истории изменений.
+- Online bootstrap и связанные файлы по умолчанию загружаются из `production`.
 
 ### Runtime и routing
 
-- BT10 использует native Mihomo `auto-route + auto-redirect + dns-hijack` без выдуманного fallback table.
-- Runtime проверяет не только наличие `tun0`, но и фактическую готовность native policy routing / redirect / DNS hijack.
-- Dynamic USB paths пересчитываются после каждого монтирования и не зависят от постоянного имени `sda/sdb` или mount label.
-- Coldboot не должен делать второй лишний Internet probe перед запуском runtime.
+- BT10 использует native Mihomo `auto-route + auto-redirect + dns-hijack` без отдельного fallback table.
+- Runtime проверяет фактическую готовность TUN, policy routing, TCP redirect и DNS hijack.
+- USB device и mountpoint определяются динамически после каждого монтирования и не зависят от `sda/sdb` или имени тома.
+- Coldboot не делает лишний повторный Internet probe перед запуском runtime.
 
 ### Config
 
 - `config.yaml` создаётся только если отсутствует.
-- Обычная переустановка не заменяет пользовательский конфиг.
+- Переустановка не заменяет пользовательский конфиг.
 - Невалидный конфиг не восстанавливается автоматически из backup.
-- Backup остаётся пассивным и используется только вручную.
-- `gc edit` проверяет сохранённый YAML через `mihomo -t`.
-- UTF-8 комментарии сохраняются.
+- `gc edit` сохраняет UTF-8 и проверяет YAML через `mihomo -t`.
 
 ### Nano / UTF-8
 
@@ -30,18 +30,18 @@
 
 ### MPTCP
 
-- GoshaCrash больше не меняет MPTCP sysctl автоматически.
-- Включённый или выключенный MPTCP не считается ошибкой watchdog/runtime сам по себе.
-- `gc doctor` показывает текущее состояние.
+- GoshaCrash не меняет MPTCP sysctl автоматически.
+- Текущее состояние MPTCP отображается в `gc doctor`.
+- Включённый или выключенный MPTCP сам по себе не считается ошибкой runtime/watchdog.
 
 ### Menu
 
-- Раздел Logs переведён на навигацию `↑/↓`.
+- Раздел Logs использует навигацию `↑/↓`.
 - `Enter` открывает выбранный пункт.
-- `Esc` возвращает из Logs в главное меню.
+- `Esc` возвращает в главное меню.
 
 ### Installer
 
-- USB formatting полностью удалён из `install.sh`.
+- USB formatting не входит в `install.sh`.
 - Установщик работает от фактического текущего USB mountpoint.
 - Локальный `goshacrash.sh` из той же сборки используется раньше online-download.

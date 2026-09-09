@@ -1,14 +1,14 @@
 # Ветки GoshaCrash
 
-## Текущая схема
+## Схема репозитория
 
-- `production` — рабочая ветка для реальных роутеров;
-- `main` — разработка и тестирование;
-- Git tags — зафиксированные релизные точки.
+- `main` — разработка, тесты и полная история проекта;
+- `production` — чистый рабочий snapshot для реальных роутеров;
+- tags — зафиксированные релизные точки.
 
-Публичная сборка **3.10.2-rc40-test2** использует `production` как default branch для online bootstrap и обновления связанных файлов.
+Текущая рабочая версия: **GoshaCrash 4.0.0 production**.
 
-В `install.sh`:
+В `install.sh` и `goshacrash.sh` production-ветка используется по умолчанию:
 
 ```sh
 BRANCH="${BRANCH:-production}"
@@ -20,9 +20,17 @@ BRANCH="${BRANCH:-production}"
 https://raw.githubusercontent.com/goshamarat/GoshaCrash/refs/heads/production/install.sh
 ```
 
-## Обычный цикл разработки
+## Важно: production содержит один commit
 
-Работу вести в `main`:
+`production` не используется как обычная ветка разработки и не накапливает историю из `main`.
+
+Вся история, тестовые файлы и промежуточные изменения остаются в `main`. При выпуске новой рабочей версии содержимое `production` заменяется новым чистым snapshot-коммитом.
+
+Не нужно делать обычный `Merge pull request` из `main` в `production`, если цель — сохранить production с одним commit.
+
+## Разработка
+
+Работа ведётся в `main`:
 
 ```sh
 git switch main
@@ -32,60 +40,30 @@ git switch main
 git pull --ff-only origin main
 ```
 
-После проверки изменений переносить их в `production` через Pull Request `main -> production`. Перед merge обязательно просмотреть diff.
+После тестирования из нужного состояния `main` собирается чистый production snapshot.
 
-## Проверка production локально
+## Проверка production
 
 ```sh
 git switch production
 ```
 
 ```sh
-git pull --ff-only origin production
+git log --oneline --decorate
 ```
 
-```sh
-git log --oneline --decorate -10
+В production должен быть один root commit текущей рабочей сборки, например:
+
+```text
+GoshaCrash 4.0.0 production
 ```
 
 ## Явный тест main через installer
 
-Production installer можно временно запустить с другим источником, не меняя файл:
+Production installer можно временно запустить с другим источником без изменения файла:
 
 ```sh
 BRANCH=main /bin/sh install.sh
 ```
 
-Это предназначено для тестов. На обычных роутерах default должен оставаться `production`.
-
-## Если production нужно откатить
-
-Сначала найти известный рабочий коммит:
-
-```sh
-git log --oneline --decorate -20
-```
-
-Переключиться на production:
-
-```sh
-git switch production
-```
-
-Поставить локальную ветку на нужный коммит:
-
-```sh
-git reset --hard <GOOD_COMMIT>
-```
-
-После проверки обновить remote:
-
-```sh
-git push --force-with-lease origin production
-```
-
-Использовать `--force-with-lease`, а не обычный `--force`.
-
-## Важно
-
-Не откатывать `main` только ради сохранения рабочего production. Рабочая версия уже изолирована в `production`, поэтому `main` можно развивать независимо.
+На обычных роутерах default должен оставаться `production`.

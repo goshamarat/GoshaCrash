@@ -3,7 +3,7 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="3.10.2-rc40-test2"
+INSTALLER_VERSION="4.0.0"
 EXPECTED_CONTROLLER_BUILD_ID="2026-09-09-simple-config-native-auto-mptcp-passive-logs-nav-v1"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
@@ -1841,7 +1841,7 @@ json_asset_urls(){
 }
 
 pinned_official_mihomo_url(){
-    # rc40-test2 deliberately pins the modern core. A router install must not silently
+    # 4.0.0 deliberately pins the modern core. A router install must not silently
     # switch CPU binary just because GitHub "latest" changed between runs.
     MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_VERSION"
     printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$OFFICIAL_MIHOMO_VERSION/mihomo-linux-$MIHOMO_TARGET-$OFFICIAL_MIHOMO_VERSION.gz"
@@ -2187,7 +2187,7 @@ install_stock_usb_mount_bridge(){
     mkdir -p "$DM_ROOT/etc/init.d" "$DM_ROOT/lib/ipkg/info" || return 1
     cat > "$DM_ROOT/etc/init.d/S50usb-mount-script" <<'HOOK'
 #!/bin/sh
-# GoshaCrash Download Master bridge 3.10.2-rc40-test2
+# GoshaCrash Download Master bridge 4.0.0
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2314,7 +2314,7 @@ install_hooks(){
 
     cat > /jffs/scripts/usb-mount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB hook 3.10.2-rc40-test2
+# GoshaCrash USB hook 4.0.0
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2379,7 +2379,7 @@ BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 UPTIME="$(cat /proc/uptime 2>/dev/null)"
 trace "controller ready after ${WAITED}s dm=${DM:-none} boot_id=${BOOT_ID:-unknown} uptime=${UPTIME:-unknown}"
 date '+%Y-%m-%d %H:%M:%S' > "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-printf '[%s] autostart hook rc40-test2: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
+printf '[%s] autostart hook 4.0.0: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
 
 NOHUP=""
 for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup; do
@@ -2397,7 +2397,7 @@ HOOK
 
     cat > /jffs/scripts/usb-umount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB unmount hook 3.10.2-rc40-test2
+# GoshaCrash USB unmount hook 4.0.0
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2454,7 +2454,7 @@ HOOK
     test -d /opt/bin && test -w /opt/bin && write_command_wrapper /opt/bin/gc 2>/dev/null || true
 
     # Old rc23-rc26 used a custom /jffs/addons/goshacrash directory only to
-    # store base/start/trace. rc40-test2 no longer needs it; remove our own residue.
+    # store base/start/trace. 4.0.0 no longer needs it; remove our own residue.
     rm -rf /jffs/addons/goshacrash 2>/dev/null || true
     grep -Fq 'exec /bin/busybox test "$@"' /jffs/scripts/test 2>/dev/null && rm -f /jffs/scripts/test 2>/dev/null || true
     grep -Fq "exec /bin/busybox '['" /jffs/scripts/'[' 2>/dev/null && rm -f /jffs/scripts/'[' 2>/dev/null || true
