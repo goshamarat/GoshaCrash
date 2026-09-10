@@ -4,7 +4,7 @@
 # package tools through ASUS Download Master, configuration and autostart.
 
 INSTALLER_VERSION="4.0.0"
-EXPECTED_CONTROLLER_BUILD_ID="2026-09-09-simple-config-native-auto-mptcp-passive-logs-nav-v1"
+EXPECTED_CONTROLLER_BUILD_ID="2026-09-10-ramlogs-3h-clear-ghproxy-storage-guard-v3"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -21,8 +21,11 @@ OFFICIAL_MIHOMO_FALLBACK="${OFFICIAL_MIHOMO_FALLBACK:-$OFFICIAL_MIHOMO_VERSION}"
 ZASHBOARD_PRIMARY="${ZASHBOARD_URL:-https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip}"
 
 TMP_ROOT="/tmp/goshacrash-install.$$"
-TMP_LOG="/tmp/goshacrash-install.log"
+RUNTIME_ROOT="${GOSHACRASH_RUNTIME:-/tmp/goshacrash}"
+RUNTIME_LOGS="$RUNTIME_ROOT/logs"
+TMP_LOG="$RUNTIME_LOGS/install.log"
 INSTALL_LOG="$TMP_LOG"
+PACKAGES_LOG="$RUNTIME_LOGS/packages.log"
 USB_MOUNT=""
 USB_DEVICE=""
 USB_DISK=""
@@ -36,6 +39,7 @@ PKG=""
 UNZIP_BIN=""
 GZIP_BIN=""
 DOWNLOADER=""
+GITHUB_MODE="${GOSHACRASH_GITHUB_MODE:-auto}"
 NVRAM_BIN=""
 LOCK_DIR="/tmp/goshacrash-install.lock"
 LOCK_HELD="0"
@@ -366,6 +370,12 @@ opt_namespace_write_through(){
     return 1
 }
 
+usb_kernel_fs_errors_install(){
+    test -n "$USB_DEVICE" || return 1
+    short="${USB_DEVICE##*/}"
+    dmesg 2>/dev/null | grep -Eq "EXT[234]-fs error \(device $short\)|I/O error.*$short|Buffer I/O error.*$short"
+}
+
 usb_storage_sanity_check(){
     # A damaged ext filesystem can look mounted and writable while directory
     # metadata is already unreadable (for example: "Structure needs cleaning").
@@ -373,7 +383,7 @@ usb_storage_sanity_check(){
     # filesystem metadata and only makes the failure harder to diagnose.
     for probe_dir in "$DM_ROOT" "$DM_ROOT/scripts" "$BASE/ui"; do
         test -d "$probe_dir" || continue
-        if ! ls -la "$probe_dir" >/dev/null 2>> "$BASE/logs/packages.log"; then
+        if ! ls -la "$probe_dir" >/dev/null 2>> "$PACKAGES_LOG"; then
             fail "USB filesystem повреждена или каталог нечитаем: $probe_dir"
             fail "Сначала останови Download Master, размонтируй USB и выполни offline fsck; затем повтори установку"
             return 1
@@ -394,23 +404,23 @@ preserve_stock_opt_payload(){
         target="$DM_ROOT/$name"
 
         if test -d "$target"; then
-            if ! ls -la "$target" >/dev/null 2>> "$BASE/logs/packages.log"; then
+            if ! ls -la "$target" >/dev/null 2>> "$PACKAGES_LOG"; then
                 fail "USB/Optware каталог $target повреждён или нечитаем; требуется offline fsck"
                 return 1
             fi
         fi
 
-        printf '[%s] OPT PRESERVE: %s -> %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$entry" "$target" >> "$BASE/logs/packages.log" 2>/dev/null || true
+        printf '[%s] OPT PRESERVE: %s -> %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$entry" "$target" >> "$PACKAGES_LOG" 2>/dev/null || true
 
         if test -d "$entry"; then
-            mkdir -p "$target" >> "$BASE/logs/packages.log" 2>&1 || return 1
-            cp -R "$entry/." "$target/" >> "$BASE/logs/packages.log" 2>&1 || {
+            mkdir -p "$target" >> "$PACKAGES_LOG" 2>&1 || return 1
+            cp -R "$entry/." "$target/" >> "$PACKAGES_LOG" 2>&1 || {
                 fail "Не удалось сохранить штатный /opt/$name перед подготовкой Optware"
-                fail "Подробность сохранена в $BASE/logs/packages.log; если есть 'Structure needs cleaning' — нужен offline fsck"
+                fail "Подробность сохранена в $PACKAGES_LOG; если есть 'Structure needs cleaning' — нужен offline fsck"
                 return 1
             }
         elif test -f "$entry"; then
-            cp -f "$entry" "$target" >> "$BASE/logs/packages.log" 2>&1 || {
+            cp -f "$entry" "$target" >> "$PACKAGES_LOG" 2>&1 || {
                 fail "Не удалось сохранить штатный файл /opt/$name; см. packages.log"
                 return 1
             }
@@ -461,8 +471,8 @@ prepare_optware_namespace(){
     touch "$DM_ROOT/.goshacrash-opt-root" 2>/dev/null || true
 
     pkg_log "OPT NAMESPACE: bind $DM_ROOT -> /opt"
-    "$mount_bin" -o bind "$DM_ROOT" /opt >> "$BASE/logs/packages.log" 2>&1 || \
-      "$mount_bin" --bind "$DM_ROOT" /opt >> "$BASE/logs/packages.log" 2>&1 || {
+    "$mount_bin" -o bind "$DM_ROOT" /opt >> "$PACKAGES_LOG" 2>&1 || \
+      "$mount_bin" --bind "$DM_ROOT" /opt >> "$PACKAGES_LOG" 2>&1 || {
         fail "Не удалось bind-mount Download Master на /opt; ipkg на этой прошивке не сможет ставить полный payload"
         return 1
       }
@@ -644,7 +654,7 @@ verify_ipkg_natural(){
         return 1
     }
 
-    err="$BASE/logs/ipkg-runtime.err"
+    err="$RUNTIME_ROOT/ipkg-runtime.err"
     : > "$err"
     (
         unset LD_LIBRARY_PATH
@@ -666,7 +676,7 @@ pkg_natural_update(){
     (
         unset LD_LIBRARY_PATH
         "$PKG" update
-    ) >> "$BASE/logs/packages.log" 2>&1
+    ) >> "$PACKAGES_LOG" 2>&1
 }
 
 pkg_natural_is_installed(){
@@ -688,7 +698,7 @@ pkg_natural_install(){
     (
         unset LD_LIBRARY_PATH
         "$PKG" install "$name"
-    ) >> "$BASE/logs/packages.log" 2>&1
+    ) >> "$PACKAGES_LOG" 2>&1
 }
 
 verify_dm_payload_natural(){
@@ -732,7 +742,7 @@ verify_ipkg_runtime(){
     prepare_path
     test -n "$PKG" || find_pkg || return 1
 
-    err="$BASE/logs/ipkg-runtime.err"
+    err="$RUNTIME_ROOT/ipkg-runtime.err"
     : > "$err"
 
     # EXT3 keeps the real Optware symlinks, so first try ipkg with NO
@@ -760,7 +770,7 @@ verify_ipkg_runtime(){
     fi
 
     fail "Optware runtime повреждён; ipkg rc=$rc"
-    cat "$err" >> "$BASE/logs/packages.log" 2>/dev/null || true
+    cat "$err" >> "$PACKAGES_LOG" 2>/dev/null || true
     return 1
 }
 
@@ -774,8 +784,8 @@ find_pkg(){
 }
 
 pkg_log(){
-    mkdir -p "$BASE/logs" 2>/dev/null || true
-    printf '[%s] %s\n' "$(now)" "$*" >> "$BASE/logs/packages.log" 2>/dev/null || true
+    mkdir -p "$RUNTIME_LOGS" 2>/dev/null || true
+    printf '[%s] %s\n' "$(now)" "$*" >> "$PACKAGES_LOG" 2>/dev/null || true
 }
 
 PKG_INDEX_REFRESHED=0
@@ -784,7 +794,7 @@ pkg_update_index_once(){
     test "$PKG_INDEX_REFRESHED" = "1" && return 0
     pkg_progress "обновляю индекс пакетов (один раз)"
     pkg_log "RUN: $PKG update"
-    run_pkg "$PKG" update >> "$BASE/logs/packages.log" 2>&1 || return 1
+    run_pkg "$PKG" update >> "$PACKAGES_LOG" 2>&1 || return 1
     PKG_INDEX_REFRESHED=1
     return 0
 }
@@ -805,7 +815,7 @@ pkg_install_one(){
     pkg_progress "install $name (локальный индекс)"
     pkg_log "RUN: $PKG install $name"
 
-    run_pkg "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && {
+    run_pkg "$PKG" install "$name" >> "$PACKAGES_LOG" 2>&1 && {
         repair_optware_abi >/dev/null 2>&1 || true
         return 0
     }
@@ -813,7 +823,7 @@ pkg_install_one(){
     warn "install $name не удался с текущим индексом"
     pkg_update_index_once || true
     pkg_progress "повторный install $name"
-    run_pkg "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
+    run_pkg "$PKG" install "$name" >> "$PACKAGES_LOG" 2>&1
     rc=$?
     repair_optware_abi >/dev/null 2>&1 || true
     return "$rc"
@@ -831,13 +841,13 @@ pkg_reinstall_one(){
 
     pkg_progress "remove $name"
     pkg_log "REINSTALL: $name"
-    run_pkg "$PKG" remove "$name" >> "$BASE/logs/packages.log" 2>&1 || true
+    run_pkg "$PKG" remove "$name" >> "$PACKAGES_LOG" 2>&1 || true
 
     repair_optware_abi >/dev/null 2>&1 || true
     verify_ipkg_runtime || return 1
 
     pkg_progress "install $name (локальный индекс)"
-    run_pkg "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1 && {
+    run_pkg "$PKG" install "$name" >> "$PACKAGES_LOG" 2>&1 && {
         repair_optware_abi >/dev/null 2>&1 || true
         return 0
     }
@@ -845,7 +855,7 @@ pkg_reinstall_one(){
     warn "reinstall $name не удался с текущим индексом"
     pkg_update_index_once || true
     pkg_progress "повторный install $name"
-    run_pkg "$PKG" install "$name" >> "$BASE/logs/packages.log" 2>&1
+    run_pkg "$PKG" install "$name" >> "$PACKAGES_LOG" 2>&1
     rc=$?
     repair_optware_abi >/dev/null 2>&1 || true
     return "$rc"
@@ -888,8 +898,8 @@ restart_download_master_env(){
         "$DM_ROOT/etc/init.d/S50downloadmaster.1"; do
         test -x "$script" || continue
         pkg_log "RUN: $script restart"
-        "$script" restart >> "$BASE/logs/packages.log" 2>&1 || \
-            "$script" start >> "$BASE/logs/packages.log" 2>&1 || true
+        "$script" restart >> "$PACKAGES_LOG" 2>&1 || \
+            "$script" start >> "$PACKAGES_LOG" 2>&1 || true
         sleep 2
         prepare_path
         refresh_tools
@@ -1032,7 +1042,7 @@ repair_terminfo_package(){
     # ipkg may still print a dependency warning after successfully unpacking;
     # the physical payload below is authoritative.
     pkg_log "RUN OFFLINE: $PKG -o $stage -force-depends install $ipk"
-    run_pkg "$PKG" -o "$stage" -force-depends install "$ipk" >> "$BASE/logs/packages.log" 2>&1 || \
+    run_pkg "$PKG" -o "$stage" -force-depends install "$ipk" >> "$PACKAGES_LOG" 2>&1 || \
       warn "offline ipkg вернул ненулевой код; проверяю фактически распакованный payload"
 
     staged_terminfo=""
@@ -1055,7 +1065,7 @@ repair_terminfo_package(){
     say "Optware terminfo staging: xterm + xterm-256color найдены"
 
     mkdir -p "$DM_ROOT/share/terminfo" || return 1
-    cp -R "$staged_terminfo/." "$DM_ROOT/share/terminfo/" >> "$BASE/logs/packages.log" 2>&1 || {
+    cp -R "$staged_terminfo/." "$DM_ROOT/share/terminfo/" >> "$PACKAGES_LOG" 2>&1 || {
         fail "Не удалось сохранить terminfo на USB"
         return 1
     }
@@ -1390,7 +1400,7 @@ wget_fetch(){
     chmod 700 "$WGET_HOME" 2>/dev/null || true
     : > "$WGET_HOME/.wget-hsts" 2>/dev/null || true
     chmod 600 "$WGET_HOME/.wget-hsts" 2>/dev/null || true
-    HOME="$WGET_HOME" "$w" --no-check-certificate -O "$out.part" "$url" && test -s "$out.part" && {
+    HOME="$WGET_HOME" "$w" --no-check-certificate -T 15 -O "$out.part" "$url" && test -s "$out.part" && {
         mv -f "$out.part" "$out"
         return 0
     }
@@ -1406,9 +1416,9 @@ curl_fetch(){
     test -n "$c" || return 1
 
     echo "--- curl: $url" >&2
-    # No connect timeout and no overall max-time: the transfer may continue as
-    # long as the connection is alive. The progress bar remains visible.
-    "$c" -k -fL --retry 3 --retry-delay 3 -# \
+    # Fail over when GitHub cannot establish or sustain a usable transfer.
+    # There is no hard total timeout, so genuinely slow downloads may finish.
+    "$c" -k -fL --connect-timeout 12 --speed-time 30 --speed-limit 1024 --retry 2 --retry-delay 2 -# \
         -A "GoshaCrash/$INSTALLER_VERSION" -o "$out.part" "$url" && test -s "$out.part" && {
         mv -f "$out.part" "$out"
         return 0
@@ -1416,10 +1426,9 @@ curl_fetch(){
     return 1
 }
 
-fetch(){
+fetch_direct(){
     url="$1"; out="$2"
     rm -f "$out" "$out.part"
-
     if test "$DOWNLOADER" = "wget"; then
         wget_fetch "$url" "$out" && return 0
         warn "wget не скачал файл; пробую curl"
@@ -1429,6 +1438,41 @@ fetch(){
         warn "curl не скачал файл; пробую wget"
         wget_fetch "$url" "$out" && return 0
     fi
+    rm -f "$out" "$out.part"
+    return 1
+}
+
+ghproxy_url(){
+    case "$1" in
+        https://github.com/*) printf 'https://ghproxy.net/%s\n' "${1#https://}" ;;
+        *) return 1 ;;
+    esac
+}
+
+fetch(){
+    url="$1"; out="$2"
+    proxy="$(ghproxy_url "$url" 2>/dev/null)"
+
+    if test -n "$proxy" && test "$GITHUB_MODE" = proxy; then
+        say "GitHub proxy: $proxy"
+        fetch_direct "$proxy" "$out" && return 0
+        warn "ghproxy.net не ответил; пробую прямой GitHub"
+        fetch_direct "$url" "$out" && { GITHUB_MODE=direct; return 0; }
+        rm -f "$out" "$out.part"
+        return 1
+    fi
+
+    fetch_direct "$url" "$out" && { test -n "$proxy" && GITHUB_MODE=direct; return 0; }
+
+    if test -n "$proxy" && test "$GITHUB_MODE" != direct; then
+        warn "GitHub недоступен; переключаю загрузки на ghproxy.net"
+        say "Fallback: $proxy"
+        fetch_direct "$proxy" "$out" && { GITHUB_MODE=proxy; return 0; }
+    elif test -n "$proxy"; then
+        warn "Прямой GitHub перестал отвечать; пробую ghproxy.net"
+        say "Fallback: $proxy"
+        fetch_direct "$proxy" "$out" && { GITHUB_MODE=proxy; return 0; }
+    fi
 
     rm -f "$out" "$out.part"
     return 1
@@ -1436,6 +1480,19 @@ fetch(){
 
 fetch_repo_file(){
     rel="$1"; out="$2"
+
+    if test "$GITHUB_MODE" = proxy; then
+        for url in \
+            "https://github.com/$REPO/raw/refs/heads/$BRANCH/$rel" \
+            "https://testingcf.jsdelivr.net/gh/$REPO@$BRANCH/$rel" \
+            "https://cdn.jsdelivr.net/gh/$REPO@$BRANCH/$rel"; do
+            say "Скачиваю $rel"
+            fetch "$url" "$out" && return 0
+            warn "Источник недоступен: $url"
+        done
+        return 1
+    fi
+
     for url in \
         "https://raw.githubusercontent.com/$REPO/refs/heads/$BRANCH/$rel" \
         "https://github.com/$REPO/raw/refs/heads/$BRANCH/$rel" \
@@ -2320,7 +2377,8 @@ PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 MOUNT_POINT="$2"
 BASE="$MOUNT_POINT/goshacrash"
-TRACE="$BASE/logs/coldboot.log"
+RUNTIME_ROOT=/tmp/goshacrash
+TRACE="$RUNTIME_ROOT/logs/coldboot.log"
 TMP_TRACE=/tmp/goshacrash-coldboot.log
 WAITED=0
 
@@ -2331,13 +2389,13 @@ trace(){
 test -x "$BASE/goshacrash.sh" || exit 0
 printf '%s\n' "$BASE" > /tmp/goshacrash-base 2>/dev/null || true
 
-mkdir -p "$BASE/logs" "$BASE/run" "$BASE/state" 2>/dev/null || true
+mkdir -p "$BASE/state" "$RUNTIME_ROOT/logs" "$RUNTIME_ROOT/run" "$RUNTIME_ROOT/state" 2>/dev/null || true
 if test -s "$TMP_TRACE"; then
   cat "$TMP_TRACE" >> "$TRACE" 2>/dev/null || true
   : > "$TMP_TRACE" 2>/dev/null || true
 fi
 
-# Keep the persistent trace bounded.
+# Keep the current-boot RAM trace bounded.
 if test -f "$TRACE"; then
   TRACE_SIZE="$(wc -c < "$TRACE" 2>/dev/null)"
   case "$TRACE_SIZE" in ''|*[!0-9]*) TRACE_SIZE=0;; esac
@@ -2378,17 +2436,17 @@ done
 BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 UPTIME="$(cat /proc/uptime 2>/dev/null)"
 trace "controller ready after ${WAITED}s dm=${DM:-none} boot_id=${BOOT_ID:-unknown} uptime=${UPTIME:-unknown}"
-date '+%Y-%m-%d %H:%M:%S' > "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-printf '[%s] autostart hook 4.0.0: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BASE/logs/boot.log" 2>/dev/null || true
+date '+%Y-%m-%d %H:%M:%S' > "$RUNTIME_ROOT/state/autostart-hook-ran" 2>/dev/null || true
+printf '[%s] autostart hook 4.0.0: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$RUNTIME_ROOT/logs/boot.log" 2>/dev/null || true
 
 NOHUP=""
 for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup; do
   test -x "$p" && { NOHUP="$p"; break; }
 done
 if test -n "$NOHUP"; then
-  GOSHACRASH_BASE="$BASE" "$NOHUP" /bin/sh "$BASE/goshacrash.sh" boot </dev/null >> "$BASE/logs/boot.log" 2>&1 &
+  GOSHACRASH_BASE="$BASE" "$NOHUP" /bin/sh "$BASE/goshacrash.sh" boot </dev/null >> "$RUNTIME_ROOT/logs/boot.log" 2>&1 &
 else
-  GOSHACRASH_BASE="$BASE" /bin/sh "$BASE/goshacrash.sh" boot </dev/null >> "$BASE/logs/boot.log" 2>&1 &
+  GOSHACRASH_BASE="$BASE" /bin/sh "$BASE/goshacrash.sh" boot </dev/null >> "$RUNTIME_ROOT/logs/boot.log" 2>&1 &
 fi
 trace "boot worker launched pid=$!"
 exit 0
@@ -2471,9 +2529,7 @@ HOOK
 
     remove_pre3712_autostart
     install_stock_usb_mount_bridge || return 1
-    # Do not erase runtime/boot logs during an upgrade.  They are the only
-    # evidence of cold-boot failures on the router and runtime rotates them.
-    ok "Автозапуск установлен для stock ASUSWRT; служебные данные остаются внутри $BASE"
+    ok "Автозапуск установлен; runtime logs/run/heartbeat находятся в /tmp (RAM), RAM-логи очищаются раз в 3 часа и на USB не сохраняются"
 }
 
 verify_shell_compat(){
@@ -2538,11 +2594,9 @@ EOF
 }
 
 save_install_log(){
-    mkdir -p "$BASE/logs" 2>/dev/null || return 0
-    if test "$INSTALL_LOG" = "$TMP_LOG"; then
-        cat "$TMP_LOG" >> "$BASE/logs/install.log" 2>/dev/null || true
-        INSTALL_LOG="$BASE/logs/install.log"
-    fi
+    mkdir -p "$RUNTIME_LOGS" 2>/dev/null || return 0
+    INSTALL_LOG="$TMP_LOG"
+    return 0
 }
 
 
@@ -2563,6 +2617,7 @@ normalize_legacy_optware_unzip() {
 
 
 main(){
+    mkdir -p "$RUNTIME_LOGS" 2>/dev/null || true
     : > "$TMP_LOG"
 
     case "${1:-}" in
@@ -2602,11 +2657,32 @@ main(){
     legacy_preflight_before_dm || return 1
     find_download_master || return 1
     BASE="$USB_MOUNT/goshacrash"
-    mkdir -p "$TMP_ROOT" "$BASE/bin" "$BASE/logs" "$BASE/run" "$BASE/state" || return 1
-    # Keep the persistent tree minimal. Remove only empty legacy directories;
-    # never delete existing user files automatically.
+    mkdir -p "$TMP_ROOT" "$BASE/bin" "$BASE/state" "$RUNTIME_LOGS" "$RUNTIME_ROOT/run" "$RUNTIME_ROOT/state" || return 1
+    # Do not remove legacy USB run/log directories here: an older controller may
+    # still be using their PID files during an in-place update. The new controller
+    # migrates/stops that legacy runtime atomically on its first start/restart.
     rmdir "$BASE/rulesets" "$BASE/proxies" "$BASE/backups" 2>/dev/null || true
-    save_install_log
+    rm -f "$BASE/state/logs-last-3h.txt.gz" "$BASE/state/logs-last-3h.txt" 2>/dev/null || true
+
+    USED_PCT="$(df -P "$USB_MOUNT" 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}')"
+    FREE_KB="$(df -Pk "$USB_MOUNT" 2>/dev/null | awk 'NR==2 {print $4}')"
+    case "$USED_PCT" in ''|*[!0-9]*) USED_PCT=0;; esac
+    case "$FREE_KB" in ''|*[!0-9]*) FREE_KB=0;; esac
+    if test "$USED_PCT" -ge 95 || test "$FREE_KB" -lt 32768; then
+        fail "USB почти заполнена: used=${USED_PCT}% free=${FREE_KB}KB. Освободи место перед установкой"
+        return 1
+    fi
+    if test -d "$USB_MOUNT/.minidlna"; then
+        DLNA_KB="$(du -sk "$USB_MOUNT/.minidlna" 2>/dev/null | awk '{print $1}')"
+        case "$DLNA_KB" in ''|*[!0-9]*) DLNA_KB=0;; esac
+        test "$DLNA_KB" -lt 262144 || warn "ASUS .minidlna занимает ${DLNA_KB}KB; если Media Server не используется, отключи его и очисти каталог"
+    fi
+
+    if usb_kernel_fs_errors_install; then
+        fail "Ядро уже зафиксировало ошибки ${USB_FS:-filesystem} на $USB_DEVICE. Установка остановлена, чтобы не писать на повреждённую USB"
+        fail "Нужен offline e2fsck на размонтированном разделе; если повторный чистый проход снова находит ошибки — переформатируй или замени флешку"
+        return 1
+    fi
 
     say "GoshaCrash installer $INSTALLER_VERSION"
     say "USB device: $USB_DEVICE"
@@ -2662,7 +2738,7 @@ main(){
     fi
 
     GOSHACRASH_BASE="$BASE" "$BASE/goshacrash.sh" restart || {
-        fail "Первый запуск не удался. Проверь $BASE/logs/mihomo.log и команду gc logs"
+        fail "Первый запуск не удался. Проверь /tmp/goshacrash/logs/mihomo.log и команду gc logs"
         return 1
     }
 

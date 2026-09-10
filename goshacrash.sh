@@ -4,7 +4,7 @@
 # Zashboard updates are triggered from the native button inside Zashboard.
 
 VERSION="4.0.0"
-BUILD_ID="2026-09-09-simple-config-native-auto-mptcp-passive-logs-nav-v1"
+BUILD_ID="2026-09-10-ramlogs-3h-clear-ghproxy-storage-guard-v3"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -43,15 +43,17 @@ RUNTIME_BASE_FILE="/tmp/goshacrash-base"
 BIN="$BASE/bin/mihomo"
 UI="$BASE/ui"
 CONFIG="$BASE/config.yaml"
-RUN="$BASE/run"
-LOGS="$BASE/logs"
+RUNTIME_ROOT="${GOSHACRASH_RUNTIME:-/tmp/goshacrash}"
+RUN="$RUNTIME_ROOT/run"
+LOGS="$RUNTIME_ROOT/logs"
+VOLATILE_STATE="$RUNTIME_ROOT/state"
 STATE="$BASE/state"
 PLATFORM_FILE="$STATE/platform.env"
 PIDFILE="$RUN/mihomo.pid"
 WATCHDOG_PIDFILE="$RUN/watchdog.pid"
 WATCHDOG_LOG="$LOGS/watchdog.log"
 WATCHDOG_START_LOCK="$RUN/watchdog-start.lock"
-WATCHDOG_HEARTBEAT="$STATE/watchdog-heartbeat"
+WATCHDOG_HEARTBEAT="$VOLATILE_STATE/watchdog-heartbeat"
 BOOT_PIDFILE="$RUN/boot.pid"
 BOOT_LOCK="$RUN/boot.lock"
 START_LOCK="$RUN/start.lock"
@@ -62,6 +64,8 @@ BOOT_TOKEN_FILE="/tmp/goshacrash-boot-token"
 MIHOMO_LOG="$LOGS/mihomo.log"
 INSTALL_LOG="$LOGS/install.log"
 PACKAGES_LOG="$LOGS/packages.log"
+LOG_CLEAR_INTERVAL="${GOSHACRASH_LOG_CLEAR_INTERVAL:-10800}"
+LOG_CLEAR_LAST="$VOLATILE_STATE/log-clear-last"
 
 TUN_DEVICE="${GOSHACRASH_TUN_DEVICE:-tun0}"
 TUN_TABLE="${GOSHACRASH_TUN_TABLE:-2022}"
@@ -77,13 +81,13 @@ WAN_FAIL_LIMIT="${GOSHACRASH_WAN_FAIL_LIMIT:-3}"
 WAN_RECOVER_LIMIT="${GOSHACRASH_WAN_RECOVER_LIMIT:-2}"
 WAN_PROBE_TIMEOUT="${GOSHACRASH_WAN_PROBE_TIMEOUT:-2}"
 WAN_PROBE_IPS="${GOSHACRASH_WAN_PROBE_IPS:-1.1.1.1 8.8.8.8 9.9.9.9}"
-WAN_OFFLINE="$STATE/wan-offline"
-WAN_FAIL_COUNT="$STATE/wan-fail-count"
-WAN_OK_COUNT="$STATE/wan-ok-count"
-WAN_STATE="$STATE/internet.state"
+WAN_OFFLINE="$VOLATILE_STATE/wan-offline"
+WAN_FAIL_COUNT="$VOLATILE_STATE/wan-fail-count"
+WAN_OK_COUNT="$VOLATILE_STATE/wan-ok-count"
+WAN_STATE="$VOLATILE_STATE/internet.state"
 PROC_SYS="${GOSHACRASH_PROC_SYS:-/proc/sys}"
 
-ROUTE_STATE="$STATE/route"
+ROUTE_STATE="$VOLATILE_STATE/route"
 ROUTE_ACTIVE="$ROUTE_STATE/active"
 LAN_CHAIN="GOSHACRASH_TUN_LAN"
 ROUTER_CHAIN="GOSHACRASH_TUN_ROUTER"
@@ -116,7 +120,7 @@ IPTABLES=""
 IPT_WAIT=""
 NET_BACKEND=""
 
-ensure_dirs(){ mkdir -p "$BASE/bin" "$UI" "$RUN" "$LOGS" "$STATE" "$ROUTE_STATE"; }
+ensure_dirs(){ mkdir -p "$BASE/bin" "$UI" "$RUNTIME_ROOT" "$RUN" "$LOGS" "$VOLATILE_STATE" "$STATE" "$ROUTE_STATE"; }
 now(){ date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date; }
 
 rotate_log(){
@@ -1217,6 +1221,37 @@ watchdog_connectivity_step(){
     return 1
 }
 
+migrate_legacy_usb_runtime(){
+    legacy_run="$BASE/run"
+    legacy_logs="$BASE/logs"
+    [ -d "$legacy_run" ] || [ -d "$legacy_logs" ] || [ -e "$BASE/state/watchdog-heartbeat" ] || return 0
+
+    old_watchdog="$(cat "$legacy_run/watchdog.pid" 2>/dev/null)"
+    if [ -n "$old_watchdog" ] && pid_matches "$old_watchdog" "$BASE/goshacrash.sh" " watchdog-loop"; then
+        kill "$old_watchdog" 2>/dev/null || true
+        sleep 1
+        pid_matches "$old_watchdog" "$BASE/goshacrash.sh" " watchdog-loop" && kill -9 "$old_watchdog" 2>/dev/null || true
+    fi
+
+    old_mihomo="$(cat "$legacy_run/mihomo.pid" 2>/dev/null)"
+    if [ -n "$old_mihomo" ] && [ -r "/proc/$old_mihomo/cmdline" ]; then
+        old_cmd="$(tr '\000' ' ' < "/proc/$old_mihomo/cmdline" 2>/dev/null)"
+        case "$old_cmd" in
+            *"$BASE/bin/mihomo"*)
+                kill "$old_mihomo" 2>/dev/null || true
+                sleep 1
+                kill -0 "$old_mihomo" 2>/dev/null && kill -9 "$old_mihomo" 2>/dev/null || true
+                ;;
+        esac
+    fi
+
+    rm -rf "$legacy_run" "$legacy_logs" "$BASE/state/route" 2>/dev/null || true
+    rm -f "$BASE/state/logs-last-3h.txt.gz" "$BASE/state/logs-last-3h.txt" 2>/dev/null || true
+    rm -f "$BASE/state/wan-offline" "$BASE/state/wan-fail-count" "$BASE/state/wan-ok-count" "$BASE/state/internet.state" "$BASE/state/watchdog-heartbeat" "$BASE/state/autostart-hook-ran" 2>/dev/null || true
+    log_event INFO storage "legacy USB runtime migrated to RAM; old logs/run removed"
+    return 0
+}
+
 manual_route_start(){
     select_net_backend || return 1
     [ -x "$IPTABLES" ] || { fail "iptables не найден"; return 1; }
@@ -1348,6 +1383,7 @@ wait_modern_uplink(){
 
 start_runtime(){
     ensure_dirs || return 1
+    storage_guard_runtime || return 1
     load_platform || return 1
     repair_opt >/dev/null 2>&1 || true
     refresh_path
@@ -1502,8 +1538,8 @@ cleanup_stale_runtime_state(){
     # connectivity state; manual-stop remains persistent by design.
     rm -f "$WAN_OFFLINE" "$WAN_FAIL_COUNT" "$WAN_OK_COUNT" "$WAN_STATE" "$WATCHDOG_HEARTBEAT" 2>/dev/null || true
 
-    # Files under run/ live on USB and survive a hard power cut.  A PID alone
-    # is not proof that it still belongs to GoshaCrash after the next boot.
+    # run/, logs/ and transient watchdog state live only in /tmp (RAM).
+    # They intentionally disappear on reboot to avoid constant writes to USB.
     running_pid >/dev/null 2>&1 || rm -f "$PIDFILE" 2>/dev/null || true
     watchdog_pid >/dev/null 2>&1 || rm -f "$WATCHDOG_PIDFILE" 2>/dev/null || true
     boot_pid >/dev/null 2>&1 || rm -f "$BOOT_PIDFILE" 2>/dev/null || true
@@ -1632,16 +1668,19 @@ watchdog_loop(){
     # the controller reaches the watchdog, not one interval later.
     printf '%s pid=%s\n' "$(now)" "$$" > "$WATCHDOG_HEARTBEAT" 2>/dev/null || true
     watchdog_check
+    maybe_clear_ram_logs
     while :; do
         sleep "$WATCHDOG_INTERVAL"
         printf '%s pid=%s\n' "$(now)" "$$" > "$WATCHDOG_HEARTBEAT" 2>/dev/null || true
         watchdog_check
+        maybe_clear_ram_logs
     done
 }
 
 start(){
     ensure_dirs || return 1
     load_platform || return 1
+    migrate_legacy_usb_runtime
     refresh_path
     check_config || return 1
 
@@ -1672,7 +1711,7 @@ start(){
     return "$rc"
 }
 stop(){
-    ensure_dirs || return 1; load_platform || true; touch "$MANUAL_STOP"
+    ensure_dirs || return 1; load_platform || true; migrate_legacy_usb_runtime; touch "$MANUAL_STOP"
     control_lock_set || { fail "Другая операция GoshaCrash ещё выполняется"; return 1; }
     watchdog_stop; stop_runtime; control_lock_clear; ok "Mihomo остановлен; обычный DIRECT восстановлен"
 }
@@ -1683,6 +1722,7 @@ service_stop(){
     # otherwise the next boot would intentionally skip autostart.
     ensure_dirs || return 1
     load_platform || true
+    migrate_legacy_usb_runtime
     control_lock_set || { warn "service-stop: другая операция ещё выполняется"; return 1; }
     watchdog_stop
     stop_runtime
@@ -1692,6 +1732,7 @@ service_stop(){
 restart(){
     ensure_dirs || return 1
     load_platform || return 1
+    migrate_legacy_usb_runtime
     refresh_path
 
     check_config || return 1
@@ -1746,6 +1787,7 @@ main_default_route(){
 boot(){
     ensure_dirs || return 1
     load_platform || return 1
+    migrate_legacy_usb_runtime
     refresh_path
 
     if [ -f "$MANUAL_STOP" ]; then
@@ -2117,11 +2159,80 @@ runtime_usb_device(){
     awk -v m="$mp" '$2==m {print $1; exit}' /proc/mounts 2>/dev/null
 }
 
+usb_usage_percent(){
+    df -P "$USB_MOUNT" 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}'
+}
+
+usb_free_kb(){
+    df -Pk "$USB_MOUNT" 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
+storage_space_ok(){
+    used="$(usb_usage_percent)"
+    free_kb="$(usb_free_kb)"
+    case "$used" in ''|*[!0-9]*) used=0;; esac
+    case "$free_kb" in ''|*[!0-9]*) free_kb=0;; esac
+    [ "$used" -lt 95 ] && [ "$free_kb" -ge 32768 ]
+}
+
+storage_guard_runtime(){
+    refresh_storage_identity >/dev/null 2>&1 || true
+    storage_space_ok && return 0
+    used="$(usb_usage_percent)"; free_kb="$(usb_free_kb)"
+    fail "USB почти заполнена: used=${used:-?}% free=${free_kb:-?}KB. Runtime не запускается, чтобы не добивать filesystem"
+    return 1
+}
+
+minidlna_size_kb(){
+    [ -d "$USB_MOUNT/.minidlna" ] || return 1
+    du -sk "$USB_MOUNT/.minidlna" 2>/dev/null | awk '{print $1}'
+}
+
 usb_kernel_fs_errors(){
     dev="$(runtime_usb_device 2>/dev/null)"
     [ -n "$dev" ] || return 1
     short="${dev##*/}"
     dmesg 2>/dev/null | grep -Eq "EXT[234]-fs error \(device $short\)|I/O error.*$short|Buffer I/O error.*$short"
+}
+
+uptime_seconds(){
+    awk '{print int($1)}' /proc/uptime 2>/dev/null
+}
+
+log_clear_mark_now(){
+    u="$(uptime_seconds)"
+    case "$u" in ''|*[!0-9]*) return 1;; esac
+    printf '%s\n' "$u" > "$LOG_CLEAR_LAST" 2>/dev/null || return 1
+    return 0
+}
+
+clear_ram_logs(){
+    ensure_dirs || return 1
+    for f in "$LOGS"/*.log; do
+        [ -f "$f" ] || continue
+        : > "$f" 2>/dev/null || true
+    done
+    rm -f "$LOGS"/*.log.1 "$LOGS"/*.log.2 "$LOGS"/*.log.3 2>/dev/null || true
+    log_clear_mark_now >/dev/null 2>&1 || true
+    return 0
+}
+
+maybe_clear_ram_logs(){
+    interval="$LOG_CLEAR_INTERVAL"
+    case "$interval" in ''|*[!0-9]*|0) interval=10800;; esac
+    u="$(uptime_seconds)"
+    case "$u" in ''|*[!0-9]*) return 0;; esac
+    last="$(cat "$LOG_CLEAR_LAST" 2>/dev/null)"
+    case "$last" in
+        ''|*[!0-9]*)
+            printf '%s\n' "$u" > "$LOG_CLEAR_LAST" 2>/dev/null || true
+            return 0
+            ;;
+    esac
+    elapsed=$((u - last))
+    [ "$elapsed" -ge "$interval" ] || return 0
+    clear_ram_logs >/dev/null 2>&1 || true
+    return 0
 }
 
 usb_metadata_probe_runtime(){
@@ -2642,8 +2753,8 @@ autostart_status(){
     [ -x "$DM_ROOT/etc/init.d/S50usb-mount-script" ] && echo "  ASUS app bridge: OK" || echo "  ASUS app bridge: FAIL"
     bridge_version="$(sed -n 's/^# GoshaCrash Download Master bridge //p' "$DM_ROOT/etc/init.d/S50usb-mount-script" 2>/dev/null | /bin/busybox head -n 1)"
     [ -n "$bridge_version" ] && echo "  bridge version: $bridge_version" || echo "  bridge version: old/unknown"
-    [ -f "$STATE/autostart-hook-ran" ] && echo "  last hook: $(cat "$STATE/autostart-hook-ran" 2>/dev/null)" || echo "  last hook: never"
-    [ -f "$LOGS/coldboot.log" ] && echo "  coldboot trace: $LOGS/coldboot.log" || echo "  coldboot trace: not written yet"
+    [ -f "$VOLATILE_STATE/autostart-hook-ran" ] && echo "  last hook: $(cat "$VOLATILE_STATE/autostart-hook-ran" 2>/dev/null)" || echo "  last hook: not seen this boot"
+    [ -f "$LOGS/coldboot.log" ] && echo "  coldboot trace: $LOGS/coldboot.log (RAM)" || echo "  coldboot trace: not written yet"
     [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall 4.0.0)" || echo "  legacy JFFS dir: clean"
     [ -f "$MANUAL_STOP" ] && echo "  manual-stop: YES" || echo "  manual-stop: no"
     return 0
@@ -2812,6 +2923,27 @@ doctor(){
     [ -n "$DM_ROOT" ] && [ -x "$DM_ROOT/etc/init.d/S50usb-mount-script" ] \
         && echo "  ASUS app bridge: OK" || echo "  ASUS app bridge: FAIL"
 
+    used_pct="$(usb_usage_percent)"
+    free_kb="$(usb_free_kb)"
+    echo "  USB space: used=${used_pct:-?}% free=${free_kb:-?}KB"
+    if storage_space_ok; then
+        echo "  USB free-space guard: OK"
+    else
+        echo "  USB free-space guard: FAIL (95%+/less than 32MB)"
+    fi
+    if dlna_kb="$(minidlna_size_kb 2>/dev/null)"; then
+        case "$dlna_kb" in ''|*[!0-9]*) dlna_kb=0;; esac
+        if [ "$dlna_kb" -ge 262144 ]; then
+            echo "  ASUS .minidlna cache: LARGE (${dlna_kb}KB)"
+        else
+            echo "  ASUS .minidlna cache: ${dlna_kb}KB"
+        fi
+    else
+        echo "  ASUS .minidlna cache: not present"
+    fi
+    echo "  runtime logs: $LOGS (RAM, cleared every 3h)"
+    echo "  persistent logs on USB: disabled"
+
     if usb_metadata_probe_runtime; then
         echo "  USB metadata probe: OK"
     else
@@ -2858,13 +2990,14 @@ GoshaCrash 4.0.0 — что буквально вводить в SSH
 
 ПОЛНАЯ ДИАГНОСТИКА
   gc doctor
+  gc storage
 
 АВТОЗАПУСК / COLD BOOT
   gc autostart status
   BASE="$(gc base)"
-  cat "$BASE/logs/coldboot.log"
-  tail -n 100 "$BASE/logs/boot.log"
-  tail -n 100 "$BASE/logs/watchdog.log"
+  cat "/tmp/goshacrash/logs/coldboot.log"
+  tail -n 100 "/tmp/goshacrash/logs/boot.log"
+  tail -n 100 "/tmp/goshacrash/logs/watchdog.log"
 
 ПРОВЕРИТЬ ТОЛЬКО INTERNET PROBE
   gc internet-probe
@@ -2880,8 +3013,8 @@ GoshaCrash 4.0.0 — что буквально вводить в SSH
 
 СБРОСИТЬ ЛОЖНЫЙ OFFLINE
   BASE="$(gc base)"
-  rm -f "$BASE/state/wan-offline" "$BASE/state/wan-fail-count" "$BASE/state/wan-ok-count"
-  echo online > "$BASE/state/internet.state"
+  rm -f "/tmp/goshacrash/state/wan-offline" "/tmp/goshacrash/state/wan-fail-count" "/tmp/goshacrash/state/wan-ok-count"
+  echo online > "/tmp/goshacrash/state/internet.state"
   gc restart
 
 
@@ -2917,28 +3050,31 @@ GoshaCrash 4.0.0 — что буквально вводить в SSH
 LIVE MIHOMO
   gc logs live mihomo 100
 
+ОЧИСТИТЬ RAM-ЛОГИ СЕЙЧАС
+  gc logs clear
+
 ЛОГ MIHOMO ВРУЧНУЮ
   BASE="$(gc base)"
-  tail -n 100 "$BASE/logs/mihomo.log"
+  tail -n 100 "/tmp/goshacrash/logs/mihomo.log"
 
 LIVE ВРУЧНУЮ
   BASE="$(gc base)"
-  tail -f "$BASE/logs/mihomo.log"
+  tail -f "/tmp/goshacrash/logs/mihomo.log"
 
 ЛОГ УСТАНОВКИ
   BASE="$(gc base)"
-  tail -n 200 "$BASE/logs/install.log"
+  tail -n 200 "/tmp/goshacrash/logs/install.log"
 
 ЛОГ ПАКЕТОВ
   BASE="$(gc base)"
-  tail -n 200 "$BASE/logs/packages.log"
+  tail -n 200 "/tmp/goshacrash/logs/packages.log"
 
 ПРОЦЕСС MIHOMO
   ps | grep '[m]ihomo'
 
 PID MIHOMO
   BASE="$(gc base)"
-  cat "$BASE/run/mihomo.pid" 2>/dev/null
+  cat "/tmp/goshacrash/run/mihomo.pid" 2>/dev/null
 
 TUN
   ifconfig tun0
@@ -2973,14 +3109,14 @@ RT-AC68U / LEGACY
 
 WATCHDOG
   BASE="$(gc base)"
-  cat "$BASE/run/watchdog.pid" 2>/dev/null
-  PID="$(cat "$BASE/run/watchdog.pid" 2>/dev/null)"
+  cat "/tmp/goshacrash/run/watchdog.pid" 2>/dev/null
+  PID="$(cat "/tmp/goshacrash/run/watchdog.pid" 2>/dev/null)"
   [ -n "$PID" ] && kill -0 "$PID" && echo "watchdog OK"
 
 СОСТОЯНИЕ INTERNET WATCHDOG
   BASE="$(gc base)"
-  cat "$BASE/state/internet.state" 2>/dev/null
-  ls -l "$BASE/state/wan-offline" 2>/dev/null
+  cat "/tmp/goshacrash/state/internet.state" 2>/dev/null
+  ls -l "/tmp/goshacrash/state/wan-offline" 2>/dev/null
 
 АВТОЗАПУСК
   gc autostart status
@@ -2991,7 +3127,7 @@ HOOK AUTOSTART
 
 СРАБОТАЛ ЛИ AUTOSTART ПОСЛЕ REBOOT
   BASE="$(gc base)"
-  cat "$BASE/state/autostart-hook-ran" 2>/dev/null
+  cat "/tmp/goshacrash/state/autostart-hook-ran" 2>/dev/null
 
 ПРОВЕРИТЬ /opt ПОСЛЕ REBOOT
   ls -ld /opt /tmp/opt
@@ -3054,11 +3190,12 @@ CONTROLLER
 
 РУЧНОЙ RESTART ТОЛЬКО MIHOMO
   BASE="$(gc base)"
-  PID="$(cat "$BASE/run/mihomo.pid" 2>/dev/null)"
+  PID="$(cat "/tmp/goshacrash/run/mihomo.pid" 2>/dev/null)"
   [ -n "$PID" ] && kill "$PID"
-  rm -f "$BASE/run/mihomo.pid"
-  GOGC=50 nohup "$BASE/bin/mihomo" -d "$BASE" -f "$BASE/config.yaml" </dev/null >>"$BASE/logs/mihomo.log" 2>&1 &
-  echo $! > "$BASE/run/mihomo.pid"
+  rm -f "/tmp/goshacrash/run/mihomo.pid"
+  mkdir -p /tmp/goshacrash/logs /tmp/goshacrash/run
+  GOGC=50 nohup "$BASE/bin/mihomo" -d "$BASE" -f "$BASE/config.yaml" </dev/null >>/tmp/goshacrash/logs/mihomo.log 2>&1 &
+  echo $! > "/tmp/goshacrash/run/mihomo.pid"
 
 ПОСЛЕ РУЧНОГО ЗАПУСКА ВЕРНУТЬ ПОЛНЫЙ RUNTIME
   gc restart
@@ -3089,6 +3226,7 @@ case "$GC_COMMAND" in
     version) echo "$VERSION"; exit 0;;
     help|-h|--help) usage; exit 0;;
     base) printf '%s\n' "$BASE"; exit 0;;
+    logdir) printf '%s\n' "$LOGS"; exit 0;;
 esac
 
 refresh_path >/dev/null 2>&1 || true
@@ -3140,12 +3278,29 @@ case "$GC_COMMAND" in
             *) echo 'Использование: gc routing status|manual|auto'; exit 1;;
         esac
         ;;
+    storage)
+        refresh_storage_identity >/dev/null 2>&1 || true
+        echo "USB: ${USB_DEVICE:-?} -> $USB_MOUNT (${USB_FS:-?})"
+        df -h "$USB_MOUNT" 2>/dev/null || true
+        if dlna_kb="$(minidlna_size_kb 2>/dev/null)"; then echo ".minidlna: ${dlna_kb}KB"; else echo ".minidlna: not present"; fi
+        echo "persistent logs on USB: disabled"
+        echo "RAM logs: $LOGS (cleared every 3h)"
+        if usb_kernel_fs_errors; then echo "filesystem kernel log: ERRORS DETECTED - offline fsck required"; else echo "filesystem kernel log: no current errors"; fi
+        ;;
     logs)
         shift
         case "${1:-mihomo}" in
             live)
                 shift
                 follow_logs "${1:-mihomo}" "${2:-100}"
+                ;;
+            clear)
+                clear_ram_logs
+                echo "RAM logs cleared"
+                ;;
+            flush)
+                clear_ram_logs
+                echo "RAM logs cleared; persistent USB log snapshots are disabled"
                 ;;
             *) show_logs "${1:-mihomo}" "${2:-100}" ;;
         esac

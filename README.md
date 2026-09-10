@@ -25,7 +25,7 @@
 - поддерживает Optware / Download Master;
 - ставит UTF-8 окружение для `nano`;
 - даёт меню `gc` со стрелками, `Enter` и `Esc`;
-- содержит `gc status`, `gc doctor`, логи, редактор конфига и диагностику автозапуска.
+- содержит `gc status`, `gc doctor`, `gc storage`, RAM-логи, редактор конфига и диагностику автозапуска.
 
 ## Важные принципы текущей сборки
 
@@ -83,6 +83,46 @@ echo 1 > /proc/sys/net/mptcp/mptcp_enabled
 ```sh
 echo 0 > /proc/sys/net/mptcp/mptcp_enabled
 ```
+
+
+### Runtime-логи только в RAM, очистка раз в 3 часа
+
+Все часто изменяемые данные перенесены в RAM (`/tmp`):
+
+```text
+/tmp/goshacrash/
+├── logs/        # mihomo/install/packages/watchdog/boot/coldboot
+├── run/         # PID и lock-файлы
+└── state/       # heartbeat, WAN counters, runtime routing state
+```
+
+Рабочие логи пишутся только в RAM. Watchdog больше не переписывает USB-файл heartbeat каждые 10 секунд. Каждые 3 часа содержимое RAM-логов очищается и место сразу освобождается. На USB логи не копируются, snapshots и архивы не создаются.
+
+`gc logs` читает текущие RAM-логи. `gc logs clear` очищает их вручную. После перезагрузки RAM-логи также исчезают автоматически.
+
+### GitHub fallback через ghproxy.net
+
+Сначала установщик всегда пробует прямой GitHub. Если URL вида `https://github.com/...` недоступен, тот же файл автоматически запрашивается через `ghproxy.net`. Например:
+
+```text
+https://github.com/MetaCubeX/mihomo/releases/download/v1.19.30/mihomo-linux-armv7-v1.19.30.gz
+```
+
+автоматически получает fallback:
+
+```text
+https://ghproxy.net/github.com/MetaCubeX/mihomo/releases/download/v1.19.30/mihomo-linux-armv7-v1.19.30.gz
+```
+
+Это применяется к Mihomo, Zashboard и GitHub release-файлам проекта. Для файлов самой ветки дополнительно остаются raw GitHub и jsDelivr источники.
+
+### Защита USB / filesystem
+
+Перед стартом runtime GoshaCrash проверяет свободное место. При заполнении USB на 95% и выше либо при остатке меньше 32 MiB запуск блокируется, чтобы не продолжать запись на почти заполненную файловую систему.
+
+`gc doctor` и `gc storage` показывают заполнение USB, наличие крупного `.minidlna` и ошибки EXT2/3/4 или I/O из текущего kernel log. Установщик отказывается продолжать запись, если ядро уже зафиксировало ошибки файловой системы на выбранном USB-разделе.
+
+Важно: GoshaCrash не запускает `e2fsck` по смонтированной флешке. Уже повреждённую файловую систему нужно чинить offline; если второй последовательный `e2fsck -f` на всё ещё размонтированном разделе снова находит множество новых ошибок, флешку/файловую систему надо переформатировать, а при повторении на свежей ФС — заменить носитель.
 
 ### Native AUTO на BT10
 
@@ -167,6 +207,7 @@ Esc     назад / выход
 |---|---|
 | `gc status` | краткий статус |
 | `gc doctor` | полная диагностика |
+| `gc storage` | место на USB, `.minidlna`, kernel FS errors |
 | `gc edit` | редактировать `config.yaml` |
 | `gc start` | запустить runtime |
 | `gc restart` | перезапустить runtime |
@@ -176,6 +217,7 @@ Esc     назад / выход
 | `gc routing manual` | manual routing |
 | `gc logs` | последние строки Mihomo |
 | `gc logs live mihomo 100` | live log Mihomo |
+| `gc logs clear` | вручную очистить текущие RAM-логи |
 | `gc dashboard` | адрес Zashboard |
 | `gc autostart status` | диагностика автозапуска |
 
@@ -218,6 +260,8 @@ gc autostart status
 
 ## Persistent layout
 
+USB содержит только постоянные данные:
+
 ```text
 /tmp/mnt/<current>/
 ├── install.sh
@@ -227,9 +271,16 @@ gc autostart status
     ├── config.yaml
     ├── bin/
     ├── ui/
-    ├── logs/
-    ├── run/
-    └── state/
+    └── state/               # platform/manual-stop и редкие persistent данные
+```
+
+Часто изменяемый runtime находится только в RAM. Логи очищаются раз в 3 часа и на USB не сохраняются:
+
+```text
+/tmp/goshacrash/
+├── logs/
+├── run/
+└── state/
 ```
 
 В JFFS остаются только необходимые hooks/wrappers:
