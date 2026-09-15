@@ -3,8 +3,8 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="4.0.0"
-EXPECTED_CONTROLLER_BUILD_ID="2026-09-10-ramlogs-3h-clear-ghproxy-storage-guard-v3"
+INSTALLER_VERSION="4.0.1"
+EXPECTED_CONTROLLER_BUILD_ID="2026-09-15-auto-latest-mihomo-fifo-logs-v1"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -16,8 +16,8 @@ BRANCH="${BRANCH:-production}"
 
 LEGACY_MIHOMO_VERSION="${LEGACY_MIHOMO_VERSION:-v1.19.28}"
 LEGACY_MIHOMO_TAG="${LEGACY_MIHOMO_TAG:-mihomo-gvisor-armv5-$LEGACY_MIHOMO_VERSION}"
-OFFICIAL_MIHOMO_VERSION="${OFFICIAL_MIHOMO_VERSION:-v1.19.30}"
-OFFICIAL_MIHOMO_FALLBACK="${OFFICIAL_MIHOMO_FALLBACK:-$OFFICIAL_MIHOMO_VERSION}"
+OFFICIAL_MIHOMO_VERSION="${OFFICIAL_MIHOMO_VERSION:-}"
+OFFICIAL_MIHOMO_FALLBACK="${OFFICIAL_MIHOMO_FALLBACK:-}"
 ZASHBOARD_PRIMARY="${ZASHBOARD_URL:-https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip}"
 
 TMP_ROOT="/tmp/goshacrash-install.$$"
@@ -1897,11 +1897,22 @@ json_asset_urls(){
         tr -d '\r'
 }
 
+latest_mihomo_version(){
+    # Latest is resolved only during installation. No background update daemon.
+    # Prefer a tiny GitHub API query; if unavailable allow manual override.
+    test -n "$OFFICIAL_MIHOMO_VERSION" && { printf '%s\n' "$OFFICIAL_MIHOMO_VERSION"; return 0; }
+    api="https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
+    tmp="$TMP_ROOT/mihomo-release.json"
+    if fetch "$api" "$tmp"; then
+        v="$(grep '"tag_name"' "$tmp" 2>/dev/null | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+        test -n "$v" && { printf '%s\n' "$v"; return 0; }
+    fi
+    return 1
+}
+
 pinned_official_mihomo_url(){
-    # 4.0.0 deliberately pins the modern core. A router install must not silently
-    # switch CPU binary just because GitHub "latest" changed between runs.
-    MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_VERSION"
-    printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$OFFICIAL_MIHOMO_VERSION/mihomo-linux-$MIHOMO_TARGET-$OFFICIAL_MIHOMO_VERSION.gz"
+    MIHOMO_VERSION_SELECTED="$(latest_mihomo_version)" || { fail "Не удалось определить latest Mihomo"; return 1; }
+    printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$MIHOMO_VERSION_SELECTED/mihomo-linux-$MIHOMO_TARGET-$MIHOMO_VERSION_SELECTED.gz"
 }
 
 legacy_mihomo_urls(){
@@ -2244,7 +2255,7 @@ install_stock_usb_mount_bridge(){
     mkdir -p "$DM_ROOT/etc/init.d" "$DM_ROOT/lib/ipkg/info" || return 1
     cat > "$DM_ROOT/etc/init.d/S50usb-mount-script" <<'HOOK'
 #!/bin/sh
-# GoshaCrash Download Master bridge 4.0.0
+# GoshaCrash Download Master bridge 4.0.1
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2371,7 +2382,7 @@ install_hooks(){
 
     cat > /jffs/scripts/usb-mount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB hook 4.0.0
+# GoshaCrash USB hook 4.0.1
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2437,7 +2448,7 @@ BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 UPTIME="$(cat /proc/uptime 2>/dev/null)"
 trace "controller ready after ${WAITED}s dm=${DM:-none} boot_id=${BOOT_ID:-unknown} uptime=${UPTIME:-unknown}"
 date '+%Y-%m-%d %H:%M:%S' > "$RUNTIME_ROOT/state/autostart-hook-ran" 2>/dev/null || true
-printf '[%s] autostart hook 4.0.0: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$RUNTIME_ROOT/logs/boot.log" 2>/dev/null || true
+printf '[%s] autostart hook 4.0.1: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$RUNTIME_ROOT/logs/boot.log" 2>/dev/null || true
 
 NOHUP=""
 for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup; do
@@ -2455,7 +2466,7 @@ HOOK
 
     cat > /jffs/scripts/usb-umount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB unmount hook 4.0.0
+# GoshaCrash USB unmount hook 4.0.1
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2512,7 +2523,7 @@ HOOK
     test -d /opt/bin && test -w /opt/bin && write_command_wrapper /opt/bin/gc 2>/dev/null || true
 
     # Old rc23-rc26 used a custom /jffs/addons/goshacrash directory only to
-    # store base/start/trace. 4.0.0 no longer needs it; remove our own residue.
+    # store base/start/trace. 4.0.1 no longer needs it; remove our own residue.
     rm -rf /jffs/addons/goshacrash 2>/dev/null || true
     grep -Fq 'exec /bin/busybox test "$@"' /jffs/scripts/test 2>/dev/null && rm -f /jffs/scripts/test 2>/dev/null || true
     grep -Fq "exec /bin/busybox '['" /jffs/scripts/'[' 2>/dev/null && rm -f /jffs/scripts/'[' 2>/dev/null || true
@@ -2529,7 +2540,7 @@ HOOK
 
     remove_pre3712_autostart
     install_stock_usb_mount_bridge || return 1
-    ok "Автозапуск установлен; runtime logs/run/heartbeat находятся в /tmp (RAM), RAM-логи очищаются раз в 3 часа и на USB не сохраняются"
+    ok "Автозапуск установлен; logs/run/heartbeat находятся в /tmp (RAM), USB не используется для runtime-логов"
 }
 
 verify_shell_compat(){
@@ -2662,7 +2673,6 @@ main(){
     # still be using their PID files during an in-place update. The new controller
     # migrates/stops that legacy runtime atomically on its first start/restart.
     rmdir "$BASE/rulesets" "$BASE/proxies" "$BASE/backups" 2>/dev/null || true
-    rm -f "$BASE/state/logs-last-3h.txt.gz" "$BASE/state/logs-last-3h.txt" 2>/dev/null || true
 
     USED_PCT="$(df -P "$USB_MOUNT" 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}')"
     FREE_KB="$(df -Pk "$USB_MOUNT" 2>/dev/null | awk 'NR==2 {print $4}')"

@@ -1,16 +1,16 @@
 # Changelog
 
-## 4.0.0 production
+## 4.0.1 production
 
 ### USB / filesystem
 
-- Runtime logs live only in `/tmp/goshacrash/logs` (RAM) and are cleared every 3 hours; no log snapshot is written to USB.
+- Runtime logs moved from USB to `/tmp/goshacrash/logs` (RAM).
 - PID/lock files moved to `/tmp/goshacrash/run`.
 - Watchdog heartbeat, WAN counters and routing runtime state moved to RAM; the 10-second heartbeat no longer writes to USB.
-- Old GoshaCrash-owned `logs/`, `run/` and previous 3-hour snapshot files are removed from USB during update.
+- Old GoshaCrash-owned `logs/` and `run/` directories are removed from USB during update.
 - Runtime refuses to start when USB is >=95% full or has less than 32 MiB free.
 - `gc storage` and `gc doctor` expose USB usage, `.minidlna` size and kernel filesystem errors.
-- Installer refuses further writes when current kernel log already contains EXT filesystem/I/O errors for the selected USB. Runtime log maintenance no longer writes logs to USB at all.
+- Installer refuses further writes when current kernel log already contains EXT filesystem/I/O errors for the selected USB.
 
 ### Downloads
 
@@ -19,7 +19,7 @@
 - Mihomo, Zashboard and project GitHub release assets use the same fallback logic.
 - Direct download attempts now fail over on connection/stall instead of waiting indefinitely.
 
-Первая чистая production-сборка **GoshaCrash 4.0.0**.
+Первая чистая production-сборка **GoshaCrash 4.0.1**.
 
 - Ветка `production` используется как рабочий канал для реальных роутеров.
 - Ветка `main` остаётся для разработки, тестов и полной истории изменений.

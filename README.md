@@ -3,7 +3,7 @@
 **Mihomo + Zashboard для ASUSWRT-роутеров.**  
 Установка, TUN-маршрутизация, автозапуск, watchdog, диагностика и управление из одного `gc`.
 
-> Текущая публичная сборка: **GoshaCrash 4.0.0 production**
+> Текущая публичная сборка: **GoshaCrash 4.0.1 production**
 
 ## Поддерживаемые роутеры
 
@@ -85,7 +85,7 @@ echo 0 > /proc/sys/net/mptcp/mptcp_enabled
 ```
 
 
-### Runtime-логи только в RAM, очистка раз в 3 часа
+### Runtime-логи и watchdog больше не пишут на USB
 
 Все часто изменяемые данные перенесены в RAM (`/tmp`):
 
@@ -96,9 +96,9 @@ echo 0 > /proc/sys/net/mptcp/mptcp_enabled
 └── state/       # heartbeat, WAN counters, runtime routing state
 ```
 
-Рабочие логи пишутся только в RAM. Watchdog больше не переписывает USB-файл heartbeat каждые 10 секунд. Каждые 3 часа содержимое RAM-логов очищается и место сразу освобождается. На USB логи не копируются, snapshots и архивы не создаются.
+После reboot эти данные исчезают — это намеренно. На USB остаются только программа, `config.yaml`, UI и редко изменяемое persistent state. В частности watchdog больше не переписывает USB-файл heartbeat каждые 10 секунд.
 
-`gc logs` читает текущие RAM-логи. `gc logs clear` очищает их вручную. После перезагрузки RAM-логи также исчезают автоматически.
+`gc logs` продолжает работать как раньше, но читает `/tmp/goshacrash/logs`.
 
 ### GitHub fallback через ghproxy.net
 
@@ -217,7 +217,6 @@ Esc     назад / выход
 | `gc routing manual` | manual routing |
 | `gc logs` | последние строки Mihomo |
 | `gc logs live mihomo 100` | live log Mihomo |
-| `gc logs clear` | вручную очистить текущие RAM-логи |
 | `gc dashboard` | адрес Zashboard |
 | `gc autostart status` | диагностика автозапуска |
 
@@ -274,7 +273,7 @@ USB содержит только постоянные данные:
     └── state/               # platform/manual-stop и редкие persistent данные
 ```
 
-Часто изменяемый runtime находится только в RAM. Логи очищаются раз в 3 часа и на USB не сохраняются:
+Часто изменяемый runtime находится только в RAM:
 
 ```text
 /tmp/goshacrash/

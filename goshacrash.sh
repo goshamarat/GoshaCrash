@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="4.0.0"
-BUILD_ID="2026-09-10-ramlogs-3h-clear-ghproxy-storage-guard-v3"
+VERSION="4.0.1"
+BUILD_ID="2026-09-15-auto-latest-mihomo-fifo-logs-v1"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -64,8 +64,6 @@ BOOT_TOKEN_FILE="/tmp/goshacrash-boot-token"
 MIHOMO_LOG="$LOGS/mihomo.log"
 INSTALL_LOG="$LOGS/install.log"
 PACKAGES_LOG="$LOGS/packages.log"
-LOG_CLEAR_INTERVAL="${GOSHACRASH_LOG_CLEAR_INTERVAL:-10800}"
-LOG_CLEAR_LAST="$VOLATILE_STATE/log-clear-last"
 
 TUN_DEVICE="${GOSHACRASH_TUN_DEVICE:-tun0}"
 TUN_TABLE="${GOSHACRASH_TUN_TABLE:-2022}"
@@ -779,13 +777,13 @@ validate_binary_arch(){
     [ "$magic" = 7f454c46 ] || { fail "Mihomo повреждён: файл не является ELF (header=${hex:-empty})"; return 1; }
     case "$MIHOMO_TARGET" in
       armv5|armv7)
-        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку 4.0.0"; return 1; }
+        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку 4.0.1"; return 1; }
         ;;
       arm64|aarch64)
-        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку 4.0.0"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку 4.0.1"; return 1; }
         ;;
       amd64|amd64-compatible|x86_64)
-        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку 4.0.0"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку 4.0.1"; return 1; }
         ;;
     esac
     return 0
@@ -959,12 +957,12 @@ reserved_destinations(){
     cat <<'NETS'
 0.0.0.0/8
 10.0.0.0/8
-100.64.0.0/10
+100.64.0.1/10
 127.0.0.0/8
-169.254.0.0/16
+169.254.0.1/16
 172.16.0.0/12
 192.168.0.0/16
-224.0.0.0/4
+224.0.1.0/4
 240.0.0.0/4
 255.255.255.255/32
 NETS
@@ -1246,7 +1244,6 @@ migrate_legacy_usb_runtime(){
     fi
 
     rm -rf "$legacy_run" "$legacy_logs" "$BASE/state/route" 2>/dev/null || true
-    rm -f "$BASE/state/logs-last-3h.txt.gz" "$BASE/state/logs-last-3h.txt" 2>/dev/null || true
     rm -f "$BASE/state/wan-offline" "$BASE/state/wan-fail-count" "$BASE/state/wan-ok-count" "$BASE/state/internet.state" "$BASE/state/watchdog-heartbeat" "$BASE/state/autostart-hook-ran" 2>/dev/null || true
     log_event INFO storage "legacy USB runtime migrated to RAM; old logs/run removed"
     return 0
@@ -1668,12 +1665,10 @@ watchdog_loop(){
     # the controller reaches the watchdog, not one interval later.
     printf '%s pid=%s\n' "$(now)" "$$" > "$WATCHDOG_HEARTBEAT" 2>/dev/null || true
     watchdog_check
-    maybe_clear_ram_logs
     while :; do
         sleep "$WATCHDOG_INTERVAL"
         printf '%s pid=%s\n' "$(now)" "$$" > "$WATCHDOG_HEARTBEAT" 2>/dev/null || true
         watchdog_check
-        maybe_clear_ram_logs
     done
 }
 
@@ -2193,46 +2188,6 @@ usb_kernel_fs_errors(){
     [ -n "$dev" ] || return 1
     short="${dev##*/}"
     dmesg 2>/dev/null | grep -Eq "EXT[234]-fs error \(device $short\)|I/O error.*$short|Buffer I/O error.*$short"
-}
-
-uptime_seconds(){
-    awk '{print int($1)}' /proc/uptime 2>/dev/null
-}
-
-log_clear_mark_now(){
-    u="$(uptime_seconds)"
-    case "$u" in ''|*[!0-9]*) return 1;; esac
-    printf '%s\n' "$u" > "$LOG_CLEAR_LAST" 2>/dev/null || return 1
-    return 0
-}
-
-clear_ram_logs(){
-    ensure_dirs || return 1
-    for f in "$LOGS"/*.log; do
-        [ -f "$f" ] || continue
-        : > "$f" 2>/dev/null || true
-    done
-    rm -f "$LOGS"/*.log.1 "$LOGS"/*.log.2 "$LOGS"/*.log.3 2>/dev/null || true
-    log_clear_mark_now >/dev/null 2>&1 || true
-    return 0
-}
-
-maybe_clear_ram_logs(){
-    interval="$LOG_CLEAR_INTERVAL"
-    case "$interval" in ''|*[!0-9]*|0) interval=10800;; esac
-    u="$(uptime_seconds)"
-    case "$u" in ''|*[!0-9]*) return 0;; esac
-    last="$(cat "$LOG_CLEAR_LAST" 2>/dev/null)"
-    case "$last" in
-        ''|*[!0-9]*)
-            printf '%s\n' "$u" > "$LOG_CLEAR_LAST" 2>/dev/null || true
-            return 0
-            ;;
-    esac
-    elapsed=$((u - last))
-    [ "$elapsed" -ge "$interval" ] || return 0
-    clear_ram_logs >/dev/null 2>&1 || true
-    return 0
 }
 
 usb_metadata_probe_runtime(){
@@ -2755,7 +2710,7 @@ autostart_status(){
     [ -n "$bridge_version" ] && echo "  bridge version: $bridge_version" || echo "  bridge version: old/unknown"
     [ -f "$VOLATILE_STATE/autostart-hook-ran" ] && echo "  last hook: $(cat "$VOLATILE_STATE/autostart-hook-ran" 2>/dev/null)" || echo "  last hook: not seen this boot"
     [ -f "$LOGS/coldboot.log" ] && echo "  coldboot trace: $LOGS/coldboot.log (RAM)" || echo "  coldboot trace: not written yet"
-    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall 4.0.0)" || echo "  legacy JFFS dir: clean"
+    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall 4.0.1)" || echo "  legacy JFFS dir: clean"
     [ -f "$MANUAL_STOP" ] && echo "  manual-stop: YES" || echo "  manual-stop: no"
     return 0
 }
@@ -2941,8 +2896,7 @@ doctor(){
     else
         echo "  ASUS .minidlna cache: not present"
     fi
-    echo "  runtime logs: $LOGS (RAM, cleared every 3h)"
-    echo "  persistent logs on USB: disabled"
+    echo "  runtime logs: $LOGS (RAM, cleared on reboot)"
 
     if usb_metadata_probe_runtime; then
         echo "  USB metadata probe: OK"
@@ -2976,7 +2930,7 @@ doctor(){
 }
 usage(){
 cat <<'USAGE'
-GoshaCrash 4.0.0 — что буквально вводить в SSH
+GoshaCrash 4.0.1 — что буквально вводить в SSH
 
 КАТАЛОГ УСТАНОВКИ
   BASE="$(gc base)"
@@ -3049,9 +3003,6 @@ GoshaCrash 4.0.0 — что буквально вводить в SSH
 
 LIVE MIHOMO
   gc logs live mihomo 100
-
-ОЧИСТИТЬ RAM-ЛОГИ СЕЙЧАС
-  gc logs clear
 
 ЛОГ MIHOMO ВРУЧНУЮ
   BASE="$(gc base)"
@@ -3283,8 +3234,6 @@ case "$GC_COMMAND" in
         echo "USB: ${USB_DEVICE:-?} -> $USB_MOUNT (${USB_FS:-?})"
         df -h "$USB_MOUNT" 2>/dev/null || true
         if dlna_kb="$(minidlna_size_kb 2>/dev/null)"; then echo ".minidlna: ${dlna_kb}KB"; else echo ".minidlna: not present"; fi
-        echo "persistent logs on USB: disabled"
-        echo "RAM logs: $LOGS (cleared every 3h)"
         if usb_kernel_fs_errors; then echo "filesystem kernel log: ERRORS DETECTED - offline fsck required"; else echo "filesystem kernel log: no current errors"; fi
         ;;
     logs)
@@ -3293,14 +3242,6 @@ case "$GC_COMMAND" in
             live)
                 shift
                 follow_logs "${1:-mihomo}" "${2:-100}"
-                ;;
-            clear)
-                clear_ram_logs
-                echo "RAM logs cleared"
-                ;;
-            flush)
-                clear_ram_logs
-                echo "RAM logs cleared; persistent USB log snapshots are disabled"
                 ;;
             *) show_logs "${1:-mihomo}" "${2:-100}" ;;
         esac
