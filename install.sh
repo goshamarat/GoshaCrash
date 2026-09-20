@@ -3,8 +3,8 @@
 # One copied file installs the controller, a matching Mihomo core, Zashboard,
 # package tools through ASUS Download Master, configuration and autostart.
 
-INSTALLER_VERSION="4.0.1"
-EXPECTED_CONTROLLER_BUILD_ID="2026-09-15-auto-latest-mihomo-fifo-logs-v1"
+INSTALLER_VERSION="4.0.0"
+EXPECTED_CONTROLLER_BUILD_ID="2026-09-20-pcontrols-guard-v1"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -16,8 +16,8 @@ BRANCH="${BRANCH:-production}"
 
 LEGACY_MIHOMO_VERSION="${LEGACY_MIHOMO_VERSION:-v1.19.28}"
 LEGACY_MIHOMO_TAG="${LEGACY_MIHOMO_TAG:-mihomo-gvisor-armv5-$LEGACY_MIHOMO_VERSION}"
-OFFICIAL_MIHOMO_VERSION="${OFFICIAL_MIHOMO_VERSION:-}"
-OFFICIAL_MIHOMO_FALLBACK="${OFFICIAL_MIHOMO_FALLBACK:-}"
+OFFICIAL_MIHOMO_VERSION="${OFFICIAL_MIHOMO_VERSION:-v1.19.30}"
+OFFICIAL_MIHOMO_FALLBACK="${OFFICIAL_MIHOMO_FALLBACK:-$OFFICIAL_MIHOMO_VERSION}"
 ZASHBOARD_PRIMARY="${ZASHBOARD_URL:-https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip}"
 
 TMP_ROOT="/tmp/goshacrash-install.$$"
@@ -26,6 +26,7 @@ RUNTIME_LOGS="$RUNTIME_ROOT/logs"
 TMP_LOG="$RUNTIME_LOGS/install.log"
 INSTALL_LOG="$TMP_LOG"
 PACKAGES_LOG="$RUNTIME_LOGS/packages.log"
+LOG_MAX_BYTES="${GOSHACRASH_LOG_MAX_BYTES:-10485760}"
 USB_MOUNT=""
 USB_DEVICE=""
 USB_DISK=""
@@ -79,7 +80,30 @@ GCNET_BIN=""
 RESET_CONFIG="0"
 
 now(){ date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date; }
-_emit(){ level="$1"; shift; line="[$(now)] [$level] [install] $*"; printf '%s\n' "$line"; printf '%s\n' "$line" >> "$INSTALL_LOG" 2>/dev/null || true; }
+log_limit_bytes(){
+    limit="$LOG_MAX_BYTES"
+    case "$limit" in ''|*[!0-9]*|0) limit=10485760;; esac
+    printf '%s\n' "$limit"
+}
+cap_ram_log(){
+    file="$1"
+    test -f "$file" || return 0
+    limit="$(log_limit_bytes)"
+    size="$(wc -c < "$file" 2>/dev/null)"
+    case "$size" in ''|*[!0-9]*) return 0;; esac
+    test "$size" -lt "$limit" && return 0
+    : > "$file" 2>/dev/null || return 1
+    printf '[%s] [INFO] [log] RAM log cleared at %s-byte limit\n' "$(now)" "$limit" >> "$file" 2>/dev/null || true
+}
+cap_all_ram_logs(){
+    mkdir -p "$RUNTIME_LOGS" 2>/dev/null || return 0
+    rm -f "$RUNTIME_LOGS"/*.log.1 "$RUNTIME_LOGS"/*.log.2 "$RUNTIME_LOGS"/*.log.3 2>/dev/null || true
+    for file in "$RUNTIME_LOGS"/*.log; do
+        test -f "$file" || continue
+        cap_ram_log "$file" || true
+    done
+}
+_emit(){ level="$1"; shift; line="[$(now)] [$level] [install] $*"; cap_ram_log "$INSTALL_LOG"; printf '%s\n' "$line"; printf '%s\n' "$line" >> "$INSTALL_LOG" 2>/dev/null || true; cap_ram_log "$INSTALL_LOG"; }
 say(){ _emit INFO "$@"; }
 ok(){ _emit OK "$@"; }
 warn(){ _emit WARN "$@" >&2; }
@@ -374,6 +398,23 @@ usb_kernel_fs_errors_install(){
     test -n "$USB_DEVICE" || return 1
     short="${USB_DEVICE##*/}"
     dmesg 2>/dev/null | grep -Eq "EXT[234]-fs error \(device $short\)|I/O error.*$short|Buffer I/O error.*$short"
+}
+
+usb_noatime_install_ok(){
+    opts="$(awk -v d="$USB_DEVICE" -v m="$USB_MOUNT" '$1==d && $2==m {print $4; exit}' /proc/mounts 2>/dev/null)"
+    case ",$opts," in *,noatime,*) return 0;; esac
+    return 1
+}
+
+ensure_usb_noatime_install(){
+    usb_noatime_install_ok && return 0
+    for m in /bin/mount /sbin/mount /usr/bin/mount /usr/sbin/mount; do
+        test -x "$m" || continue
+        "$m" -o remount,noatime,nodiratime "$USB_DEVICE" "$USB_MOUNT" >/dev/null 2>&1 || \
+          "$m" -o remount,noatime,nodiratime "$USB_MOUNT" >/dev/null 2>&1 || continue
+        usb_noatime_install_ok && return 0
+    done
+    return 1
 }
 
 usb_storage_sanity_check(){
@@ -677,6 +718,9 @@ pkg_natural_update(){
         unset LD_LIBRARY_PATH
         "$PKG" update
     ) >> "$PACKAGES_LOG" 2>&1
+    rc=$?
+    cap_ram_log "$PACKAGES_LOG"
+    return "$rc"
 }
 
 pkg_natural_is_installed(){
@@ -699,6 +743,9 @@ pkg_natural_install(){
         unset LD_LIBRARY_PATH
         "$PKG" install "$name"
     ) >> "$PACKAGES_LOG" 2>&1
+    rc=$?
+    cap_ram_log "$PACKAGES_LOG"
+    return "$rc"
 }
 
 verify_dm_payload_natural(){
@@ -785,7 +832,9 @@ find_pkg(){
 
 pkg_log(){
     mkdir -p "$RUNTIME_LOGS" 2>/dev/null || true
+    cap_ram_log "$PACKAGES_LOG"
     printf '[%s] %s\n' "$(now)" "$*" >> "$PACKAGES_LOG" 2>/dev/null || true
+    cap_ram_log "$PACKAGES_LOG"
 }
 
 PKG_INDEX_REFRESHED=0
@@ -794,7 +843,8 @@ pkg_update_index_once(){
     test "$PKG_INDEX_REFRESHED" = "1" && return 0
     pkg_progress "обновляю индекс пакетов (один раз)"
     pkg_log "RUN: $PKG update"
-    run_pkg "$PKG" update >> "$PACKAGES_LOG" 2>&1 || return 1
+    run_pkg "$PKG" update >> "$PACKAGES_LOG" 2>&1 || { cap_ram_log "$PACKAGES_LOG"; return 1; }
+    cap_ram_log "$PACKAGES_LOG"
     PKG_INDEX_REFRESHED=1
     return 0
 }
@@ -1897,22 +1947,11 @@ json_asset_urls(){
         tr -d '\r'
 }
 
-latest_mihomo_version(){
-    # Latest is resolved only during installation. No background update daemon.
-    # Prefer a tiny GitHub API query; if unavailable allow manual override.
-    test -n "$OFFICIAL_MIHOMO_VERSION" && { printf '%s\n' "$OFFICIAL_MIHOMO_VERSION"; return 0; }
-    api="https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
-    tmp="$TMP_ROOT/mihomo-release.json"
-    if fetch "$api" "$tmp"; then
-        v="$(grep '"tag_name"' "$tmp" 2>/dev/null | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
-        test -n "$v" && { printf '%s\n' "$v"; return 0; }
-    fi
-    return 1
-}
-
 pinned_official_mihomo_url(){
-    MIHOMO_VERSION_SELECTED="$(latest_mihomo_version)" || { fail "Не удалось определить latest Mihomo"; return 1; }
-    printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$MIHOMO_VERSION_SELECTED/mihomo-linux-$MIHOMO_TARGET-$MIHOMO_VERSION_SELECTED.gz"
+    # 4.0.0 deliberately pins the modern core. A router install must not silently
+    # switch CPU binary just because GitHub "latest" changed between runs.
+    MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_VERSION"
+    printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$OFFICIAL_MIHOMO_VERSION/mihomo-linux-$MIHOMO_TARGET-$OFFICIAL_MIHOMO_VERSION.gz"
 }
 
 legacy_mihomo_urls(){
@@ -2255,16 +2294,24 @@ install_stock_usb_mount_bridge(){
     mkdir -p "$DM_ROOT/etc/init.d" "$DM_ROOT/lib/ipkg/info" || return 1
     cat > "$DM_ROOT/etc/init.d/S50usb-mount-script" <<'HOOK'
 #!/bin/sh
-# GoshaCrash Download Master bridge 4.0.1
+# GoshaCrash Download Master bridge 4.0.0
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 mount="$(df "$(readlink -f "$0")" | grep -v '^Filesystem' | head -n 1 | awk '{print $1, $6}')"
 device="$(echo "$mount" | awk '{print $1}')"
 mount="$(echo "$mount" | awk '{print $2}')"
+cap_trace(){
+  test -f /tmp/goshacrash-coldboot.log || return 0
+  s="$(wc -c < /tmp/goshacrash-coldboot.log 2>/dev/null)"
+  case "$s" in ''|*[!0-9]*) return 0;; esac
+  test "$s" -lt 10485760 || : > /tmp/goshacrash-coldboot.log 2>/dev/null || true
+}
 case "$1" in
   start)
+    cap_trace
     printf '[%s] [dm-bridge pid=%s] start device=%s mount=%s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$device" "$mount" >> /tmp/goshacrash-coldboot.log 2>/dev/null || true
+    cap_trace
     if test -x /jffs/scripts/usb-mount-script; then
       /jffs/scripts/usb-mount-script "$device" "$mount" &
     fi
@@ -2378,11 +2425,11 @@ NANO_WRAP
 install_hooks(){
     # Keep GoshaCrash-owned persistent data inside $BASE. Outside it we leave
     # only the standard ASUS hook/wrapper files that firmware actually calls.
-    mkdir -p /jffs/scripts /jffs/configs /jffs/etc "$DM_ROOT/bin" "$DM_ROOT/etc/init.d" || return 1
+    mkdir -p /jffs/scripts /jffs/configs /jffs/etc /jffs/goshacrash "$DM_ROOT/bin" "$DM_ROOT/etc/init.d" || return 1
 
     cat > /jffs/scripts/usb-mount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB hook 4.0.1
+# GoshaCrash USB hook 4.0.0
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2393,30 +2440,38 @@ TRACE="$RUNTIME_ROOT/logs/coldboot.log"
 TMP_TRACE=/tmp/goshacrash-coldboot.log
 WAITED=0
 
+cap_trace(){
+  test -f "$TRACE" || return 0
+  s="$(wc -c < "$TRACE" 2>/dev/null)"
+  case "$s" in ''|*[!0-9]*) return 0;; esac
+  test "$s" -lt 10485760 || : > "$TRACE" 2>/dev/null || true
+}
 trace(){
+  cap_trace
   printf '[%s] [usb-mount pid=%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$*" >> "$TRACE" 2>/dev/null || true
+  cap_trace
 }
 
 test -x "$BASE/goshacrash.sh" || exit 0
 printf '%s\n' "$BASE" > /tmp/goshacrash-base 2>/dev/null || true
 
-mkdir -p "$BASE/state" "$RUNTIME_ROOT/logs" "$RUNTIME_ROOT/run" "$RUNTIME_ROOT/state" 2>/dev/null || true
+mkdir -p "$RUNTIME_ROOT/logs" "$RUNTIME_ROOT/run" "$RUNTIME_ROOT/state" 2>/dev/null || true
 if test -s "$TMP_TRACE"; then
   cat "$TMP_TRACE" >> "$TRACE" 2>/dev/null || true
   : > "$TMP_TRACE" 2>/dev/null || true
 fi
 
-# Keep the current-boot RAM trace bounded.
-if test -f "$TRACE"; then
-  TRACE_SIZE="$(wc -c < "$TRACE" 2>/dev/null)"
-  case "$TRACE_SIZE" in ''|*[!0-9]*) TRACE_SIZE=0;; esac
-  if test "$TRACE_SIZE" -gt 131072; then
-    tail -n 200 "$TRACE" > "$TRACE.tmp.$$" 2>/dev/null && mv -f "$TRACE.tmp.$$" "$TRACE" 2>/dev/null || true
-    rm -f "$TRACE.tmp.$$" 2>/dev/null || true
-  fi
-fi
-
 trace "entered device=$1 mount=$MOUNT_POINT"
+
+NOATIME_OK=0
+for m in /bin/mount /sbin/mount /usr/bin/mount /usr/sbin/mount; do
+  test -x "$m" || continue
+  if "$m" -o remount,noatime,nodiratime "$1" "$MOUNT_POINT" >/dev/null 2>&1 || "$m" -o remount,noatime,nodiratime "$MOUNT_POINT" >/dev/null 2>&1; then
+    NOATIME_OK=1
+  fi
+  break
+done
+if test "$NOATIME_OK" = 1; then trace "USB remounted noatime,nodiratime"; else trace "WARN: noatime remount failed"; fi
 
 DM=""
 for d in "$MOUNT_POINT/asusware.arm" "$MOUNT_POINT/asusware.arm64" "$MOUNT_POINT/asusware"; do
@@ -2432,7 +2487,6 @@ if test -n "$DM" && test -d "$DM"; then
   elif test ! -e /tmp/opt; then
     ln -s "$DM" /tmp/opt 2>/dev/null || true
   fi
-  touch "$DM/.asusrouter" 2>/dev/null || true
 fi
 
 while test ! -x "$BASE/goshacrash.sh"; do
@@ -2448,16 +2502,22 @@ BOOT_ID="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)"
 UPTIME="$(cat /proc/uptime 2>/dev/null)"
 trace "controller ready after ${WAITED}s dm=${DM:-none} boot_id=${BOOT_ID:-unknown} uptime=${UPTIME:-unknown}"
 date '+%Y-%m-%d %H:%M:%S' > "$RUNTIME_ROOT/state/autostart-hook-ran" 2>/dev/null || true
-printf '[%s] autostart hook 4.0.1: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$RUNTIME_ROOT/logs/boot.log" 2>/dev/null || true
+BOOT_LOG="$RUNTIME_ROOT/logs/boot.log"
+if test -f "$BOOT_LOG"; then
+  BOOT_SIZE="$(wc -c < "$BOOT_LOG" 2>/dev/null)"
+  case "$BOOT_SIZE" in ''|*[!0-9]*) BOOT_SIZE=0;; esac
+  test "$BOOT_SIZE" -lt 10485760 || : > "$BOOT_LOG" 2>/dev/null || true
+fi
+printf '[%s] autostart hook 4.0.0: USB/controller ready; launching boot\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" >> "$BOOT_LOG" 2>/dev/null || true
 
 NOHUP=""
 for p in /usr/bin/nohup /bin/nohup /usr/sbin/nohup /sbin/nohup; do
   test -x "$p" && { NOHUP="$p"; break; }
 done
 if test -n "$NOHUP"; then
-  GOSHACRASH_BASE="$BASE" "$NOHUP" /bin/sh "$BASE/goshacrash.sh" boot </dev/null >> "$RUNTIME_ROOT/logs/boot.log" 2>&1 &
+  GOSHACRASH_BASE="$BASE" "$NOHUP" /bin/sh "$BASE/goshacrash.sh" boot </dev/null >> "$BOOT_LOG" 2>&1 &
 else
-  GOSHACRASH_BASE="$BASE" /bin/sh "$BASE/goshacrash.sh" boot </dev/null >> "$RUNTIME_ROOT/logs/boot.log" 2>&1 &
+  GOSHACRASH_BASE="$BASE" /bin/sh "$BASE/goshacrash.sh" boot </dev/null >> "$BOOT_LOG" 2>&1 &
 fi
 trace "boot worker launched pid=$!"
 exit 0
@@ -2466,7 +2526,7 @@ HOOK
 
     cat > /jffs/scripts/usb-umount-script <<'HOOK'
 #!/bin/sh
-# GoshaCrash USB unmount hook 4.0.1
+# GoshaCrash USB unmount hook 4.0.0
 unset LD_LIBRARY_PATH 2>/dev/null || true
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
@@ -2475,6 +2535,11 @@ BASE="$MOUNT_POINT/goshacrash"
 TRACE=/tmp/goshacrash-coldboot.log
 RC=0
 trace(){
+  if test -f "$TRACE"; then
+    s="$(wc -c < "$TRACE" 2>/dev/null)"
+    case "$s" in ''|*[!0-9]*) s=0;; esac
+    test "$s" -lt 10485760 || : > "$TRACE" 2>/dev/null || true
+  fi
   printf '[%s] [usb-umount pid=%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$$" "$*" >> "$TRACE" 2>/dev/null || true
 }
 
@@ -2509,6 +2574,12 @@ if test -f /tmp/goshacrash-opt-bind.state; then
   esac
 fi
 
+for s in /bin/sync /sbin/sync /usr/bin/sync /usr/sbin/sync; do
+  test -x "$s" || continue
+  "$s" >/dev/null 2>&1 || true
+  trace "sync completed before USB unmount"
+  break
+done
 rm -f /tmp/goshacrash-base 2>/dev/null || true
 exit "$RC"
 HOOK
@@ -2523,7 +2594,7 @@ HOOK
     test -d /opt/bin && test -w /opt/bin && write_command_wrapper /opt/bin/gc 2>/dev/null || true
 
     # Old rc23-rc26 used a custom /jffs/addons/goshacrash directory only to
-    # store base/start/trace. 4.0.1 no longer needs it; remove our own residue.
+    # store base/start/trace. 4.0.0 no longer needs it; remove our own residue.
     rm -rf /jffs/addons/goshacrash 2>/dev/null || true
     grep -Fq 'exec /bin/busybox test "$@"' /jffs/scripts/test 2>/dev/null && rm -f /jffs/scripts/test 2>/dev/null || true
     grep -Fq "exec /bin/busybox '['" /jffs/scripts/'[' 2>/dev/null && rm -f /jffs/scripts/'[' 2>/dev/null || true
@@ -2540,7 +2611,7 @@ HOOK
 
     remove_pre3712_autostart
     install_stock_usb_mount_bridge || return 1
-    ok "Автозапуск установлен; logs/run/heartbeat находятся в /tmp (RAM), USB не используется для runtime-логов"
+    ok "Автозапуск установлен; runtime logs/run/heartbeat находятся в /tmp (RAM), каждый RAM-лог ограничен 10 MiB и на USB не сохраняется"
 }
 
 verify_shell_compat(){
@@ -2612,6 +2683,15 @@ save_install_log(){
 
 
 
+cleanup_legacy_usb_runtime_files(){
+    # Explicit install/update is allowed to modify persistent files. Runtime is not.
+    rm -rf "$BASE/logs" "$BASE/run" "$BASE/state/route" 2>/dev/null || true
+    rm -f "$BASE/state/logs-last-3h.txt.gz" "$BASE/state/logs-last-3h.txt" 2>/dev/null || true
+    rm -f "$BASE/state/wan-offline" "$BASE/state/wan-fail-count" "$BASE/state/wan-ok-count" "$BASE/state/internet.state" "$BASE/state/watchdog-heartbeat" "$BASE/state/autostart-hook-ran" 2>/dev/null || true
+    rmdir "$BASE/backups" 2>/dev/null || true
+}
+
+
 normalize_legacy_optware_unzip() {
     # Old ASUS Download Master / Optware packages may install Info-ZIP as
     # /opt/bin/unzip-unzip and rely on an alternatives symlink that is absent
@@ -2629,6 +2709,7 @@ normalize_legacy_optware_unzip() {
 
 main(){
     mkdir -p "$RUNTIME_LOGS" 2>/dev/null || true
+    cap_all_ram_logs
     : > "$TMP_LOG"
 
     case "${1:-}" in
@@ -2668,11 +2749,8 @@ main(){
     legacy_preflight_before_dm || return 1
     find_download_master || return 1
     BASE="$USB_MOUNT/goshacrash"
-    mkdir -p "$TMP_ROOT" "$BASE/bin" "$BASE/state" "$RUNTIME_LOGS" "$RUNTIME_ROOT/run" "$RUNTIME_ROOT/state" || return 1
-    # Do not remove legacy USB run/log directories here: an older controller may
-    # still be using their PID files during an in-place update. The new controller
-    # migrates/stops that legacy runtime atomically on its first start/restart.
-    rmdir "$BASE/rulesets" "$BASE/proxies" "$BASE/backups" 2>/dev/null || true
+    # Before filesystem/space guards pass, only RAM may be modified.
+    mkdir -p "$TMP_ROOT" "$RUNTIME_LOGS" "$RUNTIME_ROOT/run" "$RUNTIME_ROOT/state" || return 1
 
     USED_PCT="$(df -P "$USB_MOUNT" 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}')"
     FREE_KB="$(df -Pk "$USB_MOUNT" 2>/dev/null | awk 'NR==2 {print $4}')"
@@ -2693,6 +2771,18 @@ main(){
         fail "Нужен offline e2fsck на размонтированном разделе; если повторный чистый проход снова находит ошибки — переформатируй или замени флешку"
         return 1
     fi
+    if ensure_usb_noatime_install; then
+        say "USB mount: noatime включён (меньше metadata writes при чтении)"
+    else
+        warn "Не удалось включить noatime; прошивка может обновлять atime при чтении USB"
+    fi
+
+    # Persistent writes begin only here, after the USB health guards passed.
+    mkdir -p "$BASE/bin" "$BASE/state" || return 1
+    # Old persistent runtime leftovers are cleaned only during this explicit update,
+    # never by background boot/watchdog runtime.
+    rmdir "$BASE/rulesets" "$BASE/proxies" "$BASE/backups" 2>/dev/null || true
+    rm -f "$BASE/state/logs-last-3h.txt.gz" "$BASE/state/logs-last-3h.txt" 2>/dev/null || true
 
     say "GoshaCrash installer $INSTALLER_VERSION"
     say "USB device: $USB_DEVICE"
@@ -2751,6 +2841,8 @@ main(){
         fail "Первый запуск не удался. Проверь /tmp/goshacrash/logs/mihomo.log и команду gc logs"
         return 1
     }
+    cleanup_legacy_usb_runtime_files
+    cap_all_ram_logs
 
     save_install_log
     ok "Установка завершена"

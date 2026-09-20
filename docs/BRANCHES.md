@@ -6,7 +6,7 @@
 - `production` — чистый рабочий snapshot для реальных роутеров;
 - tags — зафиксированные релизные точки.
 
-Текущая рабочая версия: **GoshaCrash 4.0.1 production**.
+Текущая рабочая версия: **GoshaCrash 4.0.0 production**.
 
 В `install.sh` и `goshacrash.sh` production-ветка используется по умолчанию:
 
@@ -55,7 +55,7 @@ git log --oneline --decorate
 В production должен быть один root commit текущей рабочей сборки, например:
 
 ```text
-GoshaCrash 4.0.1 production
+GoshaCrash 4.0.0 production
 ```
 
 ## Явный тест main через installer

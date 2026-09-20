@@ -1,16 +1,29 @@
 # Changelog
 
-## 4.0.1 production
+## 4.0.0 production
+
+### ASUS PControls / parental control
+
+- Added a stock-ASUSWRT `PControls` guard. GoshaCrash does not create, edit or own the `PControls` chain; ASUS remains the source of truth.
+- When ASUS creates one or more `FORWARD ... -j PControls` rules, GoshaCrash keeps its own/Mihomo `FORWARD` hooks after the last stock PControls rule.
+- For native Mihomo `auto-redirect`, clients attached by ASUS to PControls are returned from `mihomo-prerouting` before TCP/DNS redirect. Their traffic therefore reaches the normal routing/`FORWARD` path where ASUS can block it before TUN/proxy.
+- The watchdog detects PControls appearing, disappearing or changing after boot. Membership changes trigger one clean Mihomo restart so already redirected long-lived sessions (for example Telegram) cannot stay alive behind an old conntrack redirect.
+- `gc pcontrols` shows the current guard state. `gc doctor` reports PControls presence, FORWARD priority and native auto-redirect bypass status.
+- If PControls does not exist yet, the guard is a no-op and waits for ASUS to create it later.
 
 ### USB / filesystem
 
-- Runtime logs moved from USB to `/tmp/goshacrash/logs` (RAM).
+- Runtime logs live only in `/tmp/goshacrash/logs` (RAM). Each `.log` has an independent 10 MiB cap; when that file reaches the cap it is truncated in RAM. There is no time-based flush and no USB log snapshot. A low-RAM guard clears RAM logs if available memory falls below 32 MiB.
 - PID/lock files moved to `/tmp/goshacrash/run`.
 - Watchdog heartbeat, WAN counters and routing runtime state moved to RAM; the 10-second heartbeat no longer writes to USB.
-- Old GoshaCrash-owned `logs/` and `run/` directories are removed from USB during update.
+- Background runtime no longer touches USB marker/probe files or creates Optware directories/copies payloads on boot; it only verifies the prepared layout and may bind it into `/opt` in the mount namespace.
+- USB mount is best-effort remounted with `noatime,nodiratime` to suppress read-driven access-time metadata writes.
+- USB unmount hook performs a final `sync` after stopping runtime and releasing `/opt`.
+- Persistent `manual-stop` moved off USB to `/jffs/goshacrash/manual-stop`; passive edit backups moved to `/tmp/goshacrash/backups`.
+- Old GoshaCrash-owned `logs/`, `run/` and previous snapshot files are removed only during an explicit install/update, never by background runtime.
 - Runtime refuses to start when USB is >=95% full or has less than 32 MiB free.
 - `gc storage` and `gc doctor` expose USB usage, `.minidlna` size and kernel filesystem errors.
-- Installer refuses further writes when current kernel log already contains EXT filesystem/I/O errors for the selected USB.
+- Installer refuses further writes when current kernel log already contains EXT filesystem/I/O errors for the selected USB. Runtime log maintenance no longer writes logs to USB at all.
 
 ### Downloads
 
@@ -19,7 +32,7 @@
 - Mihomo, Zashboard and project GitHub release assets use the same fallback logic.
 - Direct download attempts now fail over on connection/stall instead of waiting indefinitely.
 
-Первая чистая production-сборка **GoshaCrash 4.0.1**.
+Первая чистая production-сборка **GoshaCrash 4.0.0**.
 
 - Ветка `production` используется как рабочий канал для реальных роутеров.
 - Ветка `main` остаётся для разработки, тестов и полной истории изменений.

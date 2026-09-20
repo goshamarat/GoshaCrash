@@ -3,8 +3,8 @@
 # One management script: Mihomo lifecycle, routing, config, logs and packages.
 # Zashboard updates are triggered from the native button inside Zashboard.
 
-VERSION="4.0.1"
-BUILD_ID="2026-09-15-auto-latest-mihomo-fifo-logs-v1"
+VERSION="4.0.0"
+BUILD_ID="2026-09-20-pcontrols-guard-v1"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -49,6 +49,7 @@ LOGS="$RUNTIME_ROOT/logs"
 VOLATILE_STATE="$RUNTIME_ROOT/state"
 STATE="$BASE/state"
 PLATFORM_FILE="$STATE/platform.env"
+PERSIST_ROOT="${GOSHACRASH_PERSIST_ROOT:-/jffs/goshacrash}"
 PIDFILE="$RUN/mihomo.pid"
 WATCHDOG_PIDFILE="$RUN/watchdog.pid"
 WATCHDOG_LOG="$LOGS/watchdog.log"
@@ -58,12 +59,15 @@ BOOT_PIDFILE="$RUN/boot.pid"
 BOOT_LOCK="$RUN/boot.lock"
 START_LOCK="$RUN/start.lock"
 CONTROL_LOCK="$RUN/control.lock"
-MANUAL_STOP="$STATE/manual-stop"
+MANUAL_STOP="$PERSIST_ROOT/manual-stop"
 BOOT_TOKEN_FILE="/tmp/goshacrash-boot-token"
 
 MIHOMO_LOG="$LOGS/mihomo.log"
 INSTALL_LOG="$LOGS/install.log"
 PACKAGES_LOG="$LOGS/packages.log"
+RAM_BACKUPS="$RUNTIME_ROOT/backups"
+LOG_MAX_BYTES="${GOSHACRASH_LOG_MAX_BYTES:-10485760}"
+LOG_MIN_FREE_KB="${GOSHACRASH_LOG_MIN_FREE_KB:-32768}"
 
 TUN_DEVICE="${GOSHACRASH_TUN_DEVICE:-tun0}"
 TUN_TABLE="${GOSHACRASH_TUN_TABLE:-2022}"
@@ -93,6 +97,14 @@ FORWARD_CHAIN="GOSHACRASH_TUN_FORWARD"
 DNS_LAN_CHAIN="GOSHACRASH_DNS_LAN"
 DNS_OUT_CHAIN="GOSHACRASH_DNS_OUT"
 
+# ASUS parental-control compatibility.  ASUS owns the PControls chain and its
+# contents.  GoshaCrash never creates or edits PControls itself: it only keeps
+# its own forwarding hooks behind the stock PControls jump and bypasses
+# Mihomo's early NAT redirect for clients that ASUS has attached to PControls.
+# State is volatile on purpose; it lives in /tmp and disappears on reboot.
+PCONTROLS_STATE="$VOLATILE_STATE/pcontrols"
+PCONTROLS_CLIENTS="$PCONTROLS_STATE/clients"
+
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-production}"
 
@@ -118,28 +130,46 @@ IPTABLES=""
 IPT_WAIT=""
 NET_BACKEND=""
 
-ensure_dirs(){ mkdir -p "$BASE/bin" "$UI" "$RUNTIME_ROOT" "$RUN" "$LOGS" "$VOLATILE_STATE" "$STATE" "$ROUTE_STATE"; }
+ensure_dirs(){
+    mkdir -p "$RUNTIME_ROOT" "$RUN" "$LOGS" "$VOLATILE_STATE" "$ROUTE_STATE" "$RAM_BACKUPS" 2>/dev/null || return 1
+    [ -d "$BASE/bin" ] && [ -d "$UI" ] && [ -d "$STATE" ]
+}
 now(){ date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date; }
 
-rotate_log(){
-    file="$1"; limit="${2:-1048576}"
+log_limit_bytes(){
+    limit="$LOG_MAX_BYTES"
+    case "$limit" in ''|*[!0-9]*|0) limit=10485760;; esac
+    printf '%s\n' "$limit"
+}
+
+cap_ram_log(){
+    file="$1"
     [ -f "$file" ] || return 0
+    limit="$(log_limit_bytes)"
     size="$(wc -c < "$file" 2>/dev/null)"
     case "$size" in ''|*[!0-9]*) return 0;; esac
     [ "$size" -lt "$limit" ] && return 0
-    rm -f "$file.3" 2>/dev/null || true
-    [ -f "$file.2" ] && mv -f "$file.2" "$file.3" 2>/dev/null || true
-    [ -f "$file.1" ] && mv -f "$file.1" "$file.2" 2>/dev/null || true
-    mv -f "$file" "$file.1" 2>/dev/null || true
-    : > "$file"
+    : > "$file" 2>/dev/null || return 1
+    printf '[%s] [INFO] [log] RAM log cleared at %s-byte limit\n' "$(now)" "$limit" >> "$file" 2>/dev/null || true
+    return 0
+}
+
+cap_all_ram_logs(){
+    mkdir -p "$LOGS" 2>/dev/null || return 0
+    rm -f "$LOGS"/*.log.1 "$LOGS"/*.log.2 "$LOGS"/*.log.3 2>/dev/null || true
+    for file in "$LOGS"/*.log; do
+        [ -f "$file" ] || continue
+        cap_ram_log "$file" || true
+    done
 }
 
 log_event(){
     level="$1"; component="$2"; shift 2
     mkdir -p "$LOGS" 2>/dev/null || true
     logfile="$LOGS/goshacrash.log"
-    rotate_log "$logfile" 1048576
+    cap_ram_log "$logfile"
     printf '[%s] [%s] [%s] %s\n' "$(now)" "$level" "$component" "$*" >> "$logfile" 2>/dev/null || true
+    cap_ram_log "$logfile"
 }
 
 say(){ printf '%s\n' "[GoshaCrash] $*"; log_event INFO main "$*"; }
@@ -291,7 +321,6 @@ find_pkg(){
 ensure_optware_link(){
     find_dm_root || return 1
     [ -d "$DM_ROOT" ] || return 1
-    touch "$DM_ROOT/.asusrouter" 2>/dev/null || true
     if [ -L /tmp/opt ]; then
       target="$(readlink /tmp/opt 2>/dev/null)"
       [ "$target" = "$DM_ROOT" ] || ln -snf "$DM_ROOT" /tmp/opt 2>/dev/null || return 1
@@ -322,19 +351,13 @@ find_system_umount_runtime(){
     return 1
 }
 
-opt_namespace_write_through_runtime(){
-    [ -n "$DM_ROOT" ] && [ -d "$DM_ROOT" ] || return 1
-    probe=".goshacrash-opt-probe.$$"
-    rm -f "/opt/$probe" "$DM_ROOT/$probe" 2>/dev/null || true
-
-    if ( : > "/opt/$probe" ) 2>/dev/null; then
-        if [ -e "$DM_ROOT/$probe" ]; then
-            rm -f "/opt/$probe" "$DM_ROOT/$probe" 2>/dev/null || true
-            return 0
-        fi
-        rm -f "/opt/$probe" 2>/dev/null || true
-    fi
-    return 1
+opt_namespace_ready_runtime(){
+    refresh_storage_identity >/dev/null 2>&1 || true
+    [ -n "$USB_DEVICE" ] || return 1
+    optdev="$(df -P /opt 2>/dev/null | awk 'NR==2 {print $1}')"
+    [ "$optdev" = "$USB_DEVICE" ] || return 1
+    [ -x /opt/bin/ipkg ] || [ -x /opt/bin/opkg ] || return 1
+    return 0
 }
 
 usb_storage_sanity_runtime(){
@@ -348,95 +371,54 @@ usb_storage_sanity_runtime(){
     return 0
 }
 
-preserve_stock_opt_payload_runtime(){
-    for entry in /opt/*; do
-        [ -e "$entry" ] || continue
-        [ -L "$entry" ] && continue
-        name="${entry##*/}"
-        target="$DM_ROOT/$name"
-        if [ -d "$target" ]; then
-            ls -la "$target" >/dev/null 2>> "$PACKAGES_LOG" || {
-                log_event ERROR opt "USB/Optware target unreadable: $target; offline fsck required"
-                return 1
-            }
-        fi
-        printf '[%s] OPT PRESERVE(runtime): %s -> %s\n' "$(now)" "$entry" "$target" >> "$PACKAGES_LOG" 2>/dev/null || true
-        if [ -d "$entry" ]; then
-            mkdir -p "$target" >> "$PACKAGES_LOG" 2>&1 || return 1
-            cp -R "$entry/." "$target/" >> "$PACKAGES_LOG" 2>&1 || return 1
-        elif [ -f "$entry" ]; then
-            cp -f "$entry" "$target" >> "$PACKAGES_LOG" 2>&1 || return 1
-        fi
-    done
-    return 0
-}
-
 prepare_optware_topdirs_runtime(){
     [ -n "$DM_ROOT" ] && [ -d "$DM_ROOT" ] || return 1
-    mkdir -p \
-        "$DM_ROOT/libexec" \
-        "$DM_ROOT/man/man1" \
-        "$DM_ROOT/var" 2>/dev/null || return 1
-    return 0
+    # Installer creates these persistent directories. Runtime only verifies them:
+    # boot/start must not mutate USB metadata.
+    [ -d "$DM_ROOT/libexec" ] && [ -d "$DM_ROOT/man/man1" ] && [ -d "$DM_ROOT/var" ]
 }
 
 prepare_optware_namespace_runtime(){
     ensure_optware_link || return 1
     usb_storage_sanity_runtime || return 1
+    prepare_optware_topdirs_runtime || {
+        log_event ERROR opt "Optware persistent layout incomplete; rerun install.sh instead of repairing USB at runtime"
+        return 1
+    }
 
-    if opt_namespace_write_through_runtime; then
-        prepare_optware_topdirs_runtime || return 1
+    if opt_namespace_ready_runtime; then
         if awk '$2=="/opt" {found=1} END {exit !found}' /proc/mounts 2>/dev/null; then
             printf '%s\n' "$DM_ROOT" > "$OPT_NAMESPACE_STATE" 2>/dev/null || true
         fi
         return 0
     fi
 
-    mount_bin="$(find_system_mount_runtime 2>/dev/null)"
-    [ -n "$mount_bin" ] || return 1
-
+    # Binding an already-prepared USB tree changes only the mount namespace.
+    # No probe files, touch, mkdir or payload copies are allowed during runtime.
     if awk '$2=="/opt" {found=1} END {exit !found}' /proc/mounts 2>/dev/null; then
+        log_event ERROR opt "/opt is mounted from another source; refusing runtime USB mutation"
         return 1
     fi
 
-    preserve_stock_opt_payload_runtime || return 1
-    touch "$DM_ROOT/.goshacrash-opt-root" 2>/dev/null || true
-
+    mount_bin="$(find_system_mount_runtime 2>/dev/null)"
+    [ -n "$mount_bin" ] || return 1
     "$mount_bin" -o bind "$DM_ROOT" /opt >> "$PACKAGES_LOG" 2>&1 || \
       "$mount_bin" --bind "$DM_ROOT" /opt >> "$PACKAGES_LOG" 2>&1 || return 1
 
-    opt_namespace_write_through_runtime || {
+    if ! opt_namespace_ready_runtime; then
         umount_bin="$(find_system_umount_runtime 2>/dev/null)"
         [ -n "$umount_bin" ] && "$umount_bin" /opt >/dev/null 2>&1 || true
         return 1
-    }
+    fi
 
-    prepare_optware_topdirs_runtime || return 1
     printf '%s\n' "$DM_ROOT" > "$OPT_NAMESPACE_STATE" 2>/dev/null || true
-    log_event INFO opt "writable /opt bound to $DM_ROOT; libexec/man/var ready"
+    log_event INFO opt "read-only runtime setup: /opt bound to prepared $DM_ROOT"
     return 0
 }
 optware_runtime_ready(){
     ensure_optware_link >/dev/null 2>&1 || true
     [ -x /tmp/opt/bin/ipkg ] || [ -x /tmp/opt/bin/opkg ] || [ -x /opt/bin/ipkg ] || [ -x /opt/bin/opkg ] || [ -x "$DM_ROOT/bin/ipkg" ] || [ -x "$DM_ROOT/bin/opkg" ]
 }
-runtime_copy_alias(){
-    src="$1"
-    dst="$2"
-    test -f "$src" || return 1
-    test -f "$dst" && return 0
-    cp -f "$src" "$dst" 2>/dev/null || return 1
-    chmod 755 "$dst" 2>/dev/null || true
-}
-
-runtime_first_versioned(){
-    pattern="$1"
-    for f in $pattern; do
-        test -f "$f" && { printf '%s\n' "$f"; return 0; }
-    done
-    return 1
-}
-
 OPTWARE_OVERLAY="/tmp/goshacrash-opt"
 OPTWARE_OVERLAY_LIB="$OPTWARE_OVERLAY/lib"
 
@@ -481,28 +463,6 @@ optware_env_runtime(){
     printf '%s\n' "$OPTWARE_OVERLAY_LIB:$DM_ROOT/lib:/lib:/usr/lib"
 }
 
-repair_generic_sonames_runtime(){
-    test -n "$DM_ROOT" && test -d "$DM_ROOT/lib" || return 1
-
-    for src in "$DM_ROOT"/lib/lib*.so.[0-9]*.[0-9]*; do
-        test -f "$src" || continue
-
-        base="${src##*/}"
-        prefix="${base%%.so.*}"
-        ver="${base#*.so.}"
-        major="${ver%%.*}"
-
-        case "$major" in
-            ''|*[!0-9]*) continue ;;
-        esac
-
-        dst="$DM_ROOT/lib/$prefix.so.$major"
-        test -f "$dst" && continue
-        runtime_copy_alias "$src" "$dst" || return 1
-    done
-    return 0
-}
-
 repair_optware_abi_runtime(){
     build_optware_overlay_runtime
 }
@@ -530,7 +490,7 @@ repair_opt(){
     fi
 
     prepare_optware_namespace_runtime || {
-        log_event ERROR opt "cannot prepare writable /opt namespace for $DM_ROOT"
+        log_event ERROR opt "cannot prepare Optware /opt namespace for $DM_ROOT"
         return 1
     }
     repair_optware_abi_runtime >/dev/null 2>&1 || true
@@ -541,10 +501,11 @@ repair_opt(){
 pkg_update_index(){
     repair_opt >/dev/null 2>&1 || return 1
     find_pkg || return 1
-    rotate_log "$PACKAGES_LOG" 1048576
+    cap_ram_log "$PACKAGES_LOG"
     say "Обновляю только индекс пакетов через $PKG"
     printf '[%s] RUN: %s update\n' "$(now)" "$PKG" >> "$PACKAGES_LOG"
     "$PKG" update >> "$PACKAGES_LOG" 2>&1 || { fail "Не удалось обновить индекс пакетов. См. $PACKAGES_LOG"; return 1; }
+    cap_ram_log "$PACKAGES_LOG"
     ok "Индекс пакетов обновлён; установленные пакеты не обновлялись"
 }
 
@@ -558,7 +519,7 @@ pkg_reinstall_runtime(){
     name="$1"
     repair_opt >/dev/null 2>&1 || return 1
     find_pkg || return 1
-    rotate_log "$PACKAGES_LOG" 1048576
+    cap_ram_log "$PACKAGES_LOG"
     printf '[%s] RUN: %s remove %s\n' "$(now)" "$PKG" "$name" >> "$PACKAGES_LOG"
     "$PKG" remove "$name" >> "$PACKAGES_LOG" 2>&1 || true
     printf '[%s] RUN: %s update\n' "$(now)" "$PKG" >> "$PACKAGES_LOG"
@@ -575,7 +536,7 @@ pkg_install(){
     case "$name" in ''|*[!A-Za-z0-9+_.-]*) fail "Недопустимое имя пакета: $name"; return 1;; esac
     repair_opt >/dev/null 2>&1 || return 1
     find_pkg || return 1
-    rotate_log "$PACKAGES_LOG" 1048576
+    cap_ram_log "$PACKAGES_LOG"
     say "Устанавливаю пакет $name через $PKG"
     printf '[%s] RUN: %s install %s\n' "$(now)" "$PKG" "$name" >> "$PACKAGES_LOG"
     if ! "$PKG" install "$name" >> "$PACKAGES_LOG" 2>&1; then
@@ -584,6 +545,7 @@ pkg_install(){
         "$PKG" install "$name" >> "$PACKAGES_LOG" 2>&1 || { fail "Пакет $name не установлен. См. $PACKAGES_LOG"; return 1; }
     fi
     refresh_path
+    cap_ram_log "$PACKAGES_LOG"
     ok "Пакет установлен: $name"
 }
 
@@ -777,13 +739,13 @@ validate_binary_arch(){
     [ "$magic" = 7f454c46 ] || { fail "Mihomo повреждён: файл не является ELF (header=${hex:-empty})"; return 1; }
     case "$MIHOMO_TARGET" in
       armv5|armv7)
-        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку 4.0.1"; return 1; }
+        [ "$class" = 01 ] && [ "$machine" = 2800 ] || { fail "Mihomo не той архитектуры: нужен 32-bit ARM ($MIHOMO_TARGET), ELF class=$class machine=$machine. Повтори установку 4.0.0"; return 1; }
         ;;
       arm64|aarch64)
-        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку 4.0.1"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = b700 ] || { fail "Mihomo не той архитектуры: нужен ARM64, ELF class=$class machine=$machine. Повтори установку 4.0.0"; return 1; }
         ;;
       amd64|amd64-compatible|x86_64)
-        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку 4.0.1"; return 1; }
+        [ "$class" = 02 ] && [ "$machine" = 3e00 ] || { fail "Mihomo не той архитектуры: нужен x86_64, ELF class=$class machine=$machine. Повтори установку 4.0.0"; return 1; }
         ;;
     esac
     return 0
@@ -953,16 +915,229 @@ ipt(){ if [ -n "$IPT_WAIT" ]; then "$IPTABLES" -w "$@"; else "$IPTABLES" "$@"; f
 remove_jump(){ table="$1"; chain="$2"; shift 2; while ipt -t "$table" -D "$chain" "$@" 2>/dev/null; do :; done; }
 delete_chain(){ table="$1"; chain="$2"; ipt -t "$table" -F "$chain" 2>/dev/null || true; ipt -t "$table" -X "$chain" 2>/dev/null || true; }
 
+# Collect only the selectors ASUS itself uses to enter PControls from FORWARD.
+# Current stock ASUSWRT uses: -i <LAN> -m mac --mac-source <MAC> -j PControls.
+# If a future firmware omits the MAC selector, '*' deliberately means the whole
+# matching input interface.  This is safer than allowing Mihomo to bypass a
+# stock parental-control rule that we do not fully understand.
+pcontrols_collect_clients(){
+    out="$1"
+    : > "$out" || return 1
+    ipt -t filter -S PControls >/dev/null 2>&1 || return 0
+    ipt -t filter -S FORWARD 2>/dev/null | awk '
+        $1=="-A" && $2=="FORWARD" {
+            iface="*"; mac="*"; hit=0
+            for (i=3; i<=NF; i++) {
+                if ($i=="-i" && i<NF) iface=$(i+1)
+                if ($i=="--mac-source" && i<NF) mac=toupper($(i+1))
+                if (($i=="-j" || $i=="--jump") && i<NF && $(i+1)=="PControls") hit=1
+            }
+            if (hit) print iface "|" mac
+        }
+    ' | awk '!seen[$0]++' > "$out"
+}
+
+pcontrols_last_forward_pos(){
+    ipt -t filter -L FORWARD --line-numbers -n 2>/dev/null | awk '$2=="PControls"{p=$1} END{if(p!="")print p}'
+}
+
+pcontrols_target_forward_pos(){
+    target="$1"
+    ipt -t filter -L FORWARD --line-numbers -n 2>/dev/null | awk -v t="$target" '$2==t{print $1; exit}'
+}
+
+# Keep only GoshaCrash/Mihomo hooks behind the last stock PControls rule.  ASUS
+# rules are never copied, deleted or rewritten here.
+pcontrols_move_target_after_stock(){
+    target="$1"
+    ppos="$(pcontrols_last_forward_pos)"
+    [ -n "$ppos" ] || return 0
+    tpos="$(pcontrols_target_forward_pos "$target")"
+    [ -n "$tpos" ] || return 0
+    case "$ppos:$tpos" in *[!0-9:]*|:*) return 0;; esac
+    [ "$tpos" -gt "$ppos" ] && return 0
+
+    remove_jump filter FORWARD -j "$target"
+    ppos="$(pcontrols_last_forward_pos)"
+    [ -n "$ppos" ] || return 0
+    newpos=$((ppos + 1))
+    if ipt -t filter -I FORWARD "$newpos" -j "$target" 2>/dev/null; then
+        log_event OK pcontrols "$target moved after ASUS PControls (FORWARD position $newpos)"
+        return 0
+    fi
+    # Do not leave our hook detached if ASUS rebuilt FORWARD in the middle of
+    # the operation.  Appending is safer than silently losing connectivity.
+    ipt -t filter -A FORWARD -j "$target" 2>/dev/null || true
+    return 1
+}
+
+pcontrols_nat_delete_entry(){
+    iface="$1"; mac="$2"
+    ipt -t nat -S mihomo-prerouting >/dev/null 2>&1 || return 0
+    if [ "$iface" = "*" ] && [ "$mac" = "*" ]; then
+        while ipt -t nat -D mihomo-prerouting -j RETURN 2>/dev/null; do :; done
+    elif [ "$iface" = "*" ]; then
+        while ipt -t nat -D mihomo-prerouting -m mac --mac-source "$mac" -j RETURN 2>/dev/null; do :; done
+    elif [ "$mac" = "*" ]; then
+        while ipt -t nat -D mihomo-prerouting -i "$iface" -j RETURN 2>/dev/null; do :; done
+    else
+        while ipt -t nat -D mihomo-prerouting -i "$iface" -m mac --mac-source "$mac" -j RETURN 2>/dev/null; do :; done
+    fi
+}
+
+pcontrols_nat_entry_exists(){
+    iface="$1"; mac="$2"
+    ipt -t nat -S mihomo-prerouting >/dev/null 2>&1 || return 1
+    if [ "$iface" = "*" ] && [ "$mac" = "*" ]; then
+        ipt -t nat -C mihomo-prerouting -j RETURN >/dev/null 2>&1 && return 0
+        ipt -t nat -S mihomo-prerouting 2>/dev/null | grep -Fqx -- '-A mihomo-prerouting -j RETURN'
+    elif [ "$iface" = "*" ]; then
+        ipt -t nat -C mihomo-prerouting -m mac --mac-source "$mac" -j RETURN >/dev/null 2>&1 && return 0
+        ipt -t nat -S mihomo-prerouting 2>/dev/null | grep -Fqx -- "-A mihomo-prerouting -m mac --mac-source $mac -j RETURN"
+    elif [ "$mac" = "*" ]; then
+        ipt -t nat -C mihomo-prerouting -i "$iface" -j RETURN >/dev/null 2>&1 && return 0
+        ipt -t nat -S mihomo-prerouting 2>/dev/null | grep -Fqx -- "-A mihomo-prerouting -i $iface -j RETURN"
+    else
+        ipt -t nat -C mihomo-prerouting -i "$iface" -m mac --mac-source "$mac" -j RETURN >/dev/null 2>&1 && return 0
+        ipt -t nat -S mihomo-prerouting 2>/dev/null | grep -Fqx -- "-A mihomo-prerouting -i $iface -m mac --mac-source $mac -j RETURN"
+    fi
+}
+
+pcontrols_nat_add_entry(){
+    iface="$1"; mac="$2"
+    ipt -t nat -S mihomo-prerouting >/dev/null 2>&1 || return 0
+    pcontrols_nat_entry_exists "$iface" "$mac" && return 0
+    if [ "$iface" = "*" ] && [ "$mac" = "*" ]; then
+        ipt -t nat -I mihomo-prerouting 1 -j RETURN >/dev/null 2>&1
+    elif [ "$iface" = "*" ]; then
+        ipt -t nat -I mihomo-prerouting 1 -m mac --mac-source "$mac" -j RETURN >/dev/null 2>&1
+    elif [ "$mac" = "*" ]; then
+        ipt -t nat -I mihomo-prerouting 1 -i "$iface" -j RETURN >/dev/null 2>&1
+    else
+        ipt -t nat -I mihomo-prerouting 1 -i "$iface" -m mac --mac-source "$mac" -j RETURN >/dev/null 2>&1
+    fi
+}
+
+pcontrols_nat_cleanup_state(){
+    [ -f "$PCONTROLS_CLIENTS" ] || return 0
+    while IFS='|' read -r iface mac; do
+        [ -n "$iface" ] && [ -n "$mac" ] || continue
+        pcontrols_nat_delete_entry "$iface" "$mac"
+    done < "$PCONTROLS_CLIENTS"
+}
+
+pcontrols_nat_ensure_file(){
+    file="$1"
+    ipt -t nat -S mihomo-prerouting >/dev/null 2>&1 || return 0
+    while IFS='|' read -r iface mac; do
+        [ -n "$iface" ] && [ -n "$mac" ] || continue
+        pcontrols_nat_add_entry "$iface" "$mac" || return 1
+    done < "$file"
+}
+
+pcontrols_forward_priority_ok(){
+    ppos="$(pcontrols_last_forward_pos)"
+    [ -n "$ppos" ] || return 0
+    for target in mihomo-forward "$FORWARD_CHAIN"; do
+        tpos="$(pcontrols_target_forward_pos "$target")"
+        [ -n "$tpos" ] || continue
+        case "$ppos:$tpos" in *[!0-9:]*|:*) continue;; esac
+        [ "$tpos" -gt "$ppos" ] || return 1
+    done
+    return 0
+}
+
+pcontrols_nat_bypass_ok(){
+    tmp="$PCONTROLS_STATE/check.$$"
+    mkdir -p "$PCONTROLS_STATE" 2>/dev/null || return 1
+    pcontrols_collect_clients "$tmp" || { rm -f "$tmp"; return 1; }
+    [ -s "$tmp" ] || { rm -f "$tmp"; return 0; }
+    # No native auto-redirect chain means there is nothing early to bypass.
+    ipt -t nat -S mihomo-prerouting >/dev/null 2>&1 || { rm -f "$tmp"; return 0; }
+    rc=0
+    while IFS='|' read -r iface mac; do
+        [ -n "$iface" ] && [ -n "$mac" ] || continue
+        pcontrols_nat_entry_exists "$iface" "$mac" || rc=1
+    done < "$tmp"
+    rm -f "$tmp"
+    return "$rc"
+}
+
+# Synchronize compatibility with stock ASUSWRT PControls.
+# - no PControls: do nothing and remove stale bypass selectors;
+# - PControls present: keep Mihomo/GoshaCrash FORWARD hooks after it;
+# - native auto-redirect: RETURN managed clients from mihomo-prerouting so they
+#   reach normal routing/FORWARD and ASUS can DROP them before TUN/proxy;
+# - mode=watchdog returns 2 when membership changed so the caller can restart
+#   Mihomo once and tear down already-redirected long-lived sessions (Telegram).
+pcontrols_sync(){
+    mode="${1:-startup}"
+    refresh_path >/dev/null 2>&1 || true
+    [ -x "$IPTABLES" ] || return 0
+    ipt_init
+    mkdir -p "$PCONTROLS_STATE" 2>/dev/null || return 1
+    current="$PCONTROLS_STATE/current.$$"
+    pcontrols_collect_clients "$current" || { rm -f "$current"; return 1; }
+
+    new_sig="$(cat "$current" 2>/dev/null)"
+    old_sig="$(cat "$PCONTROLS_CLIENTS" 2>/dev/null)"
+    changed=0
+    [ "$new_sig" = "$old_sig" ] || changed=1
+
+    if [ "$changed" = 1 ]; then
+        pcontrols_nat_cleanup_state
+    fi
+
+    if [ -s "$current" ]; then
+        pcontrols_move_target_after_stock mihomo-forward || true
+        pcontrols_move_target_after_stock "$FORWARD_CHAIN" || true
+        pcontrols_nat_ensure_file "$current" || true
+    fi
+
+    mv -f "$current" "$PCONTROLS_CLIENTS" 2>/dev/null || { rm -f "$current"; return 1; }
+
+    if [ "$changed" = 1 ]; then
+        count="$(wc -l < "$PCONTROLS_CLIENTS" 2>/dev/null | tr -d ' ')"
+        case "$count" in ''|*[!0-9]*) count=0;; esac
+        log_event INFO pcontrols "ASUS PControls membership changed; managed selectors=$count"
+        [ "$mode" = watchdog ] && return 2
+    fi
+    return 0
+}
+
+pcontrols_status(){
+    refresh_path >/dev/null 2>&1 || true
+    [ -x "$IPTABLES" ] || { echo "PControls: iptables unavailable"; return 1; }
+    ipt_init
+    tmp="$PCONTROLS_STATE/status.$$"
+    mkdir -p "$PCONTROLS_STATE" 2>/dev/null || true
+    pcontrols_collect_clients "$tmp" || { rm -f "$tmp"; echo "PControls: probe failed"; return 1; }
+    if [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        echo "PControls: NOT PRESENT/NO CLIENTS"
+        return 0
+    fi
+    count="$(wc -l < "$tmp" 2>/dev/null | tr -d ' ')"
+    echo "PControls: PRESENT (${count:-?} selector(s))"
+    pcontrols_forward_priority_ok && echo "PControls FORWARD priority: OK (before Mihomo)" || echo "PControls FORWARD priority: NEEDS FIX"
+    if ipt -t nat -S mihomo-prerouting >/dev/null 2>&1; then
+        pcontrols_nat_bypass_ok && echo "PControls auto-redirect bypass: OK" || echo "PControls auto-redirect bypass: NEEDS FIX"
+    else
+        echo "PControls auto-redirect bypass: N/A"
+    fi
+    rm -f "$tmp"
+}
+
 reserved_destinations(){
     cat <<'NETS'
 0.0.0.0/8
 10.0.0.0/8
-100.64.0.1/10
+100.64.0.0/10
 127.0.0.0/8
-169.254.0.1/16
+169.254.0.0/16
 172.16.0.0/12
 192.168.0.0/16
-224.0.1.0/4
+224.0.0.0/4
 240.0.0.0/4
 255.255.255.255/32
 NETS
@@ -1243,9 +1418,9 @@ migrate_legacy_usb_runtime(){
         esac
     fi
 
-    rm -rf "$legacy_run" "$legacy_logs" "$BASE/state/route" 2>/dev/null || true
-    rm -f "$BASE/state/wan-offline" "$BASE/state/wan-fail-count" "$BASE/state/wan-ok-count" "$BASE/state/internet.state" "$BASE/state/watchdog-heartbeat" "$BASE/state/autostart-hook-ran" 2>/dev/null || true
-    log_event INFO storage "legacy USB runtime migrated to RAM; old logs/run removed"
+    # Never delete or rewrite persistent USB content from background runtime.
+    # The installer removes legacy run/log files during an explicit update.
+    log_event INFO storage "legacy USB runtime detected; old processes stopped, persistent cleanup deferred to install.sh"
     return 0
 }
 
@@ -1388,6 +1563,7 @@ start_runtime(){
     ensure_tun || { fail "/dev/net/tun недоступен"; return 1; }
     if p="$(running_pid)"; then
         if route_start; then
+            pcontrols_sync startup >/dev/null 2>&1 || true
             say "Mihomo уже работает, PID=$p; runtime проверен"
             return 0
         fi
@@ -1401,7 +1577,7 @@ start_runtime(){
 
     [ "$ROUTING_MODE" = manual ] && route_stop >/dev/null 2>&1 || true
     kill_mihomo
-    rotate_log "$MIHOMO_LOG" 2097152
+    cap_ram_log "$MIHOMO_LOG"
     log_event INFO runtime "starting $BIN with $CONFIG"
     nohup_bin="$(find_nohup 2>/dev/null)"
     if [ -n "$nohup_bin" ]; then
@@ -1415,6 +1591,7 @@ start_runtime(){
     wait_tun || { kill_mihomo; tail -n 80 "$MIHOMO_LOG" >&2; fail "Mihomo не создал $TUN_DEVICE"; return 1; }
     route_start || { kill_mihomo; route_stop >/dev/null 2>&1 || true; fail "Маршрутизация не поднялась; оставлен DIRECT"; return 1; }
     wait_route_ready || { kill_mihomo; route_stop >/dev/null 2>&1 || true; tail -n 80 "$MIHOMO_LOG" >&2; fail "Маршрутизация не стала рабочей после запуска; оставлен DIRECT"; return 1; }
+    pcontrols_sync startup >/dev/null 2>&1 || warn "PControls guard пока не удалось синхронизировать"
     ok "Mihomo запущен, PID=$p; profile=$PLATFORM"
 }
 
@@ -1559,6 +1736,9 @@ cleanup_stale_runtime_state(){
 }
 
 stop_runtime(){
+    # Remove only GoshaCrash PControls bypass rules while Mihomo's native chain
+    # still exists.  ASUS PControls itself is never touched.
+    pcontrols_nat_cleanup_state >/dev/null 2>&1 || true
     route_stop >/dev/null 2>&1 || true
     kill_mihomo
     rm -rf "$START_LOCK" 2>/dev/null || true
@@ -1605,7 +1785,7 @@ watchdog_start(){
     lock_stamp "$WATCHDOG_START_LOCK" || { rm -rf "$WATCHDOG_START_LOCK" 2>/dev/null || true; return 1; }
 
     watchdog_pid >/dev/null 2>&1 && { rm -rf "$WATCHDOG_START_LOCK" 2>/dev/null || true; return 0; }
-    rotate_log "$WATCHDOG_LOG" 1048576
+    cap_ram_log "$WATCHDOG_LOG"
     printf '[%s] watchdog: launch requested by pid=%s\n' "$(now)" "$$" >> "$WATCHDOG_LOG" 2>/dev/null || true
 
     nohup_bin="$(find_nohup 2>/dev/null)"
@@ -1638,15 +1818,29 @@ watchdog_check(){
     watchdog_connectivity_step || true
     [ -f "$WAN_OFFLINE" ] && return 0
     if ! running_pid >/dev/null 2>&1; then
-      rotate_log "$WATCHDOG_LOG" 1048576
+      cap_ram_log "$WATCHDOG_LOG"
       printf '[%s] watchdog: Mihomo down; recovery start\n' "$(now)" >> "$WATCHDOG_LOG" 2>/dev/null || true
       if ! with_start_lock start_runtime >> "$WATCHDOG_LOG" 2>&1; then
         printf '[%s] watchdog: recovery failed\n' "$(now)" >> "$WATCHDOG_LOG" 2>/dev/null || true
       fi
       return 0
     fi
+
+    pcontrols_sync watchdog
+    pc_rc=$?
+    if [ "$pc_rc" = 2 ]; then
+      cap_ram_log "$WATCHDOG_LOG"
+      printf '[%s] watchdog: ASUS PControls changed; restarting Mihomo once to close old redirected sessions\n' "$(now)" >> "$WATCHDOG_LOG" 2>/dev/null || true
+      stop_runtime
+      if ! with_start_lock start_runtime >> "$WATCHDOG_LOG" 2>&1; then
+        printf '[%s] watchdog: PControls-triggered restart failed\n' "$(now)" >> "$WATCHDOG_LOG" 2>/dev/null || true
+      fi
+      return 0
+    fi
+    [ "$pc_rc" = 0 ] || printf '[%s] watchdog: PControls guard sync failed; will retry\n' "$(now)" >> "$WATCHDOG_LOG" 2>/dev/null || true
+
     if ! runtime_health_ok; then
-      rotate_log "$WATCHDOG_LOG" 1048576
+      cap_ram_log "$WATCHDOG_LOG"
       printf '[%s] watchdog: runtime unhealthy; restart\n' "$(now)" >> "$WATCHDOG_LOG" 2>/dev/null || true
       stop_runtime
       if ! with_start_lock start_runtime >> "$WATCHDOG_LOG" 2>&1; then
@@ -1665,10 +1859,12 @@ watchdog_loop(){
     # the controller reaches the watchdog, not one interval later.
     printf '%s pid=%s\n' "$(now)" "$$" > "$WATCHDOG_HEARTBEAT" 2>/dev/null || true
     watchdog_check
+    enforce_ram_log_limits
     while :; do
         sleep "$WATCHDOG_INTERVAL"
         printf '%s pid=%s\n' "$(now)" "$$" > "$WATCHDOG_HEARTBEAT" 2>/dev/null || true
         watchdog_check
+        enforce_ram_log_limits
     done
 }
 
@@ -1706,7 +1902,7 @@ start(){
     return "$rc"
 }
 stop(){
-    ensure_dirs || return 1; load_platform || true; migrate_legacy_usb_runtime; touch "$MANUAL_STOP"
+    ensure_dirs || return 1; load_platform || true; migrate_legacy_usb_runtime; mkdir -p "$PERSIST_ROOT" 2>/dev/null || return 1; touch "$MANUAL_STOP"
     control_lock_set || { fail "Другая операция GoshaCrash ещё выполняется"; return 1; }
     watchdog_stop; stop_runtime; control_lock_clear; ok "Mihomo остановлен; обычный DIRECT восстановлен"
 }
@@ -1889,7 +2085,12 @@ firewall_reload(){
     load_platform || return 0
     [ -f "$WAN_OFFLINE" ] && return 0
     running_pid >/dev/null 2>&1 || return 0
-    if [ "$ROUTING_MODE" = manual ]; then route_start || return 1; else restart; fi
+    if [ "$ROUTING_MODE" = manual ]; then
+        route_start || return 1
+        pcontrols_sync startup >/dev/null 2>&1 || true
+    else
+        restart
+    fi
 }
 
 find_editor(){
@@ -1950,9 +2151,9 @@ repair_nano_runtime(){
 passive_config_backup(){
     tag="${1:-manual}"
     [ -f "$CONFIG" ] || return 1
-    mkdir -p "$BASE/backups" 2>/dev/null || return 1
+    mkdir -p "$RAM_BACKUPS" 2>/dev/null || return 1
     stamp="$(date '+%Y%m%d-%H%M%S' 2>/dev/null || echo now)"
-    dst="$BASE/backups/config-$tag-$stamp.yaml"
+    dst="$RAM_BACKUPS/config-$tag-$stamp.yaml"
     cp -f "$CONFIG" "$dst" || return 1
     printf '%s\n' "$dst"
 }
@@ -1981,8 +2182,7 @@ edit_config(){
         return 1
     fi
 
-    mkdir -p "$STATE" 2>/dev/null || true
-    printf '%s\n' user > "$STATE/config-origin" 2>/dev/null || true
+    printf '%s\n' user > "$VOLATILE_STATE/config-origin" 2>/dev/null || true
     ok "Синтаксис config.yaml: OK"
     say "Конфиг сохранён. Mihomo НЕ перезапускался — для применения выбери Restart."
     return 0
@@ -2037,18 +2237,6 @@ yaml_remove_top_key(){
     mv -f "$tmp" "$file"
 }
 
-platform_set(){
-    key="$1"; value="$2"; tmp="$PLATFORM_FILE.gc.$$"
-    LC_ALL=C awk -v key="$key" -v value="$value" '
-      BEGIN{done=0}
-      $0 ~ "^" key "=" {if(!done){print key "=\"" value "\""; done=1}; next}
-      {print}
-      END{if(!done) print key "=\"" value "\""}
-    ' "$PLATFORM_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
-    mv -f "$tmp" "$PLATFORM_FILE"
-    chmod 600 "$PLATFORM_FILE" 2>/dev/null || true
-}
-
 rewrite_config_for_routing(){
     mode="$1"
 
@@ -2098,9 +2286,6 @@ set_routing_mode(){
         return 1
     fi
 
-    stack="system"; [ "$MIHOMO_TARGET" = armv5 ] && stack="gvisor"
-    platform_set ROUTING_MODE "$mode" >/dev/null 2>&1 || true
-    platform_set TUN_STACK "$stack" >/dev/null 2>&1 || true
     load_platform >/dev/null 2>&1 || true
 
     if ! check_config; then
@@ -2170,8 +2355,34 @@ storage_space_ok(){
     [ "$used" -lt 95 ] && [ "$free_kb" -ge 32768 ]
 }
 
+usb_mount_options(){
+    refresh_storage_identity >/dev/null 2>&1 || true
+    awk -v d="$USB_DEVICE" -v m="$USB_MOUNT" '$1==d && $2==m {print $4; exit}' /proc/mounts 2>/dev/null
+}
+
+usb_noatime_ok(){
+    opts="$(usb_mount_options)"
+    case ",$opts," in *,noatime,*) return 0;; esac
+    return 1
+}
+
+ensure_usb_noatime_runtime(){
+    usb_noatime_ok && return 0
+    [ -n "$USB_DEVICE" ] && [ -n "$USB_MOUNT" ] || return 1
+    mount_bin="$(find_system_mount_runtime 2>/dev/null)"
+    [ -n "$mount_bin" ] || return 1
+    "$mount_bin" -o remount,noatime,nodiratime "$USB_DEVICE" "$USB_MOUNT" >/dev/null 2>&1 || \
+      "$mount_bin" -o remount,noatime,nodiratime "$USB_MOUNT" >/dev/null 2>&1 || return 1
+    usb_noatime_ok
+}
+
 storage_guard_runtime(){
     refresh_storage_identity >/dev/null 2>&1 || true
+    if usb_kernel_fs_errors; then
+        fail "Ядро уже зафиксировало ошибки filesystem на ${USB_DEVICE:-USB}. Runtime не запускается: сначала offline fsck/переформатирование"
+        return 1
+    fi
+    ensure_usb_noatime_runtime || log_event WARN storage "USB mount has no noatime; read access may still update filesystem metadata"
     storage_space_ok && return 0
     used="$(usb_usage_percent)"; free_kb="$(usb_free_kb)"
     fail "USB почти заполнена: used=${used:-?}% free=${free_kb:-?}KB. Runtime не запускается, чтобы не добивать filesystem"
@@ -2188,6 +2399,41 @@ usb_kernel_fs_errors(){
     [ -n "$dev" ] || return 1
     short="${dev##*/}"
     dmesg 2>/dev/null | grep -Eq "EXT[234]-fs error \(device $short\)|I/O error.*$short|Buffer I/O error.*$short"
+}
+
+uptime_seconds(){
+    awk '{print int($1)}' /proc/uptime 2>/dev/null
+}
+
+clear_ram_logs(){
+    ensure_dirs || return 1
+    for f in "$LOGS"/*.log; do
+        [ -f "$f" ] || continue
+        : > "$f" 2>/dev/null || true
+    done
+    rm -f "$LOGS"/*.log.1 "$LOGS"/*.log.2 "$LOGS"/*.log.3 2>/dev/null || true
+    return 0
+}
+
+ram_available_kb(){
+    v="$(awk '/^MemAvailable:/ {print $2; exit}' /proc/meminfo 2>/dev/null)"
+    case "$v" in ''|*[!0-9]*)
+        v="$(awk '/^MemFree:/ {f=$2} /^Buffers:/ {b=$2} /^Cached:/ {c=$2} END {print (f+0)+(b+0)+(c+0)}' /proc/meminfo 2>/dev/null)"
+        ;;
+    esac
+    printf '%s\n' "${v:-0}"
+}
+
+enforce_ram_log_limits(){
+    cap_all_ram_logs >/dev/null 2>&1 || true
+    minfree="$LOG_MIN_FREE_KB"
+    case "$minfree" in ''|*[!0-9]*|0) minfree=32768;; esac
+    avail="$(ram_available_kb)"
+    case "$avail" in ''|*[!0-9]*) return 0;; esac
+    if [ "$avail" -lt "$minfree" ]; then
+        clear_ram_logs >/dev/null 2>&1 || true
+        log_event WARN memory "RAM low (${avail}KB available); RAM logs cleared"
+    fi
 }
 
 usb_metadata_probe_runtime(){
@@ -2236,6 +2482,10 @@ dashboard_base_url(){
 log_file_for_kind(){
     case "${1:-mihomo}" in
       mihomo) printf '%s\n' "$MIHOMO_LOG";;
+      goshacrash|gc) printf '%s\n' "$LOGS/goshacrash.log";;
+      watchdog) printf '%s\n' "$WATCHDOG_LOG";;
+      boot) printf '%s\n' "$LOGS/boot.log";;
+      coldboot) printf '%s\n' "$LOGS/coldboot.log";;
       install) printf '%s\n' "$INSTALL_LOG";;
       packages) printf '%s\n' "$PACKAGES_LOG";;
       *) return 1;;
@@ -2245,7 +2495,7 @@ log_file_for_kind(){
 show_logs(){
     kind="${1:-mihomo}"; lines="${2:-100}"
     case "$lines" in ''|*[!0-9]*) lines=100;; esac
-    file="$(log_file_for_kind "$kind")" || { echo "logs: mihomo|install|packages"; return 1; }
+    file="$(log_file_for_kind "$kind")" || { echo "logs: mihomo|goshacrash|watchdog|boot|coldboot|install|packages"; return 1; }
     tail -n "$lines" "$file" 2>/dev/null || true
 }
 
@@ -2532,6 +2782,13 @@ menu_logs_draw(){
     printf '\033[0m'
     menu_item "$log_selected" 1 "Mihomo: last 100 lines"
     menu_item "$log_selected" 2 "Mihomo: live"
+    menu_item "$log_selected" 3 "GoshaCrash controller"
+    menu_item "$log_selected" 4 "Watchdog"
+    menu_item "$log_selected" 5 "Boot"
+    menu_item "$log_selected" 6 "Coldboot"
+    menu_item "$log_selected" 7 "Installer"
+    menu_item "$log_selected" 8 "Packages"
+    menu_item "$log_selected" 9 "Clear all RAM logs"
     printf '\033[1;36m'
     printf '├───────────────────────────────────────────┤\n'
     printf '\033[0m'
@@ -2542,31 +2799,18 @@ menu_logs_draw(){
 }
 
 menu_logs(){
-    # The normal full-screen menu has already restored canonical terminal mode
-    # before entering this submenu. Switch back to raw mode only while we read
-    # Up/Down/Enter/Esc, then restore it before showing log output.
+    # Arrow-key menu. Esc always returns directly to the main menu.
     if [ -z "${MENU_TTY_MODE:-}" ] || [ -z "${MENU_STTY_BACKEND:-}" ]; then
-        # Portable fallback for very old terminals where raw key reading is not
-        # available. The normal ASUS SSH path uses the arrow-key menu below.
-        while :; do
-            printf '\n=== MIHOMO LOG ===\n'
-            echo "  u) Последние 100 строк"
-            echo "  l) LIVE"
-            echo "  q) Главное меню"
-            printf 'Выбор [u/l/q]: '
-            IFS= read -r log_choice || return 0
-            case "$log_choice" in
-                u|U) show_logs mihomo 100; printf '\nНажми Enter, чтобы вернуться...'; IFS= read -r _gc_log_dummy || return 0 ;;
-                l|L) follow_logs mihomo 100 ;;
-                q|Q) return 0 ;;
-                *) echo "Неверный выбор" ;;
-            esac
-        done
+        echo "Logs are in /tmp/goshacrash/logs (RAM)."
+        echo "This terminal does not support the arrow-key submenu; use: gc logs <kind>"
+        echo "Kinds: mihomo goshacrash watchdog boot coldboot install packages"
+        return 0
     fi
 
     log_old_stty="$(menu_stty -g 2>/dev/null)"
     [ -n "$log_old_stty" ] || log_old_stty="$MENU_OLD_STTY"
     log_selected=1
+    log_items_count=9
     menu_stty -echo -icanon min 1 time 0 >/dev/null 2>&1 || return 0
     menu_logs_draw "$log_selected"
 
@@ -2575,12 +2819,12 @@ menu_logs(){
         case "$log_key" in
             up)
                 log_selected=$((log_selected - 1))
-                [ "$log_selected" -lt 1 ] && log_selected=2
+                [ "$log_selected" -lt 1 ] && log_selected=$log_items_count
                 menu_logs_draw "$log_selected"
                 ;;
             down)
                 log_selected=$((log_selected + 1))
-                [ "$log_selected" -gt 2 ] && log_selected=1
+                [ "$log_selected" -gt "$log_items_count" ] && log_selected=1
                 menu_logs_draw "$log_selected"
                 ;;
             quit)
@@ -2592,6 +2836,13 @@ menu_logs(){
                 case "$log_selected" in
                     1) show_logs mihomo 100; menu_pause ;;
                     2) follow_logs mihomo 100; menu_pause ;;
+                    3) show_logs goshacrash 100; menu_pause ;;
+                    4) show_logs watchdog 100; menu_pause ;;
+                    5) show_logs boot 100; menu_pause ;;
+                    6) show_logs coldboot 100; menu_pause ;;
+                    7) show_logs install 200; menu_pause ;;
+                    8) show_logs packages 200; menu_pause ;;
+                    9) clear_ram_logs; echo "RAM logs cleared"; menu_pause ;;
                 esac
                 menu_stty -echo -icanon min 1 time 0 >/dev/null 2>&1 || true
                 menu_logs_draw "$log_selected"
@@ -2710,7 +2961,7 @@ autostart_status(){
     [ -n "$bridge_version" ] && echo "  bridge version: $bridge_version" || echo "  bridge version: old/unknown"
     [ -f "$VOLATILE_STATE/autostart-hook-ran" ] && echo "  last hook: $(cat "$VOLATILE_STATE/autostart-hook-ran" 2>/dev/null)" || echo "  last hook: not seen this boot"
     [ -f "$LOGS/coldboot.log" ] && echo "  coldboot trace: $LOGS/coldboot.log (RAM)" || echo "  coldboot trace: not written yet"
-    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall 4.0.1)" || echo "  legacy JFFS dir: clean"
+    [ -d /jffs/addons/goshacrash ] && echo "  legacy JFFS dir: PRESENT (remove/reinstall 4.0.0)" || echo "  legacy JFFS dir: clean"
     [ -f "$MANUAL_STOP" ] && echo "  manual-stop: YES" || echo "  manual-stop: no"
     return 0
 }
@@ -2834,6 +3085,24 @@ doctor(){
     netstat -ln 2>/dev/null | grep -Eq "[:.]$DNS_PORT[[:space:]]" \
         && echo "  Mihomo DNS: OK" || echo "  Mihomo DNS: DOWN"
     echo "  MPTCP: $(mptcp_status)"
+    pc_tmp="$PCONTROLS_STATE/doctor.$$"
+    mkdir -p "$PCONTROLS_STATE" 2>/dev/null || true
+    pcontrols_collect_clients "$pc_tmp" >/dev/null 2>&1 || true
+    if [ -s "$pc_tmp" ]; then
+        pc_count="$(wc -l < "$pc_tmp" 2>/dev/null | tr -d ' ')"
+        echo "  ASUS PControls: PRESENT (${pc_count:-?} selector(s))"
+        pcontrols_forward_priority_ok && echo "  PControls before Mihomo: OK" || echo "  PControls before Mihomo: FAIL"
+        if ipt -t nat -S mihomo-prerouting >/dev/null 2>&1; then
+            pcontrols_nat_bypass_ok && echo "  PControls auto-redirect bypass: OK" || echo "  PControls auto-redirect bypass: FAIL"
+        else
+            echo "  PControls auto-redirect bypass: N/A"
+        fi
+    else
+        echo "  ASUS PControls: NOT PRESENT"
+        echo "  PControls before Mihomo: N/A"
+        echo "  PControls auto-redirect bypass: N/A"
+    fi
+    rm -f "$pc_tmp" 2>/dev/null || true
     if [ "$ROUTING_MODE" = auto ]; then
         auto_route_policy_ok && echo "  auto-route policy: OK (native Mihomo)" || echo "  auto-route policy: FAIL"
         auto_redirect_ok && echo "  auto-redirect TCP: OK (native Mihomo)" || echo "  auto-redirect TCP: FAIL"
@@ -2859,7 +3128,7 @@ doctor(){
 
     find_dm_root >/dev/null 2>&1 && echo "  Download Master: $DM_ROOT" || echo "  Download Master: FAIL"
     ensure_optware_link >/dev/null 2>&1 && echo "  /tmp/opt: OK" || echo "  /tmp/opt: FAIL"
-    if opt_namespace_write_through_runtime >/dev/null 2>&1; then
+    if opt_namespace_ready_runtime >/dev/null 2>&1; then
         echo "  /opt -> USB: OK"
     else
         echo "  /opt -> USB: FAIL"
@@ -2896,7 +3165,11 @@ doctor(){
     else
         echo "  ASUS .minidlna cache: not present"
     fi
-    echo "  runtime logs: $LOGS (RAM, cleared on reboot)"
+    echo "  runtime logs: $LOGS (RAM, max 10 MiB per log)"
+    echo "  RAM available: $(ram_available_kb)KB; low-RAM log purge threshold: ${LOG_MIN_FREE_KB}KB"
+    echo "  persistent logs on USB: disabled"
+    if usb_noatime_ok; then echo "  USB noatime: OK"; else echo "  USB noatime: NOT SET (runtime attempts best-effort remount)"; fi
+    echo "  background USB writes by GoshaCrash: disabled (install/update/config/package actions are explicit exceptions)"
 
     if usb_metadata_probe_runtime; then
         echo "  USB metadata probe: OK"
@@ -2930,7 +3203,7 @@ doctor(){
 }
 usage(){
 cat <<'USAGE'
-GoshaCrash 4.0.1 — что буквально вводить в SSH
+GoshaCrash 4.0.0 — что буквально вводить в SSH
 
 КАТАЛОГ УСТАНОВКИ
   BASE="$(gc base)"
@@ -2945,6 +3218,7 @@ GoshaCrash 4.0.1 — что буквально вводить в SSH
 ПОЛНАЯ ДИАГНОСТИКА
   gc doctor
   gc storage
+  gc pcontrols
 
 АВТОЗАПУСК / COLD BOOT
   gc autostart status
@@ -3001,8 +3275,19 @@ GoshaCrash 4.0.1 — что буквально вводить в SSH
 200 СТРОК MIHOMO
   gc logs mihomo 200
 
+ОСТАЛЬНЫЕ RAM-ЛОГИ
+  gc logs goshacrash 100
+  gc logs watchdog 100
+  gc logs boot 100
+  gc logs coldboot 100
+  gc logs install 200
+  gc logs packages 200
+
 LIVE MIHOMO
   gc logs live mihomo 100
+
+ОЧИСТИТЬ RAM-ЛОГИ СЕЙЧАС
+  gc logs clear
 
 ЛОГ MIHOMO ВРУЧНУЮ
   BASE="$(gc base)"
@@ -3220,6 +3505,16 @@ case "$GC_COMMAND" in
         packages_repair
         ;;
     doctor) doctor;;
+    pcontrols)
+        pcontrols_sync watchdog
+        pc_rc=$?
+        if [ "$pc_rc" = 2 ] && running_pid >/dev/null 2>&1; then
+            echo "PControls changed: restarting Mihomo once to close old redirected sessions"
+            stop_runtime
+            with_start_lock start_runtime || true
+        fi
+        pcontrols_status
+        ;;
     routing)
         shift
         case "${1:-status}" in
@@ -3234,6 +3529,11 @@ case "$GC_COMMAND" in
         echo "USB: ${USB_DEVICE:-?} -> $USB_MOUNT (${USB_FS:-?})"
         df -h "$USB_MOUNT" 2>/dev/null || true
         if dlna_kb="$(minidlna_size_kb 2>/dev/null)"; then echo ".minidlna: ${dlna_kb}KB"; else echo ".minidlna: not present"; fi
+        echo "persistent logs on USB: disabled"
+        echo "background USB writes by GoshaCrash: disabled"
+        echo "RAM logs: $LOGS (max 10 MiB per log; size/low-RAM/manual/reboot cleanup only)"
+        echo "RAM available: $(ram_available_kb)KB"
+        if usb_noatime_ok; then echo "USB noatime: OK"; else echo "USB noatime: NOT SET"; fi
         if usb_kernel_fs_errors; then echo "filesystem kernel log: ERRORS DETECTED - offline fsck required"; else echo "filesystem kernel log: no current errors"; fi
         ;;
     logs)
@@ -3242,6 +3542,14 @@ case "$GC_COMMAND" in
             live)
                 shift
                 follow_logs "${1:-mihomo}" "${2:-100}"
+                ;;
+            clear)
+                clear_ram_logs
+                echo "RAM logs cleared"
+                ;;
+            flush)
+                clear_ram_logs
+                echo "RAM logs cleared; no persistent USB log snapshots are used"
                 ;;
             *) show_logs "${1:-mihomo}" "${2:-100}" ;;
         esac

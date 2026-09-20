@@ -3,7 +3,7 @@
 **Mihomo + Zashboard для ASUSWRT-роутеров.**  
 Установка, TUN-маршрутизация, автозапуск, watchdog, диагностика и управление из одного `gc`.
 
-> Текущая публичная сборка: **GoshaCrash 4.0.1 production**
+> Текущая публичная сборка: **GoshaCrash 4.0.0 production**
 
 ## Поддерживаемые роутеры
 
@@ -85,7 +85,7 @@ echo 0 > /proc/sys/net/mptcp/mptcp_enabled
 ```
 
 
-### Runtime-логи и watchdog больше не пишут на USB
+### Runtime-логи только в RAM, максимум 10 MiB на файл
 
 Все часто изменяемые данные перенесены в RAM (`/tmp`):
 
@@ -96,9 +96,13 @@ echo 0 > /proc/sys/net/mptcp/mptcp_enabled
 └── state/       # heartbeat, WAN counters, runtime routing state
 ```
 
-После reboot эти данные исчезают — это намеренно. На USB остаются только программа, `config.yaml`, UI и редко изменяемое persistent state. В частности watchdog больше не переписывает USB-файл heartbeat каждые 10 секунд.
+Рабочие логи пишутся только в RAM. Каждый отдельный `.log` ограничен 10 MiB: при достижении лимита именно этот RAM-файл очищается и начинает заполняться заново. Таймера очистки нет. Если доступной RAM становится меньше 32 MiB, RAM-логи очищаются досрочно целиком, чтобы не давить на роутер. Watchdog больше не переписывает USB-файл heartbeat каждые 10 секунд. На USB логи не копируются, snapshots и архивы не создаются.
 
-`gc logs` продолжает работать как раньше, но читает `/tmp/goshacrash/logs`.
+`gc logs` читает текущие RAM-логи. `gc logs clear` очищает их вручную. После перезагрузки RAM-логи исчезают автоматически. Лимит можно переопределить переменной `GOSHACRASH_LOG_MAX_BYTES`, но production-default — 10485760 байт (10 MiB) на каждый лог.
+
+Фоновый runtime GoshaCrash не должен создавать, `touch`-ить, ротировать или обновлять файлы на USB. При монтировании GoshaCrash best-effort включает `noatime,nodiratime`, чтобы даже чтение файлов не порождало лишние atime metadata writes. Persistent USB используется как read-mostly хранилище бинарников, UI, `config.yaml` и install-time state. Исключения только явные действия пользователя: установка/обновление GoshaCrash, `gc edit` (сам `config.yaml`) и операции установки/ремонта Optware-пакетов. `manual-stop` перенесён в `/jffs/goshacrash/manual-stop`, а временный backup перед `gc edit` — в `/tmp/goshacrash/backups`.
+
+Важно: ASUS Download Master и другие сервисы прошивки — отдельные процессы и могут писать в свой `asusware.*` независимо от GoshaCrash. Media Server/MiniDLNA тоже должен быть выключен, если он не используется.
 
 ### GitHub fallback через ghproxy.net
 
@@ -118,11 +122,31 @@ https://ghproxy.net/github.com/MetaCubeX/mihomo/releases/download/v1.19.30/mihom
 
 ### Защита USB / filesystem
 
-Перед стартом runtime GoshaCrash проверяет свободное место. При заполнении USB на 95% и выше либо при остатке меньше 32 MiB запуск блокируется, чтобы не продолжать запись на почти заполненную файловую систему.
+Перед стартом runtime GoshaCrash проверяет свободное место и текущий kernel log. При заполнении USB на 95% и выше, остатке меньше 32 MiB либо уже зафиксированных EXT/I/O errors запуск блокируется, чтобы не работать с явно повреждённой файловой системой.
 
-`gc doctor` и `gc storage` показывают заполнение USB, наличие крупного `.minidlna` и ошибки EXT2/3/4 или I/O из текущего kernel log. Установщик отказывается продолжать запись, если ядро уже зафиксировало ошибки файловой системы на выбранном USB-разделе.
+`gc doctor` и `gc storage` показывают заполнение USB, наличие крупного `.minidlna`, состояние `noatime`, доступную RAM и ошибки EXT2/3/4 или I/O из текущего kernel log. Установщик отказывается продолжать запись, если ядро уже зафиксировало ошибки файловой системы на выбранном USB-разделе.
 
 Важно: GoshaCrash не запускает `e2fsck` по смонтированной флешке. Уже повреждённую файловую систему нужно чинить offline; если второй последовательный `e2fsck -f` на всё ещё размонтированном разделе снова находит множество новых ошибок, флешку/файловую систему надо переформатировать, а при повторении на свежей ФС — заменить носитель.
+
+### Родительский контроль ASUS (`PControls`)
+
+На stock ASUSWRT родительский контроль создаёт цепочку `PControls` динамически: если клиентов нет, цепочки может не быть вообще. GoshaCrash не создаёт и не переписывает её.
+
+Когда ASUS добавляет правила вида `FORWARD ... -j PControls`, GoshaCrash автоматически:
+
+- оставляет штатные правила ASUS владельцем всей логики блокировки;
+- держит `mihomo-forward` и собственный manual FORWARD hook **после** последнего `PControls`;
+- для клиентов, которых ASUS направил в PControls, добавляет ранний `RETURN` в `mihomo-prerouting`, чтобы `auto-redirect` не уводил их TCP/DNS в локальный Mihomo раньше штатного `FORWARD`;
+- watchdog повторяет проверку после старта, рестарта Mihomo и последующих изменений firewall;
+- при изменении списка PControls-клиентов один раз перезапускает Mihomo, чтобы закрыть уже существующие long-lived redirect-сессии.
+
+Проверка вручную:
+
+```sh
+gc pcontrols
+```
+
+В норме при активном родительском контроле вывод содержит `PControls FORWARD priority: OK (before Mihomo)` и, при native auto-redirect, `PControls auto-redirect bypass: OK`. Если ASUS ещё не создал цепочку, `NOT PRESENT/NO CLIENTS` является нормальным состоянием.
 
 ### Native AUTO на BT10
 
@@ -216,7 +240,11 @@ Esc     назад / выход
 | `gc routing auto` | native AUTO на поддерживаемых modern-профилях |
 | `gc routing manual` | manual routing |
 | `gc logs` | последние строки Mihomo |
+| `gc logs watchdog 100` | watchdog из RAM |
+| `gc logs boot 100` / `gc logs coldboot 100` | boot/coldboot из RAM |
+| `gc logs install 200` / `gc logs packages 200` | installer/Optware из RAM |
 | `gc logs live mihomo 100` | live log Mihomo |
+| `gc logs clear` | вручную очистить текущие RAM-логи |
 | `gc dashboard` | адрес Zashboard |
 | `gc autostart status` | диагностика автозапуска |
 
@@ -273,7 +301,7 @@ USB содержит только постоянные данные:
     └── state/               # platform/manual-stop и редкие persistent данные
 ```
 
-Часто изменяемый runtime находится только в RAM:
+Часто изменяемый runtime находится только в RAM. Каждый лог ограничен 10 MiB и на USB не сохраняется:
 
 ```text
 /tmp/goshacrash/
