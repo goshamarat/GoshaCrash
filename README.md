@@ -85,6 +85,16 @@ echo 0 > /proc/sys/net/mptcp/mptcp_enabled
 ```
 
 
+### Mihomo `cache.db`: live в RAM, snapshot на USB раз в 3 часа
+
+Mihomo часто обновляет `cache.db` (в том числе runtime/profile/fake-IP state). Живой файл находится в `/tmp/goshacrash/cache.db`; `goshacrash/cache.db` на USB — только symlink на RAM. Поэтому обычные частые записи Mihomo не идут на флешку.
+
+Раз в 3 часа watchdog делает один rolling snapshot RAM-базы в `goshacrash/state/cache.db.snapshot`. Копия берётся в RAM с краткой приостановкой процесса Mihomo только на время RAM→RAM copy, после чего USB-запись выполняется уже при работающем Mihomo. После reboot RAM-cache восстанавливается из последнего snapshot, поэтому теряется максимум примерно 3 часа cache-state при внезапном отключении питания. При обновлении со старой сборки существующий обычный `goshacrash/cache.db` используется как начальный snapshot, а не выбрасывается.
+
+`gc doctor` показывает live RAM path и состояние 3-часового snapshot. Ручной snapshot: `gc cache-save`.
+
+Главный интерактивный экран также обновляет `MIHOMO`/`TUN` примерно раз в секунду, даже если пользователь не нажимает клавиши. Если RAM pidfile потерян, контроллер пытается заново найти именно свой процесс Mihomo по командной строке.
+
 ### Runtime-логи только в RAM, максимум 10 MiB на файл
 
 Все часто изменяемые данные перенесены в RAM (`/tmp`):
@@ -96,9 +106,9 @@ echo 0 > /proc/sys/net/mptcp/mptcp_enabled
 └── state/       # heartbeat, WAN counters, runtime routing state
 ```
 
-Рабочие логи пишутся только в RAM. Каждый отдельный `.log` ограничен 10 MiB: при достижении лимита именно этот RAM-файл очищается и начинает заполняться заново. Таймера очистки нет. Если доступной RAM становится меньше 32 MiB, RAM-логи очищаются досрочно целиком, чтобы не давить на роутер. Watchdog больше не переписывает USB-файл heartbeat каждые 10 секунд. На USB логи не копируются, snapshots и архивы не создаются.
+Рабочие логи пишутся в RAM. Каждый отдельный `.log` ограничен 10 MiB. Раз в 3 часа watchdog сохраняет один rolling snapshot логов на USB (`state/logs-last-3h.txt.gz`, либо plain fallback) и после успешного snapshot очищает текущие RAM-логи, начиная следующий 3-часовой интервал. Heartbeat/PID/lock по-прежнему остаются только в RAM и не пишутся на USB каждые 10 секунд. Если доступной RAM становится меньше 32 MiB, RAM-логи очищаются досрочно.
 
-`gc logs` читает текущие RAM-логи. `gc logs clear` очищает их вручную. После перезагрузки RAM-логи исчезают автоматически. Лимит можно переопределить переменной `GOSHACRASH_LOG_MAX_BYTES`, но production-default — 10485760 байт (10 MiB) на каждый лог.
+`gc logs` читает текущие RAM-логи. `gc logs clear` очищает их вручную, `gc logs flush` принудительно делает rolling USB snapshot. Лимит можно переопределить переменной `GOSHACRASH_LOG_MAX_BYTES`, production-default — 10485760 байт (10 MiB) на каждый лог.
 
 Фоновый runtime GoshaCrash не должен создавать, `touch`-ить, ротировать или обновлять файлы на USB. При монтировании GoshaCrash best-effort включает `noatime,nodiratime`, чтобы даже чтение файлов не порождало лишние atime metadata writes. Persistent USB используется как read-mostly хранилище бинарников, UI, `config.yaml` и install-time state. Исключения только явные действия пользователя: установка/обновление GoshaCrash, `gc edit` (сам `config.yaml`) и операции установки/ремонта Optware-пакетов. `manual-stop` перенесён в `/jffs/goshacrash/manual-stop`, а временный backup перед `gc edit` — в `/tmp/goshacrash/backups`.
 

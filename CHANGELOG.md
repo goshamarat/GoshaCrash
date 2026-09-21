@@ -1,5 +1,23 @@
 # Changelog
 
+### RAM cache + live menu status
+
+- `cache.db` Mihomo больше не хранится как обычный файл на USB: `goshacrash/cache.db` становится symlink на `/tmp/goshacrash/cache.db`, поэтому частые записи cache/profile state уходят в RAM. Старый persistent `cache.db` при чистом старте удаляется, а RAM-cache создаётся заново.
+- Главное меню теперь раз в секунду перепроверяет состояние процесса Mihomo и TUN без полного перерисовывания экрана.
+- `running_pid` умеет заново найти живой Mihomo через `pidof` + `/proc/<pid>/cmdline`, если RAM pidfile потерян/устарел, поэтому статус меньше зависит от состояния pidfile.
+- `gc doctor` показывает, находится ли `cache.db` действительно в RAM.
+
+## 4.0.0 production — 2026-09-21 cache/log 3h persistence
+
+- `cache.db` live writes stay in `/tmp/goshacrash/cache.db`; the USB project path is only a symlink to RAM.
+- Every 3 hours watchdog saves one rolling `state/cache.db.snapshot` to USB. On reboot the RAM cache is restored from that snapshot.
+- Existing pre-update persistent `cache.db` is migrated as the initial snapshot instead of being discarded.
+- Cache snapshot is copied RAM→RAM while Mihomo is briefly stopped, then Mihomo immediately continues while the RAM copy is written to USB.
+- Runtime logs also use one rolling USB snapshot every 3 hours; heartbeat/PID/locks remain RAM-only.
+- `gc cache-save`, `gc logs flush`, `gc storage` and `gc doctor` expose/manual-trigger the snapshot state.
+- Main menu retains the 1-second live MIHOMO/TUN status refresh and PID rediscovery fix.
+- ASUS PControls guard from the previous build is retained.
+
 ## 4.0.0 production
 
 ### ASUS PControls / parental control

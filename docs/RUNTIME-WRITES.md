@@ -1,6 +1,6 @@
 # Runtime write policy
 
-Production goal: GoshaCrash background runtime does not intentionally write files or metadata to the mounted USB filesystem. The mount hook also attempts `noatime,nodiratime` so reads do not cause atime writes.
+Production goal: high-churn runtime writes stay in RAM. GoshaCrash intentionally opens one rolling persistence window every 3 hours for log and Mihomo cache snapshots. The mount hook also attempts `noatime,nodiratime` so normal reads do not cause atime writes.
 
 ## RAM-only paths
 
@@ -8,19 +8,20 @@ Production goal: GoshaCrash background runtime does not intentionally write file
 - `/tmp/goshacrash/run` — PIDs and locks.
 - `/tmp/goshacrash/state` — heartbeat, WAN counters, route/sysctl runtime state.
 - `/tmp/goshacrash/backups` — passive config backup made before `gc edit`.
+- `/tmp/goshacrash/cache.db` — live Mihomo runtime/profile/fake-IP cache; `<USB>/goshacrash/cache.db` is only a symlink to this RAM file.
 - `/tmp/goshacrash-opt` — Optware ABI overlay.
 
-Every `.log` is capped independently at 10 MiB by default. A file is truncated only when its own size reaches the cap, by `gc logs clear`, or by reboot because `/tmp` is volatile. If available RAM drops below 32 MiB, all RAM logs are cleared early. No periodic USB flush exists.
+Every `.log` is capped independently at 10 MiB by default. Once every 3 hours the watchdog writes one rolling log snapshot and one rolling `cache.db` snapshot to USB. After a successful log snapshot the RAM logs are truncated for the next interval. If available RAM drops below 32 MiB, RAM logs are cleared early.
 
 ## Persistent paths
 
-- `<USB>/goshacrash` — binaries, UI, user-owned `config.yaml`, platform/install state. Background runtime treats this tree as read-mostly.
+- `<USB>/goshacrash` — binaries, UI, user-owned `config.yaml`, platform/install state. `cache.db` itself points to RAM; `state/cache.db.snapshot` is the rolling 3-hour restore point. `state/logs-last-3h.txt.gz` (or plain fallback) is the rolling log snapshot.
 - `/jffs/goshacrash/manual-stop` — persistent manual-stop flag; changed only by explicit `gc stop`/`gc start`/`gc restart`.
 - `<USB>/asusware.*` — ASUS Download Master / Optware tree. GoshaCrash runtime verifies it and can bind it to `/opt` without creating probe files or touching USB metadata.
 
-## Explicit operations that can write USB
+## Intentional USB writes
 
-Zero USB writes cannot apply to installation or user-requested modifications. These operations intentionally write persistent storage:
+Background runtime normally reads USB only, except for the scheduled rolling snapshot window once every 3 hours. Installation and user-requested modifications can also write persistent storage:
 
 - `install.sh` / update;
 - editing `config.yaml`;

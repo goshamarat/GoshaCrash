@@ -4,7 +4,7 @@
 # package tools through ASUS Download Master, configuration and autostart.
 
 INSTALLER_VERSION="4.0.0"
-EXPECTED_CONTROLLER_BUILD_ID="2026-09-20-pcontrols-guard-v1"
+EXPECTED_CONTROLLER_BUILD_ID="2026-09-21-pcontrols-cache-3h-snapshots-menu-v3"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -2611,7 +2611,7 @@ HOOK
 
     remove_pre3712_autostart
     install_stock_usb_mount_bridge || return 1
-    ok "Автозапуск установлен; runtime logs/run/heartbeat находятся в /tmp (RAM), каждый RAM-лог ограничен 10 MiB и на USB не сохраняется"
+    ok "Автозапуск установлен; live logs/cache.db работают из /tmp (RAM), rolling snapshots сохраняются на USB раз в 3 часа"
 }
 
 verify_shell_compat(){
@@ -2686,8 +2686,9 @@ save_install_log(){
 cleanup_legacy_usb_runtime_files(){
     # Explicit install/update is allowed to modify persistent files. Runtime is not.
     rm -rf "$BASE/logs" "$BASE/run" "$BASE/state/route" 2>/dev/null || true
-    rm -f "$BASE/state/logs-last-3h.txt.gz" "$BASE/state/logs-last-3h.txt" 2>/dev/null || true
+    # 3h rolling log/cache snapshots are current production state; preserve them across updates.
     rm -f "$BASE/state/wan-offline" "$BASE/state/wan-fail-count" "$BASE/state/wan-ok-count" "$BASE/state/internet.state" "$BASE/state/watchdog-heartbeat" "$BASE/state/autostart-hook-ran" 2>/dev/null || true
+    rm -f "$BASE/cache.db-journal" "$BASE/cache.db-wal" "$BASE/cache.db-shm" 2>/dev/null || true
     rmdir "$BASE/backups" 2>/dev/null || true
 }
 

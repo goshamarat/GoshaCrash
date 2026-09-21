@@ -4,7 +4,7 @@
 # Zashboard updates are triggered from the native button inside Zashboard.
 
 VERSION="4.0.0"
-BUILD_ID="2026-09-20-pcontrols-guard-v1"
+BUILD_ID="2026-09-21-pcontrols-cache-3h-snapshots-menu-v3"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -66,6 +66,12 @@ MIHOMO_LOG="$LOGS/mihomo.log"
 INSTALL_LOG="$LOGS/install.log"
 PACKAGES_LOG="$LOGS/packages.log"
 RAM_BACKUPS="$RUNTIME_ROOT/backups"
+MIHOMO_CACHE_RAM="$RUNTIME_ROOT/cache.db"
+CACHE_SNAPSHOT="$STATE/cache.db.snapshot"
+LOG_SNAPSHOT="$STATE/logs-last-3h.txt.gz"
+LOG_SNAPSHOT_PLAIN="$STATE/logs-last-3h.txt"
+PERSIST_FLUSH_INTERVAL="${GOSHACRASH_PERSIST_FLUSH_INTERVAL:-10800}"
+PERSIST_FLUSH_LAST="$VOLATILE_STATE/persist-flush-last"
 LOG_MAX_BYTES="${GOSHACRASH_LOG_MAX_BYTES:-10485760}"
 LOG_MIN_FREE_KB="${GOSHACRASH_LOG_MIN_FREE_KB:-32768}"
 
@@ -133,6 +139,53 @@ NET_BACKEND=""
 ensure_dirs(){
     mkdir -p "$RUNTIME_ROOT" "$RUN" "$LOGS" "$VOLATILE_STATE" "$ROUTE_STATE" "$RAM_BACKUPS" 2>/dev/null || return 1
     [ -d "$BASE/bin" ] && [ -d "$UI" ] && [ -d "$STATE" ]
+}
+
+# Mihomo writes cache.db very frequently (selected proxies/fake-IP/profile state).
+# The live database stays in RAM. Once per three hours watchdog stores one rolling
+# point-in-time snapshot on USB; after reboot the RAM database is restored from it.
+# Therefore normal cache writes never hit flash, while at most ~3h of cache state
+# is lost after an abrupt power cut.
+mihomo_cache_ram_ready(){
+    [ -L "$BASE/cache.db" ] || return 1
+    target="$(readlink "$BASE/cache.db" 2>/dev/null)"
+    [ "$target" = "$MIHOMO_CACHE_RAM" ] && [ -f "$MIHOMO_CACHE_RAM" ]
+}
+
+restore_mihomo_cache_snapshot(){
+    [ -f "$MIHOMO_CACHE_RAM" ] && return 0
+    [ -s "$CACHE_SNAPSHOT" ] || return 0
+    cp "$CACHE_SNAPSHOT" "$MIHOMO_CACHE_RAM" 2>/dev/null || return 1
+    return 0
+}
+
+ensure_mihomo_cache_ram(){
+    mkdir -p "$RUNTIME_ROOT" 2>/dev/null || return 1
+
+    if [ -L "$BASE/cache.db" ]; then
+        target="$(readlink "$BASE/cache.db" 2>/dev/null)"
+        if [ "$target" = "$MIHOMO_CACHE_RAM" ]; then
+            restore_mihomo_cache_snapshot || return 1
+            return 0
+        fi
+        rm -f "$BASE/cache.db" 2>/dev/null || return 1
+    elif [ -e "$BASE/cache.db" ]; then
+        # One-time migration from older builds: preserve the current cache in RAM
+        # and reuse the old USB file as the first rolling snapshot when possible.
+        [ -f "$MIHOMO_CACHE_RAM" ] || cp "$BASE/cache.db" "$MIHOMO_CACHE_RAM" 2>/dev/null || return 1
+        if [ ! -e "$CACHE_SNAPSHOT" ]; then
+            mv "$BASE/cache.db" "$CACHE_SNAPSHOT" 2>/dev/null || { cp "$BASE/cache.db" "$CACHE_SNAPSHOT" 2>/dev/null || return 1; rm -f "$BASE/cache.db" 2>/dev/null || return 1; }
+        else
+            rm -f "$BASE/cache.db" 2>/dev/null || return 1
+        fi
+    fi
+
+    restore_mihomo_cache_snapshot || return 1
+    # Old sidecars are removed during migration. Current Mihomo cache.db is a
+    # single database file; the live database itself is the RAM symlink target.
+    rm -f "$BASE/cache.db-journal" "$BASE/cache.db-wal" "$BASE/cache.db-shm" 2>/dev/null || true
+    ln -s "$MIHOMO_CACHE_RAM" "$BASE/cache.db" 2>/dev/null || return 1
+    return 0
 }
 now(){ date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date; }
 
@@ -653,11 +706,32 @@ controller_pid_alive(){
 }
 
 running_pid(){
-    [ -f "$PIDFILE" ] || return 1
-    p="$(cat "$PIDFILE" 2>/dev/null)"
-    case "$p" in ''|*[!0-9]*) rm -f "$PIDFILE" 2>/dev/null || true; return 1;; esac
-    pid_matches "$p" "$BIN" || { rm -f "$PIDFILE" 2>/dev/null || true; return 1; }
-    printf '%s\n' "$p"
+    # Fast path: controller-owned PID file.
+    if [ -f "$PIDFILE" ]; then
+        p="$(cat "$PIDFILE" 2>/dev/null)"
+        case "$p" in
+            ''|*[!0-9]*) rm -f "$PIDFILE" 2>/dev/null || true ;;
+            *)
+                if pid_matches "$p" "$BIN" "$CONFIG"; then
+                    printf '%s\n' "$p"
+                    return 0
+                fi
+                rm -f "$PIDFILE" 2>/dev/null || true
+                ;;
+        esac
+    fi
+
+    # Recovery path: the process may have survived a controller/menu restart,
+    # or may have been started manually. Re-discover it instead of displaying
+    # a stale OFFLINE state solely because the RAM pidfile is missing.
+    for p in $(pidof mihomo 2>/dev/null); do
+        if pid_matches "$p" "$BIN" "$CONFIG"; then
+            printf '%s\n' "$p" > "$PIDFILE" 2>/dev/null || true
+            printf '%s\n' "$p"
+            return 0
+        fi
+    done
+    return 1
 }
 
 kill_mihomo(){
@@ -1562,12 +1636,16 @@ start_runtime(){
     check_config || return 1
     ensure_tun || { fail "/dev/net/tun недоступен"; return 1; }
     if p="$(running_pid)"; then
-        if route_start; then
+        if route_start && mihomo_cache_ram_ready; then
             pcontrols_sync startup >/dev/null 2>&1 || true
             say "Mihomo уже работает, PID=$p; runtime проверен"
             return 0
         fi
-        warn "Mihomo PID=$p есть, но runtime неполный; выполняю чистый перезапуск ядра"
+        if ! mihomo_cache_ram_ready; then
+            warn "Mihomo cache.db ещё на USB; выполняю одноразовый чистый перезапуск для переноса cache.db в RAM"
+        else
+            warn "Mihomo PID=$p есть, но runtime неполный; выполняю чистый перезапуск ядра"
+        fi
         kill_mihomo
         sleep 1
     fi
@@ -1577,6 +1655,7 @@ start_runtime(){
 
     [ "$ROUTING_MODE" = manual ] && route_stop >/dev/null 2>&1 || true
     kill_mihomo
+    ensure_mihomo_cache_ram || { fail "Не удалось перенести Mihomo cache.db в RAM"; return 1; }
     cap_ram_log "$MIHOMO_LOG"
     log_event INFO runtime "starting $BIN with $CONFIG"
     nohup_bin="$(find_nohup 2>/dev/null)"
@@ -1860,11 +1939,13 @@ watchdog_loop(){
     printf '%s pid=%s\n' "$(now)" "$$" > "$WATCHDOG_HEARTBEAT" 2>/dev/null || true
     watchdog_check
     enforce_ram_log_limits
+    maybe_flush_ram_state
     while :; do
         sleep "$WATCHDOG_INTERVAL"
         printf '%s pid=%s\n' "$(now)" "$$" > "$WATCHDOG_HEARTBEAT" 2>/dev/null || true
         watchdog_check
         enforce_ram_log_limits
+        maybe_flush_ram_state
     done
 }
 
@@ -2405,6 +2486,144 @@ uptime_seconds(){
     awk '{print int($1)}' /proc/uptime 2>/dev/null
 }
 
+persist_flush_mark_now(){
+    u="$(uptime_seconds)"
+    case "$u" in ''|*[!0-9]*) return 1;; esac
+    printf '%s\n' "$u" > "$PERSIST_FLUSH_LAST" 2>/dev/null || return 1
+    return 0
+}
+
+truncate_ram_logs_after_flush(){
+    for f in "$LOGS"/*.log; do
+        [ -f "$f" ] || continue
+        : > "$f" 2>/dev/null || true
+    done
+    rm -f "$LOGS"/*.log.1 "$LOGS"/*.log.2 "$LOGS"/*.log.3 2>/dev/null || true
+}
+
+flush_ram_logs_to_usb(){
+    ensure_dirs || return 1
+    refresh_storage_identity >/dev/null 2>&1 || true
+    storage_space_ok || { log_event WARN storage "3h log snapshot skipped: USB free-space guard failed"; return 1; }
+    usb_kernel_fs_errors && { log_event WARN storage "3h log snapshot skipped: kernel reports USB filesystem errors"; return 1; }
+
+    tmp="$RUNTIME_ROOT/logs-snapshot.$$"
+    tmpgz="$tmp.gz"
+    : > "$tmp" 2>/dev/null || return 1
+    found=0
+    for f in "$LOGS"/*.log "$LOGS"/*.log.1 "$LOGS"/*.log.2 "$LOGS"/*.log.3; do
+        [ -f "$f" ] || continue
+        found=1
+        printf '\n===== %s =====\n' "${f##*/}" >> "$tmp" 2>/dev/null || true
+        cat "$f" >> "$tmp" 2>/dev/null || true
+    done
+    if [ "$found" -ne 1 ] || [ ! -s "$tmp" ]; then
+        rm -f "$tmp" "$tmpgz" 2>/dev/null || true
+        return 0
+    fi
+
+    gzip_bin="$(command -v gzip 2>/dev/null)"
+    if [ -n "$gzip_bin" ] && [ -x "$gzip_bin" ] && "$gzip_bin" -c "$tmp" > "$tmpgz" 2>/dev/null; then
+        new="$LOG_SNAPSHOT.new"
+        rm -f "$new" 2>/dev/null || true
+        if cp "$tmpgz" "$new" 2>/dev/null && mv -f "$new" "$LOG_SNAPSHOT" 2>/dev/null; then
+            rm -f "$LOG_SNAPSHOT_PLAIN" 2>/dev/null || true
+        else
+            rm -f "$tmp" "$tmpgz" "$new" 2>/dev/null || true
+            log_event WARN storage "3h log snapshot write failed"
+            return 1
+        fi
+    else
+        new="$LOG_SNAPSHOT_PLAIN.new"
+        rm -f "$new" 2>/dev/null || true
+        if cp "$tmp" "$new" 2>/dev/null && mv -f "$new" "$LOG_SNAPSHOT_PLAIN" 2>/dev/null; then
+            rm -f "$LOG_SNAPSHOT" 2>/dev/null || true
+        else
+            rm -f "$tmp" "$tmpgz" "$new" 2>/dev/null || true
+            log_event WARN storage "3h log snapshot write failed"
+            return 1
+        fi
+    fi
+    rm -f "$tmp" "$tmpgz" 2>/dev/null || true
+    truncate_ram_logs_after_flush
+    log_event INFO storage "RAM logs saved to rolling USB snapshot; next automatic save in 3h"
+    return 0
+}
+
+cache_ram_copy_consistent(){
+    out="$1"
+    [ -s "$MIHOMO_CACHE_RAM" ] || return 1
+    p="$(running_pid 2>/dev/null)"
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+        # Freeze only while copying RAM -> RAM. USB write happens after CONT,
+        # so the proxy pause is normally only a few milliseconds.
+        (
+            stopped=0
+            cache_resume(){ [ "$stopped" = 1 ] && kill -CONT "$p" 2>/dev/null || true; }
+            trap 'cache_resume; exit 1' HUP INT TERM
+            if kill -STOP "$p" 2>/dev/null; then stopped=1; fi
+            cp "$MIHOMO_CACHE_RAM" "$out" 2>/dev/null
+            rc=$?
+            cache_resume
+            trap - HUP INT TERM
+            exit "$rc"
+        ) || return 1
+    else
+        cp "$MIHOMO_CACHE_RAM" "$out" 2>/dev/null || return 1
+    fi
+    [ -s "$out" ]
+}
+
+flush_mihomo_cache_to_usb(){
+    ensure_dirs || return 1
+    [ -s "$MIHOMO_CACHE_RAM" ] || return 0
+    refresh_storage_identity >/dev/null 2>&1 || true
+    storage_space_ok || { log_event WARN storage "3h cache.db snapshot skipped: USB free-space guard failed"; return 1; }
+    usb_kernel_fs_errors && { log_event WARN storage "3h cache.db snapshot skipped: kernel reports USB filesystem errors"; return 1; }
+
+    tmp="$RUNTIME_ROOT/cache-snapshot.$$"
+    rm -f "$tmp" 2>/dev/null || true
+    cache_ram_copy_consistent "$tmp" || { rm -f "$tmp" 2>/dev/null || true; log_event WARN storage "3h cache.db RAM snapshot failed"; return 1; }
+
+    new="$CACHE_SNAPSHOT.new"
+    rm -f "$new" 2>/dev/null || true
+    if cp "$tmp" "$new" 2>/dev/null && mv -f "$new" "$CACHE_SNAPSHOT" 2>/dev/null; then
+        rm -f "$tmp" 2>/dev/null || true
+        log_event INFO storage "Mihomo cache.db saved from RAM to rolling USB snapshot; next automatic save in 3h"
+        return 0
+    fi
+    rm -f "$tmp" "$new" 2>/dev/null || true
+    log_event WARN storage "3h cache.db USB snapshot write failed"
+    return 1
+}
+
+flush_ram_state_to_usb(){
+    # One scheduled wake-up/write window for both high-churn RAM datasets.
+    # Cache first because fake-IP/profile state is more useful after reboot.
+    rc=0
+    flush_mihomo_cache_to_usb || rc=1
+    flush_ram_logs_to_usb || rc=1
+    return "$rc"
+}
+
+maybe_flush_ram_state(){
+    interval="$PERSIST_FLUSH_INTERVAL"
+    case "$interval" in ''|*[!0-9]*|0) interval=10800;; esac
+    u="$(uptime_seconds)"
+    case "$u" in ''|*[!0-9]*) return 0;; esac
+    last="$(cat "$PERSIST_FLUSH_LAST" 2>/dev/null)"
+    case "$last" in
+        ''|*[!0-9]*) printf '%s\n' "$u" > "$PERSIST_FLUSH_LAST" 2>/dev/null || true; return 0;;
+    esac
+    elapsed=$((u - last))
+    [ "$elapsed" -ge "$interval" ] || return 0
+
+    # Mark before USB I/O: on a bad filesystem do not hammer flash every 10s.
+    printf '%s\n' "$u" > "$PERSIST_FLUSH_LAST" 2>/dev/null || true
+    flush_ram_state_to_usb >/dev/null 2>&1 || true
+    return 0
+}
+
 clear_ram_logs(){
     ensure_dirs || return 1
     for f in "$LOGS"/*.log; do
@@ -2635,6 +2854,19 @@ menu_read_byte_timeout(){
     printf '%s' "$_gc_byte"
 }
 
+menu_read_byte_poll(){
+    # One-second idle timeout lets the main screen refresh MIHOMO/TUN state
+    # even when the user does not press a key. It does not redraw the menu.
+    menu_stty -echo -icanon min 0 time 10 >/dev/null 2>&1 || return 1
+    if [ "$MENU_TTY_MODE" = "devtty" ]; then
+        _gc_poll_byte="$(dd if=/dev/tty bs=1 count=1 2>/dev/null)"
+    else
+        _gc_poll_byte="$(dd bs=1 count=1 2>/dev/null)"
+    fi
+    menu_stty -echo -icanon min 1 time 0 >/dev/null 2>&1 || true
+    printf '%s' "$_gc_poll_byte"
+}
+
 menu_pause(){
     printf '\n\033[2mPress any key to return...\033[0m'
     pause_stty="$(menu_stty -g 2>/dev/null)"
@@ -2729,6 +2961,8 @@ menu_draw(){
     printf '\033[0m'
     core_state="$(menu_state_core)"
     tun_state="$(menu_state_tun)"
+    MENU_LAST_CORE="$core_state"
+    MENU_LAST_TUN="$tun_state"
     printf '│  MIHOMO: '
     menu_print_state "$core_state" 10
     printf '  TUN: '
@@ -2752,6 +2986,21 @@ menu_draw(){
     printf '\033[0m'
 }
 
+menu_refresh_status_line(){
+    core_state="$(menu_state_core)"
+    tun_state="$(menu_state_tun)"
+    [ "$core_state" = "${MENU_LAST_CORE:-}" ] && [ "$tun_state" = "${MENU_LAST_TUN:-}" ] && return 0
+    MENU_LAST_CORE="$core_state"
+    MENU_LAST_TUN="$tun_state"
+    printf '\033[5;1H'
+    printf '│  MIHOMO: '
+    menu_print_state "$core_state" 10
+    printf '  TUN: '
+    menu_print_state "$tun_state" 6
+    printf '          │'
+    printf '\033[16;1H'
+}
+
 menu_read_key(){
     k="$(menu_read_byte)"
     case "$k" in
@@ -2768,6 +3017,34 @@ menu_read_key(){
             echo other
             ;;
         ''|"$(printf '\r')"|"$(printf '\n')") echo enter ;;
+        *) echo other ;;
+    esac
+}
+
+menu_read_key_poll(){
+    # Append a non-newline sentinel inside command substitution. Without it a
+    # literal LF (Enter on some SSH terminals) is stripped by $(...), making
+    # Enter indistinguishable from a one-second timeout.
+    raw="$(menu_read_byte_poll; printf '__GC_END__')"
+    [ "$raw" = "__GC_END__" ] && { echo timeout; return; }
+    k="${raw%__GC_END__}"
+
+    lf="$(printf '\nX')"
+    lf="${lf%X}"
+    [ "$k" = "$lf" ] && { echo enter; return; }
+
+    case "$k" in
+        "$(printf '\033')")
+            k2="$(menu_read_byte_timeout)"
+            [ -z "$k2" ] && { echo quit; return; }
+            if [ "$k2" = "[" ]; then
+                k3="$(menu_read_byte_timeout)"
+                [ "$k3" = A ] && { echo up; return; }
+                [ "$k3" = B ] && { echo down; return; }
+            fi
+            echo other
+            ;;
+        "$(printf '\r')") echo enter ;;
         *) echo other ;;
     esac
 }
@@ -2907,8 +3184,11 @@ menu(){
     menu_draw "$selected"
 
     while :; do
-        key="$(menu_read_key)"
+        key="$(menu_read_key_poll)"
         case "$key" in
+            timeout)
+                menu_refresh_status_line
+                ;;
             up)
                 old_selected="$selected"
                 selected=$((selected - 1))
@@ -3076,6 +3356,19 @@ doctor(){
     else
         echo "  config UTF-8: UNKNOWN (od unavailable)"
     fi
+    echo "  Mihomo cache runtime: $MIHOMO_CACHE_RAM (RAM, live writes)"
+    if mihomo_cache_ram_ready; then
+        echo "  Mihomo cache USB path: SYMLINK -> RAM"
+    elif [ -e "$BASE/cache.db" ] || [ -L "$BASE/cache.db" ]; then
+        echo "  Mihomo cache USB path: FAIL (persistent live cache.db)"
+    else
+        echo "  Mihomo cache USB path: pending first start"
+    fi
+    if [ -s "$CACHE_SNAPSHOT" ]; then
+        echo "  Mihomo cache snapshot: $CACHE_SNAPSHOT (rolling, every 3h)"
+    else
+        echo "  Mihomo cache snapshot: not written yet (every 3h)"
+    fi
     tun_kernel_ready && echo "  kernel TUN (/dev/net/tun): OK" || echo "  kernel TUN (/dev/net/tun): FAIL"
     if running_pid >/dev/null 2>&1; then
         echo "  Mihomo process: OK"
@@ -3167,9 +3460,15 @@ doctor(){
     fi
     echo "  runtime logs: $LOGS (RAM, max 10 MiB per log)"
     echo "  RAM available: $(ram_available_kb)KB; low-RAM log purge threshold: ${LOG_MIN_FREE_KB}KB"
-    echo "  persistent logs on USB: disabled"
+    if [ -s "$LOG_SNAPSHOT" ]; then
+        echo "  log snapshot: $LOG_SNAPSHOT (rolling, every 3h)"
+    elif [ -s "$LOG_SNAPSHOT_PLAIN" ]; then
+        echo "  log snapshot: $LOG_SNAPSHOT_PLAIN (rolling, every 3h)"
+    else
+        echo "  log snapshot: not written yet (every 3h)"
+    fi
     if usb_noatime_ok; then echo "  USB noatime: OK"; else echo "  USB noatime: NOT SET (runtime attempts best-effort remount)"; fi
-    echo "  background USB writes by GoshaCrash: disabled (install/update/config/package actions are explicit exceptions)"
+    echo "  background USB writes by GoshaCrash: rolling log + cache snapshots once every 3h"
 
     if usb_metadata_probe_runtime; then
         echo "  USB metadata probe: OK"
@@ -3288,6 +3587,12 @@ LIVE MIHOMO
 
 ОЧИСТИТЬ RAM-ЛОГИ СЕЙЧАС
   gc logs clear
+
+СОХРАНИТЬ RAM-ЛОГИ В ROLLING SNAPSHOT СЕЙЧАС
+  gc logs flush
+
+СОХРАНИТЬ cache.db ИЗ RAM НА USB СЕЙЧАС
+  gc cache-save
 
 ЛОГ MIHOMO ВРУЧНУЮ
   BASE="$(gc base)"
@@ -3515,6 +3820,14 @@ case "$GC_COMMAND" in
         fi
         pcontrols_status
         ;;
+    cache-save)
+        if flush_mihomo_cache_to_usb; then
+            echo "Mihomo cache.db saved from RAM to USB snapshot"
+        else
+            echo "cache.db snapshot failed; check gc storage / gc doctor" >&2
+            exit 1
+        fi
+        ;;
     routing)
         shift
         case "${1:-status}" in
@@ -3529,9 +3842,11 @@ case "$GC_COMMAND" in
         echo "USB: ${USB_DEVICE:-?} -> $USB_MOUNT (${USB_FS:-?})"
         df -h "$USB_MOUNT" 2>/dev/null || true
         if dlna_kb="$(minidlna_size_kb 2>/dev/null)"; then echo ".minidlna: ${dlna_kb}KB"; else echo ".minidlna: not present"; fi
-        echo "persistent logs on USB: disabled"
-        echo "background USB writes by GoshaCrash: disabled"
-        echo "RAM logs: $LOGS (max 10 MiB per log; size/low-RAM/manual/reboot cleanup only)"
+        if [ -s "$LOG_SNAPSHOT" ]; then echo "log snapshot: $LOG_SNAPSHOT (rolling, every 3h)"; elif [ -s "$LOG_SNAPSHOT_PLAIN" ]; then echo "log snapshot: $LOG_SNAPSHOT_PLAIN (rolling, every 3h)"; else echo "log snapshot: not written yet (every 3h)"; fi
+        if [ -s "$CACHE_SNAPSHOT" ]; then echo "cache.db snapshot: $CACHE_SNAPSHOT (rolling, every 3h)"; else echo "cache.db snapshot: not written yet (every 3h)"; fi
+        echo "background USB writes by GoshaCrash: one scheduled snapshot window every 3h"
+        echo "RAM logs: $LOGS (max 10 MiB per log; truncated after successful 3h snapshot)"
+        echo "RAM cache.db: $MIHOMO_CACHE_RAM (live writes stay in RAM)"
         echo "RAM available: $(ram_available_kb)KB"
         if usb_noatime_ok; then echo "USB noatime: OK"; else echo "USB noatime: NOT SET"; fi
         if usb_kernel_fs_errors; then echo "filesystem kernel log: ERRORS DETECTED - offline fsck required"; else echo "filesystem kernel log: no current errors"; fi
@@ -3548,8 +3863,12 @@ case "$GC_COMMAND" in
                 echo "RAM logs cleared"
                 ;;
             flush)
-                clear_ram_logs
-                echo "RAM logs cleared; no persistent USB log snapshots are used"
+                if flush_ram_logs_to_usb; then
+                    echo "RAM logs saved to rolling USB snapshot"
+                else
+                    echo "Log snapshot failed; check gc storage / gc doctor" >&2
+                    exit 1
+                fi
                 ;;
             *) show_logs "${1:-mihomo}" "${2:-100}" ;;
         esac
