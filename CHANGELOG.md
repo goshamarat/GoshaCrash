@@ -1,3 +1,9 @@
+## 4.0.0 production hotfix — 2026-09-21 Logs menu flicker
+
+- Fixed SSH terminal flicker in the Logs submenu: Up/Down now repaints only the old and new selection rows instead of clearing and redrawing the whole screen.
+- Full-screen redraw remains only when entering Logs or returning from an opened log view.
+- Mihomo latest-resolution, cache-lock cleanup and all routing/PControls logic are unchanged.
+
 ## 4.0.0 production hotfix — 2026-09-21 latest Mihomo + cache lock cleanup
 
 - Modern installs now resolve MetaCubeX/mihomo `releases/latest` at install time instead of pinning v1.19.30; current stable is v1.19.31.

@@ -4,7 +4,7 @@
 # Zashboard updates are triggered from the native button inside Zashboard.
 
 VERSION="4.0.0"
-BUILD_ID="2026-09-21-latest-mihomo-cache-lockfix"
+BUILD_ID="2026-09-21-latest-mihomo-cache-lockfix-menu-noflicker"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -3081,6 +3081,42 @@ menu_read_key_poll(){
     esac
 }
 
+menu_logs_item_label(){
+    case "$1" in
+        1) printf 'Mihomo: last 100 lines' ;;
+        2) printf 'Mihomo: live' ;;
+        3) printf 'GoshaCrash controller' ;;
+        4) printf 'Watchdog' ;;
+        5) printf 'Boot' ;;
+        6) printf 'Coldboot' ;;
+        7) printf 'Installer' ;;
+        8) printf 'Packages' ;;
+        9) printf 'Clear all RAM logs' ;;
+        *) printf '' ;;
+    esac
+}
+
+menu_logs_repaint_item(){
+    current="$1"
+    number="$2"
+    # LOGS has three header rows, so item 1 starts on terminal row 4.
+    row=$((3 + number))
+    label="$(menu_logs_item_label "$number")"
+    printf '\033[%s;1H' "$row"
+    menu_item_render "$current" "$number" "$label"
+}
+
+menu_logs_repaint_selection(){
+    old_selected="$1"
+    new_selected="$2"
+    [ "$old_selected" -eq "$new_selected" ] && return 0
+    # Repaint only the two rows whose selection marker changed.  Clearing and
+    # redrawing the full screen here causes very visible flicker over SSH.
+    menu_logs_repaint_item "$new_selected" "$old_selected"
+    menu_logs_repaint_item "$new_selected" "$new_selected"
+    printf '\033[16;1H'
+}
+
 menu_logs_draw(){
     log_selected="$1"
     printf '\033[?25l\033[2J\033[H'
@@ -3105,6 +3141,7 @@ menu_logs_draw(){
     printf '\033[1;36m'
     printf '└───────────────────────────────────────────┘\n'
     printf '\033[0m'
+    printf '\033[16;1H'
 }
 
 menu_logs(){
@@ -3127,14 +3164,16 @@ menu_logs(){
         log_key="$(menu_read_key)"
         case "$log_key" in
             up)
+                log_old_selected="$log_selected"
                 log_selected=$((log_selected - 1))
                 [ "$log_selected" -lt 1 ] && log_selected=$log_items_count
-                menu_logs_draw "$log_selected"
+                menu_logs_repaint_selection "$log_old_selected" "$log_selected"
                 ;;
             down)
+                log_old_selected="$log_selected"
                 log_selected=$((log_selected + 1))
                 [ "$log_selected" -gt "$log_items_count" ] && log_selected=1
-                menu_logs_draw "$log_selected"
+                menu_logs_repaint_selection "$log_old_selected" "$log_selected"
                 ;;
             quit)
                 break
