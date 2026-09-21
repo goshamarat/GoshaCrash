@@ -1,3 +1,11 @@
+## 4.0.0 production hotfix — 2026-09-21 PControls live block
+
+- ASUS' original `FORWARD -> PControls` rules are promoted unchanged to the first FORWARD positions, before generic `RELATED,ESTABLISHED` accepts and before Mihomo hooks.
+- The watchdog now tracks the PControls policy/rule snapshot as well as client membership, so toggling a block for an already-managed client is detected.
+- On an actual PControls policy change, GoshaCrash flushes Broadcom flow-cache once (per MAC where supported, global fallback otherwise) and restarts Mihomo once; hardware acceleration is not disabled persistently.
+- RT-AC68U source-IP selectors (`-s <client>/32`) are preserved. This fixes the previous widening of an IP-only selector into an unconditional `-i br0 -j RETURN`, which could bypass Mihomo for the whole LAN.
+- Native auto-redirect bypass remains limited to selectors ASUS actually sends to PControls.
+
 ## 4.0.0 production hotfix — 2026-09-21 Logs menu flicker
 
 - Fixed SSH terminal flicker in the Logs submenu: Up/Down now repaints only the old and new selection rows instead of clearing and redrawing the whole screen.

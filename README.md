@@ -142,15 +142,16 @@ https://ghproxy.net/github.com/MetaCubeX/mihomo/releases/download/<VERSION>/miho
 
 ### Родительский контроль ASUS (`PControls`)
 
-На stock ASUSWRT родительский контроль создаёт цепочку `PControls` динамически: если клиентов нет, цепочки может не быть вообще. GoshaCrash не создаёт и не переписывает её.
+На stock ASUSWRT родительский контроль создаёт цепочку `PControls` динамически: если клиентов нет, цепочки может не быть вообще. GoshaCrash не создаёт и не переписывает саму цепочку `PControls` — содержимое и условия блокировки остаются штатными ASUS.
 
 Когда ASUS добавляет правила вида `FORWARD ... -j PControls`, GoshaCrash автоматически:
 
-- оставляет штатные правила ASUS владельцем всей логики блокировки;
-- держит `mihomo-forward` и собственный manual FORWARD hook **после** последнего `PControls`;
-- для клиентов, которых ASUS направил в PControls, добавляет ранний `RETURN` в `mihomo-prerouting`, чтобы `auto-redirect` не уводил их TCP/DNS в локальный Mihomo раньше штатного `FORWARD`;
-- watchdog повторяет проверку после старта, рестарта Mihomo и последующих изменений firewall;
-- при изменении списка PControls-клиентов один раз перезапускает Mihomo, чтобы закрыть уже существующие long-lived redirect-сессии.
+- переносит **оригинальные правила ASUS `FORWARD -> PControls` без изменения их условий** в первые позиции `FORWARD`, то есть до generic `RELATED,ESTABLISHED` и до Mihomo;
+- держит `mihomo-forward` и собственный manual FORWARD hook после всех штатных `PControls`;
+- сохраняет точные селекторы ASUS: интерфейс, MAC и/или source IP. Правило вида `-s 192.168.1.x/32 -j PControls` больше не расширяется до всего `br0`;
+- для этих же селекторов добавляет ранний `RETURN` в `mihomo-prerouting`, чтобы native `auto-redirect` не уводил TCP в локальный Mihomo раньше штатного `FORWARD`;
+- watchdog отслеживает не только список клиентов, но и изменение самой политики/правил `PControls`;
+- при реальном изменении PControls один раз сбрасывает аппаратный flow-cache (по MAC, если это поддерживается, иначе общим `flush`) и один раз перезапускает Mihomo, чтобы уже активные/ускоренные соединения не продолжали жить по старому решению. Flow Cache/CTF постоянно не отключается.
 
 Проверка вручную:
 
@@ -158,7 +159,7 @@ https://ghproxy.net/github.com/MetaCubeX/mihomo/releases/download/<VERSION>/miho
 gc pcontrols
 ```
 
-В норме при активном родительском контроле вывод содержит `PControls FORWARD priority: OK (before Mihomo)` и, при native auto-redirect, `PControls auto-redirect bypass: OK`. Если ASUS ещё не создал цепочку, `NOT PRESENT/NO CLIENTS` является нормальным состоянием.
+В норме при активном родительском контроле вывод содержит `PControls FORWARD priority: OK (FIRST, before ESTABLISHED/Mihomo)` и, при native auto-redirect, `PControls auto-redirect bypass: OK`. Если ASUS ещё не создал цепочку, `NOT PRESENT/NO CLIENTS` является нормальным состоянием. Watchdog проверяет PControls каждые 10 секунд по умолчанию.
 
 ### Native AUTO на BT10
 

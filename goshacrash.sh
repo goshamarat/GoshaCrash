@@ -4,7 +4,7 @@
 # Zashboard updates are triggered from the native button inside Zashboard.
 
 VERSION="4.0.0"
-BUILD_ID="2026-09-21-latest-mihomo-cache-lockfix-menu-noflicker"
+BUILD_ID="2026-09-21-pcontrols-first-live-block"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -103,13 +103,14 @@ FORWARD_CHAIN="GOSHACRASH_TUN_FORWARD"
 DNS_LAN_CHAIN="GOSHACRASH_DNS_LAN"
 DNS_OUT_CHAIN="GOSHACRASH_DNS_OUT"
 
-# ASUS parental-control compatibility.  ASUS owns the PControls chain and its
-# contents.  GoshaCrash never creates or edits PControls itself: it only keeps
-# its own forwarding hooks behind the stock PControls jump and bypasses
-# Mihomo's early NAT redirect for clients that ASUS has attached to PControls.
-# State is volatile on purpose; it lives in /tmp and disappears on reboot.
+# ASUS parental-control compatibility. ASUS owns the PControls chain and its
+# contents. GoshaCrash never edits PControls itself: it promotes ASUS' original
+# FORWARD->PControls jumps to the first FORWARD positions, keeps its own/Mihomo
+# hooks behind them, and bypasses Mihomo's early NAT redirect only for selectors
+# ASUS actually attached to PControls. State is volatile and lives in /tmp.
 PCONTROLS_STATE="$VOLATILE_STATE/pcontrols"
 PCONTROLS_CLIENTS="$PCONTROLS_STATE/clients"
+PCONTROLS_POLICY="$PCONTROLS_STATE/policy"
 
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-production}"
@@ -1022,23 +1023,101 @@ delete_chain(){ table="$1"; chain="$2"; ipt -t "$table" -F "$chain" 2>/dev/null 
 # Collect only the selectors ASUS itself uses to enter PControls from FORWARD.
 # Current stock ASUSWRT uses: -i <LAN> -m mac --mac-source <MAC> -j PControls.
 # If a future firmware omits the MAC selector, '*' deliberately means the whole
-# matching input interface.  This is safer than allowing Mihomo to bypass a
-# stock parental-control rule that we do not fully understand.
+# matching input interface. Source-IP selectors are preserved as well; this is
+# critical on RT-AC68U time scheduling, where ASUS may emit -s <client>/32
+# without --mac-source.
 pcontrols_collect_clients(){
     out="$1"
     : > "$out" || return 1
     ipt -t filter -S PControls >/dev/null 2>&1 || return 0
     ipt -t filter -S FORWARD 2>/dev/null | awk '
         $1=="-A" && $2=="FORWARD" {
-            iface="*"; mac="*"; hit=0
+            iface="*"; mac="*"; src="*"; hit=0
             for (i=3; i<=NF; i++) {
                 if ($i=="-i" && i<NF) iface=$(i+1)
+                if (($i=="-s" || $i=="--source") && i<NF) src=$(i+1)
                 if ($i=="--mac-source" && i<NF) mac=toupper($(i+1))
                 if (($i=="-j" || $i=="--jump") && i<NF && $(i+1)=="PControls") hit=1
             }
-            if (hit) print iface "|" mac
+            if (hit) print iface "|" mac "|" src
         }
     ' | awk '!seen[$0]++' > "$out"
+}
+
+# Snapshot the stock ASUS policy that can change while the same client stays
+# managed (for example Block Internet on/off or a rebuilt time schedule).  The
+# volatile snapshot is used only to detect a change; ASUS remains source of truth.
+pcontrols_capture_policy(){
+    out="$1"
+    : > "$out" || return 1
+    if ipt -t filter -S PControls >/dev/null 2>&1; then
+        ipt -t filter -S PControls 2>/dev/null >> "$out" || return 1
+    fi
+    ipt -t filter -S FORWARD 2>/dev/null | awk '
+        $1=="-A" && $2=="FORWARD" {
+            for (i=3; i<=NF; i++) {
+                if (($i=="-j" || $i=="--jump") && i<NF && $(i+1)=="PControls") { print; break }
+            }
+        }
+    ' >> "$out"
+    if ipt -t nat -S PCREDIRECT >/dev/null 2>&1; then
+        ipt -t nat -S PCREDIRECT 2>/dev/null >> "$out" || true
+        ipt -t nat -S PREROUTING 2>/dev/null | awk '
+            $1=="-A" && $2=="PREROUTING" {
+                for (i=3; i<=NF; i++) {
+                    if (($i=="-j" || $i=="--jump") && i<NF && $(i+1)=="PCREDIRECT") { print; break }
+                }
+            }
+        ' >> "$out"
+    fi
+}
+
+find_flowcache_ctl(){
+    for p in /bin/fcctl /usr/bin/fcctl /usr/sbin/fcctl /sbin/fcctl /bin/fc /usr/bin/fc /usr/sbin/fc /sbin/fc; do
+        [ -x "$p" ] && { printf '%s
+' "$p"; return 0; }
+    done
+    return 1
+}
+
+# Broadcom flow acceleration can keep an already-established flow away from
+# netfilter even after ASUS changed PControls.  Flush only when the policy
+# actually changes.  Prefer a surgical per-MAC flush; fall back to one global
+# flush when firmware exposes only the old interface.  Never disable FC/CTF.
+pcontrols_flush_flowcache_file(){
+    file="$1"
+    ctl="$(find_flowcache_ctl 2>/dev/null)" || return 0
+    help="$($ctl 2>&1 | head -n 80)"
+    per_mac=0
+    printf '%s\n' "$help" | grep -q -- '--mac' && per_mac=1
+
+    flushed=0
+    need_global=0
+    if [ "$per_mac" = 1 ]; then
+        while IFS='|' read -r iface mac src; do
+            [ -n "$src" ] || src="*"
+            if [ -n "$mac" ] && [ "$mac" != "*" ]; then
+                if "$ctl" flush --mac "$mac" >/dev/null 2>&1; then
+                    flushed=1
+                    log_event INFO pcontrols "flow-cache flushed for parental-control MAC $mac"
+                else
+                    need_global=1
+                fi
+            else
+                # Some RT-AC68U scheduling rules select by source IPv4 only.
+                # fcctl has no portable per-IP flush across ASUS generations.
+                need_global=1
+            fi
+        done < "$file"
+    else
+        need_global=1
+    fi
+    if [ "$need_global" = 1 ] || [ "$flushed" = 0 ]; then
+        if "$ctl" flush >/dev/null 2>&1; then
+            log_event INFO pcontrols "flow-cache flushed after ASUS PControls change"
+        fi
+    fi
+    return 0
 }
 
 pcontrols_last_forward_pos(){
@@ -1050,8 +1129,95 @@ pcontrols_target_forward_pos(){
     ipt -t filter -L FORWARD --line-numbers -n 2>/dev/null | awk -v t="$target" '$2==t{print $1; exit}'
 }
 
-# Keep only GoshaCrash/Mihomo hooks behind the last stock PControls rule.  ASUS
-# rules are never copied, deleted or rewritten here.
+pcontrols_collect_forward_specs(){
+    out="$1"
+    : > "$out" || return 1
+    ipt -t filter -S FORWARD 2>/dev/null | awk '
+        $1=="-A" && $2=="FORWARD" {
+            hit=0
+            for (i=3; i<=NF; i++) {
+                if (($i=="-j" || $i=="--jump") && i<NF && $(i+1)=="PControls") { hit=1; break }
+            }
+            if (hit) {
+                sub(/^-A[[:space:]]+FORWARD[[:space:]]+/, "")
+                print
+            }
+        }
+    ' > "$out"
+}
+
+pcontrols_forward_first_ok(){
+    # Every ASUS jump to PControls must occupy positions 1..N, with no
+    # ESTABLISHED/ACCEPT/Mihomo rule in front of it.  This matters for clients
+    # that were already online when ASUS changes their parental-control state.
+    ipt -t filter -L FORWARD --line-numbers -n 2>/dev/null | awk '
+        $2=="PControls" { n++; if (($1 + 0) != n) bad=1 }
+        END { exit (n > 0 && !bad) ? 0 : 1 }
+    '
+}
+
+# Promote the *original* ASUS FORWARD->PControls rules to the beginning of
+# FORWARD without changing their match expressions.  In particular, old
+# RT-AC68U firmware may put --weekdays/--timestart/--timestop on these rules,
+# while newer ASUSWRT may use simple per-MAC jumps.  We preserve both forms.
+pcontrols_promote_stock_first(){
+    tmp="$PCONTROLS_STATE/forward.$$"
+    mkdir -p "$PCONTROLS_STATE" 2>/dev/null || return 1
+    pcontrols_collect_forward_specs "$tmp" || { rm -f "$tmp"; return 1; }
+    [ -s "$tmp" ] || { rm -f "$tmp"; return 0; }
+    pcontrols_forward_first_ok && { rm -f "$tmp"; return 0; }
+
+    total="$(wc -l < "$tmp" 2>/dev/null | tr -d ' ')"
+    case "$total" in ''|*[!0-9]*|0) rm -f "$tmp"; return 0;; esac
+
+    inserted=0
+    pos=1
+    while IFS= read -r spec; do
+        [ -n "$spec" ] || continue
+        # ASUS-generated PControls rules use whitespace-delimited iptables
+        # arguments (interfaces, MACs and xt_time options).  Disable pathname
+        # expansion so values can be passed back verbatim without eval.
+        set -f
+        # shellcheck disable=SC2086
+        set -- $spec
+        set +f
+        if ! ipt -t filter -I FORWARD "$pos" "$@" 2>/dev/null; then
+            # Roll back only the rules inserted by this attempt.  They occupy
+            # the first positions, so the original ASUS ordering is restored.
+            while [ "$inserted" -gt 0 ]; do
+                ipt -t filter -D FORWARD 1 >/dev/null 2>&1 || break
+                inserted=$((inserted - 1))
+            done
+            rm -f "$tmp"
+            return 1
+        fi
+        inserted=$((inserted + 1))
+        pos=$((pos + 1))
+    done < "$tmp"
+
+    # We inserted an exact duplicate set at the top.  Remove the old copies
+    # from the bottom by line number.  If ASUS rebuilds FORWARD concurrently,
+    # never delete inside the protected top block; the watchdog will retry.
+    removed=0
+    while [ "$removed" -lt "$total" ]; do
+        last="$(pcontrols_last_forward_pos)"
+        case "$last" in ''|*[!0-9]*) break;; esac
+        [ "$last" -gt "$total" ] || break
+        ipt -t filter -D FORWARD "$last" >/dev/null 2>&1 || break
+        removed=$((removed + 1))
+    done
+    rm -f "$tmp"
+
+    if pcontrols_forward_first_ok; then
+        log_event OK pcontrols "ASUS PControls promoted to first FORWARD position(s): 1-$total"
+        return 0
+    fi
+    return 1
+}
+
+# Keep GoshaCrash/Mihomo hooks behind the last stock PControls rule.  The stock
+# PControls jump rules may be reordered above ESTABLISHED/Mihomo, but their
+# match expressions and the ASUS-owned PControls chain are never modified.
 pcontrols_move_target_after_stock(){
     target="$1"
     ppos="$(pcontrols_last_forward_pos)"
@@ -1075,73 +1241,72 @@ pcontrols_move_target_after_stock(){
     return 1
 }
 
+
 pcontrols_nat_delete_entry(){
-    iface="$1"; mac="$2"
+    iface="$1"; mac="$2"; src="$3"
+    [ -n "$src" ] || src="*"
     ipt -t nat -S mihomo-prerouting >/dev/null 2>&1 || return 0
-    if [ "$iface" = "*" ] && [ "$mac" = "*" ]; then
-        while ipt -t nat -D mihomo-prerouting -j RETURN 2>/dev/null; do :; done
-    elif [ "$iface" = "*" ]; then
-        while ipt -t nat -D mihomo-prerouting -m mac --mac-source "$mac" -j RETURN 2>/dev/null; do :; done
-    elif [ "$mac" = "*" ]; then
-        while ipt -t nat -D mihomo-prerouting -i "$iface" -j RETURN 2>/dev/null; do :; done
-    else
-        while ipt -t nat -D mihomo-prerouting -i "$iface" -m mac --mac-source "$mac" -j RETURN 2>/dev/null; do :; done
-    fi
+    while :; do
+        set --
+        [ "$iface" = "*" ] || set -- "$@" -i "$iface"
+        [ "$src" = "*" ] || set -- "$@" -s "$src"
+        [ "$mac" = "*" ] || set -- "$@" -m mac --mac-source "$mac"
+        set -- "$@" -j RETURN
+        ipt -t nat -D mihomo-prerouting "$@" 2>/dev/null || break
+    done
 }
 
 pcontrols_nat_entry_exists(){
-    iface="$1"; mac="$2"
+    iface="$1"; mac="$2"; src="$3"
+    [ -n "$src" ] || src="*"
     ipt -t nat -S mihomo-prerouting >/dev/null 2>&1 || return 1
-    if [ "$iface" = "*" ] && [ "$mac" = "*" ]; then
-        ipt -t nat -C mihomo-prerouting -j RETURN >/dev/null 2>&1 && return 0
-        ipt -t nat -S mihomo-prerouting 2>/dev/null | grep -Fqx -- '-A mihomo-prerouting -j RETURN'
-    elif [ "$iface" = "*" ]; then
-        ipt -t nat -C mihomo-prerouting -m mac --mac-source "$mac" -j RETURN >/dev/null 2>&1 && return 0
-        ipt -t nat -S mihomo-prerouting 2>/dev/null | grep -Fqx -- "-A mihomo-prerouting -m mac --mac-source $mac -j RETURN"
-    elif [ "$mac" = "*" ]; then
-        ipt -t nat -C mihomo-prerouting -i "$iface" -j RETURN >/dev/null 2>&1 && return 0
-        ipt -t nat -S mihomo-prerouting 2>/dev/null | grep -Fqx -- "-A mihomo-prerouting -i $iface -j RETURN"
-    else
-        ipt -t nat -C mihomo-prerouting -i "$iface" -m mac --mac-source "$mac" -j RETURN >/dev/null 2>&1 && return 0
-        ipt -t nat -S mihomo-prerouting 2>/dev/null | grep -Fqx -- "-A mihomo-prerouting -i $iface -m mac --mac-source $mac -j RETURN"
-    fi
+    set --
+    [ "$iface" = "*" ] || set -- "$@" -i "$iface"
+    [ "$src" = "*" ] || set -- "$@" -s "$src"
+    [ "$mac" = "*" ] || set -- "$@" -m mac --mac-source "$mac"
+    set -- "$@" -j RETURN
+    ipt -t nat -C mihomo-prerouting "$@" >/dev/null 2>&1 && return 0
+    expected="-A mihomo-prerouting"
+    for arg in "$@"; do expected="$expected $arg"; done
+    ipt -t nat -S mihomo-prerouting 2>/dev/null | grep -Fqx -- "$expected"
 }
 
 pcontrols_nat_add_entry(){
-    iface="$1"; mac="$2"
+    iface="$1"; mac="$2"; src="$3"
+    [ -n "$src" ] || src="*"
     ipt -t nat -S mihomo-prerouting >/dev/null 2>&1 || return 0
-    pcontrols_nat_entry_exists "$iface" "$mac" && return 0
-    if [ "$iface" = "*" ] && [ "$mac" = "*" ]; then
-        ipt -t nat -I mihomo-prerouting 1 -j RETURN >/dev/null 2>&1
-    elif [ "$iface" = "*" ]; then
-        ipt -t nat -I mihomo-prerouting 1 -m mac --mac-source "$mac" -j RETURN >/dev/null 2>&1
-    elif [ "$mac" = "*" ]; then
-        ipt -t nat -I mihomo-prerouting 1 -i "$iface" -j RETURN >/dev/null 2>&1
-    else
-        ipt -t nat -I mihomo-prerouting 1 -i "$iface" -m mac --mac-source "$mac" -j RETURN >/dev/null 2>&1
-    fi
+    pcontrols_nat_entry_exists "$iface" "$mac" "$src" && return 0
+    set --
+    [ "$iface" = "*" ] || set -- "$@" -i "$iface"
+    [ "$src" = "*" ] || set -- "$@" -s "$src"
+    [ "$mac" = "*" ] || set -- "$@" -m mac --mac-source "$mac"
+    set -- "$@" -j RETURN
+    ipt -t nat -I mihomo-prerouting 1 "$@" >/dev/null 2>&1
 }
 
 pcontrols_nat_cleanup_state(){
     [ -f "$PCONTROLS_CLIENTS" ] || return 0
-    while IFS='|' read -r iface mac; do
+    while IFS='|' read -r iface mac src; do
         [ -n "$iface" ] && [ -n "$mac" ] || continue
-        pcontrols_nat_delete_entry "$iface" "$mac"
+        [ -n "$src" ] || src="*"
+        pcontrols_nat_delete_entry "$iface" "$mac" "$src"
     done < "$PCONTROLS_CLIENTS"
 }
 
 pcontrols_nat_ensure_file(){
     file="$1"
     ipt -t nat -S mihomo-prerouting >/dev/null 2>&1 || return 0
-    while IFS='|' read -r iface mac; do
+    while IFS='|' read -r iface mac src; do
         [ -n "$iface" ] && [ -n "$mac" ] || continue
-        pcontrols_nat_add_entry "$iface" "$mac" || return 1
+        [ -n "$src" ] || src="*"
+        pcontrols_nat_add_entry "$iface" "$mac" "$src" || return 1
     done < "$file"
 }
 
 pcontrols_forward_priority_ok(){
     ppos="$(pcontrols_last_forward_pos)"
     [ -n "$ppos" ] || return 0
+    pcontrols_forward_first_ok || return 1
     for target in mihomo-forward "$FORWARD_CHAIN"; do
         tpos="$(pcontrols_target_forward_pos "$target")"
         [ -n "$tpos" ] || continue
@@ -1159,9 +1324,10 @@ pcontrols_nat_bypass_ok(){
     # No native auto-redirect chain means there is nothing early to bypass.
     ipt -t nat -S mihomo-prerouting >/dev/null 2>&1 || { rm -f "$tmp"; return 0; }
     rc=0
-    while IFS='|' read -r iface mac; do
+    while IFS='|' read -r iface mac src; do
         [ -n "$iface" ] && [ -n "$mac" ] || continue
-        pcontrols_nat_entry_exists "$iface" "$mac" || rc=1
+        [ -n "$src" ] || src="*"
+        pcontrols_nat_entry_exists "$iface" "$mac" "$src" || rc=1
     done < "$tmp"
     rm -f "$tmp"
     return "$rc"
@@ -1169,7 +1335,8 @@ pcontrols_nat_bypass_ok(){
 
 # Synchronize compatibility with stock ASUSWRT PControls.
 # - no PControls: do nothing and remove stale bypass selectors;
-# - PControls present: keep Mihomo/GoshaCrash FORWARD hooks after it;
+# - PControls present: promote the exact ASUS jumps to the first FORWARD positions
+#   and keep Mihomo/GoshaCrash hooks after them;
 # - native auto-redirect: RETURN managed clients from mihomo-prerouting so they
 #   reach normal routing/FORWARD and ASUS can DROP them before TUN/proxy;
 # - mode=watchdog returns 2 when membership changed so the caller can restart
@@ -1181,29 +1348,45 @@ pcontrols_sync(){
     ipt_init
     mkdir -p "$PCONTROLS_STATE" 2>/dev/null || return 1
     current="$PCONTROLS_STATE/current.$$"
-    pcontrols_collect_clients "$current" || { rm -f "$current"; return 1; }
+    policy="$PCONTROLS_STATE/policy.$$"
+    pcontrols_collect_clients "$current" || { rm -f "$current" "$policy"; return 1; }
+    pcontrols_capture_policy "$policy" || { rm -f "$current" "$policy"; return 1; }
 
     new_sig="$(cat "$current" 2>/dev/null)"
     old_sig="$(cat "$PCONTROLS_CLIENTS" 2>/dev/null)"
+    new_policy="$(cat "$policy" 2>/dev/null)"
+    old_policy="$(cat "$PCONTROLS_POLICY" 2>/dev/null)"
     changed=0
+    policy_changed=0
     [ "$new_sig" = "$old_sig" ] || changed=1
+    [ "$new_policy" = "$old_policy" ] || policy_changed=1
 
     if [ "$changed" = 1 ]; then
         pcontrols_nat_cleanup_state
     fi
 
     if [ -s "$current" ]; then
+        # ASUS PControls must be the first FORWARD decision, including before
+        # generic RELATED,ESTABLISHED accepts. Preserve ASUS rule conditions.
+        pcontrols_promote_stock_first || true
         pcontrols_move_target_after_stock mihomo-forward || true
         pcontrols_move_target_after_stock "$FORWARD_CHAIN" || true
         pcontrols_nat_ensure_file "$current" || true
     fi
 
-    mv -f "$current" "$PCONTROLS_CLIENTS" 2>/dev/null || { rm -f "$current"; return 1; }
+    # Flush accelerated flows only for an actual ASUS policy transition.  On
+    # the first startup there is no prior snapshot, so do not perturb traffic.
+    if [ "$mode" = watchdog ] && { [ "$changed" = 1 ] || [ "$policy_changed" = 1 ]; }; then
+        pcontrols_flush_flowcache_file "$current" || true
+    fi
 
-    if [ "$changed" = 1 ]; then
+    mv -f "$current" "$PCONTROLS_CLIENTS" 2>/dev/null || { rm -f "$current" "$policy"; return 1; }
+    mv -f "$policy" "$PCONTROLS_POLICY" 2>/dev/null || { rm -f "$policy"; return 1; }
+
+    if [ "$changed" = 1 ] || [ "$policy_changed" = 1 ]; then
         count="$(wc -l < "$PCONTROLS_CLIENTS" 2>/dev/null | tr -d ' ')"
         case "$count" in ''|*[!0-9]*) count=0;; esac
-        log_event INFO pcontrols "ASUS PControls membership changed; managed selectors=$count"
+        log_event INFO pcontrols "ASUS PControls policy changed; managed selectors=$count"
         [ "$mode" = watchdog ] && return 2
     fi
     return 0
@@ -1223,7 +1406,7 @@ pcontrols_status(){
     fi
     count="$(wc -l < "$tmp" 2>/dev/null | tr -d ' ')"
     echo "PControls: PRESENT (${count:-?} selector(s))"
-    pcontrols_forward_priority_ok && echo "PControls FORWARD priority: OK (before Mihomo)" || echo "PControls FORWARD priority: NEEDS FIX"
+    pcontrols_forward_priority_ok && echo "PControls FORWARD priority: OK (FIRST, before ESTABLISHED/Mihomo)" || echo "PControls FORWARD priority: NEEDS FIX"
     if ipt -t nat -S mihomo-prerouting >/dev/null 2>&1; then
         pcontrols_nat_bypass_ok && echo "PControls auto-redirect bypass: OK" || echo "PControls auto-redirect bypass: NEEDS FIX"
     else
