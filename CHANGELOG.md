@@ -1,3 +1,14 @@
+
+## 2026-09-21 — installer/controller build sync fix
+
+- Fixed release packaging bug: `install.sh` now expects controller build `2026-09-21-pcontrols-cache-3h-snapshots-menu-v4-enterfix`.
+- Previous archive could reject its own updated `goshacrash.sh` and fetch/install the older v3 controller, so the Enter fix was not actually deployed.
+## 2026-09-21 — menu Enter hotfix
+
+- Fixed interactive `gc` menu regression where Up/Down worked but Enter could be ignored on ASUSWRT/BusyBox terminals.
+- Reverted the main menu input path to the proven blocking byte reader; status is refreshed on every navigation key and after returning from an action.
+- Cache/log 3-hour RAM snapshot logic and PControls guard are unchanged.
+
 # Changelog
 
 ### RAM cache + live menu status

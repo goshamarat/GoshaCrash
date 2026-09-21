@@ -4,7 +4,7 @@
 # Zashboard updates are triggered from the native button inside Zashboard.
 
 VERSION="4.0.0"
-BUILD_ID="2026-09-21-pcontrols-cache-3h-snapshots-menu-v3"
+BUILD_ID="2026-09-21-pcontrols-cache-3h-snapshots-menu-v4-enterfix"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -3184,22 +3184,25 @@ menu(){
     menu_draw "$selected"
 
     while :; do
-        key="$(menu_read_key_poll)"
+        # Use the original blocking byte reader here.  Timed VMIN/VTIME polling
+        # is unreliable on several ASUSWRT/BusyBox tty stacks: Enter is mapped
+        # to LF and may be consumed as an empty timed read.  The blocking reader
+        # has proven reliable for arrows, Enter and Esc on both router families.
+        key="$(menu_read_key)"
         case "$key" in
-            timeout)
-                menu_refresh_status_line
-                ;;
             up)
                 old_selected="$selected"
                 selected=$((selected - 1))
                 [ "$selected" -lt 1 ] && selected=$items_count
                 menu_repaint_selection "$old_selected" "$selected"
+                menu_refresh_status_line
                 ;;
             down)
                 old_selected="$selected"
                 selected=$((selected + 1))
                 [ "$selected" -gt "$items_count" ] && selected=1
                 menu_repaint_selection "$old_selected" "$selected"
+                menu_refresh_status_line
                 ;;
             quit)
                 break
