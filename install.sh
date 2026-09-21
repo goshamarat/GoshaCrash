@@ -4,7 +4,7 @@
 # package tools through ASUS Download Master, configuration and autostart.
 
 INSTALLER_VERSION="4.0.0"
-EXPECTED_CONTROLLER_BUILD_ID="2026-09-21-pcontrols-cache-3h-snapshots-menu-v4-enterfix"
+EXPECTED_CONTROLLER_BUILD_ID="2026-09-21-latest-mihomo-cache-lockfix"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command
@@ -16,8 +16,10 @@ BRANCH="${BRANCH:-production}"
 
 LEGACY_MIHOMO_VERSION="${LEGACY_MIHOMO_VERSION:-v1.19.28}"
 LEGACY_MIHOMO_TAG="${LEGACY_MIHOMO_TAG:-mihomo-gvisor-armv5-$LEGACY_MIHOMO_VERSION}"
-OFFICIAL_MIHOMO_VERSION="${OFFICIAL_MIHOMO_VERSION:-v1.19.30}"
-OFFICIAL_MIHOMO_FALLBACK="${OFFICIAL_MIHOMO_FALLBACK:-$OFFICIAL_MIHOMO_VERSION}"
+# Modern routers resolve the current stable MetaCubeX/mihomo release at install time.
+# OFFICIAL_MIHOMO_VERSION remains an explicit override for recovery/testing only.
+OFFICIAL_MIHOMO_VERSION="${OFFICIAL_MIHOMO_VERSION:-}"
+OFFICIAL_MIHOMO_FALLBACK="${OFFICIAL_MIHOMO_FALLBACK:-v1.19.31}"
 ZASHBOARD_PRIMARY="${ZASHBOARD_URL:-https://github.com/Zephyruso/zashboard/releases/latest/download/dist-no-fonts.zip}"
 
 TMP_ROOT="/tmp/goshacrash-install.$$"
@@ -1574,7 +1576,7 @@ detect_platform(){
     esac
 
     LEGACY="0"
-    MIHOMO_SOURCE="official-pinned"
+    MIHOMO_SOURCE="official-latest"
     ACTIVE_CONFIG="$BASE/config.yaml"
 
     case "${MIHOMO_ARCH:-$machine}" in
@@ -1947,11 +1949,40 @@ json_asset_urls(){
         tr -d '\r'
 }
 
-pinned_official_mihomo_url(){
-    # 4.0.0 deliberately pins the modern core. A router install must not silently
-    # switch CPU binary just because GitHub "latest" changed between runs.
-    MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_VERSION"
-    printf '%s\n' "https://github.com/MetaCubeX/mihomo/releases/download/$OFFICIAL_MIHOMO_VERSION/mihomo-linux-$MIHOMO_TARGET-$OFFICIAL_MIHOMO_VERSION.gz"
+resolve_official_mihomo_latest(){
+    # Explicit override is useful for recovery/testing, but normal installs always
+    # resolve MetaCubeX/mihomo's current stable "latest" release at install time.
+    if test -n "$OFFICIAL_MIHOMO_VERSION"; then
+        MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_VERSION"
+    else
+        meta="$TMP_ROOT/mihomo-latest.json"
+        page="$TMP_ROOT/mihomo-latest.html"
+        version=""
+        rm -f "$meta" "$page" 2>/dev/null || true
+
+        if fetch_direct "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" "$meta"; then
+            version="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$meta" 2>/dev/null | /bin/busybox head -n 1)"
+        fi
+
+        # GitHub API can be rate-limited or blocked on some ASUS networks. Fall
+        # back to the public latest-release page, which also works through ghproxy.
+        if test -z "$version"; then
+            if fetch "https://github.com/MetaCubeX/mihomo/releases/latest" "$page"; then
+                version="$(sed -n 's#.*href="/MetaCubeX/mihomo/releases/tag/\(v[0-9][^"]*\)".*#\1#p' "$page" 2>/dev/null | /bin/busybox head -n 1)"
+            fi
+        fi
+
+        case "$version" in
+            v[0-9]*.[0-9]*.[0-9]*) MIHOMO_VERSION_SELECTED="$version" ;;
+            *)
+                MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_FALLBACK"
+                warn "Не удалось определить GitHub latest; использую аварийный fallback $MIHOMO_VERSION_SELECTED"
+                ;;
+        esac
+    fi
+
+    MIHOMO_URL_SELECTED="https://github.com/MetaCubeX/mihomo/releases/download/$MIHOMO_VERSION_SELECTED/mihomo-linux-$MIHOMO_TARGET-$MIHOMO_VERSION_SELECTED.gz"
+    return 0
 }
 
 legacy_mihomo_urls(){
@@ -2065,10 +2096,8 @@ install_mihomo(){
         done < "$TMP_ROOT/legacy-urls.txt"
         test "$success" -eq 1 || { fail "Не удалось скачать совместимый ARMv5+gVisor Mihomo из Releases проекта"; return 1; }
     else
-        MIHOMO_URL_SELECTED="$(pinned_official_mihomo_url)" || return 1
-        MIHOMO_VERSION_SELECTED="$(printf '%s\n' "$MIHOMO_URL_SELECTED" | sed -n 's#.*/download/\([^/]*\)/.*#\1#p')"
-        test -n "$MIHOMO_VERSION_SELECTED" || MIHOMO_VERSION_SELECTED="$OFFICIAL_MIHOMO_FALLBACK"
-        say "Скачиваю официальный Mihomo $MIHOMO_VERSION_SELECTED для $MIHOMO_TARGET"
+        resolve_official_mihomo_latest || return 1
+        say "Скачиваю официальный Mihomo $MIHOMO_VERSION_SELECTED (latest stable) для $MIHOMO_TARGET"
         fetch "$MIHOMO_URL_SELECTED" "$archive" || { fail "Не удалось скачать $MIHOMO_URL_SELECTED"; return 1; }
         validate_downloaded_mihomo "$archive" "$newbin" || return 1
     fi

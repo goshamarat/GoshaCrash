@@ -5,6 +5,8 @@
 
 > Текущая публичная сборка: **GoshaCrash 4.0.0 production**
 
+> Hotfix 2026-09-21: modern-профиль определяет стабильный MetaCubeX/mihomo `releases/latest` во время установки; cache-lock WARN от параллельного `mihomo -t` очищен без скрытия реальных runtime-ошибок.
+
 ## Поддерживаемые роутеры
 
 | Роутер | Архитектура | Mihomo | Routing | TUN stack | USB |
@@ -119,13 +121,13 @@ Mihomo часто обновляет `cache.db` (в том числе runtime/pr
 Сначала установщик всегда пробует прямой GitHub. Если URL вида `https://github.com/...` недоступен, тот же файл автоматически запрашивается через `ghproxy.net`. Например:
 
 ```text
-https://github.com/MetaCubeX/mihomo/releases/download/v1.19.30/mihomo-linux-armv7-v1.19.30.gz
+https://github.com/MetaCubeX/mihomo/releases/download/<VERSION>/mihomo-linux-armv7-<VERSION>.gz
 ```
 
 автоматически получает fallback:
 
 ```text
-https://ghproxy.net/github.com/MetaCubeX/mihomo/releases/download/v1.19.30/mihomo-linux-armv7-v1.19.30.gz
+https://ghproxy.net/github.com/MetaCubeX/mihomo/releases/download/<VERSION>/mihomo-linux-armv7-<VERSION>.gz
 ```
 
 Это применяется к Mihomo, Zashboard и GitHub release-файлам проекта. Для файлов самой ветки дополнительно остаются raw GitHub и jsDelivr источники.

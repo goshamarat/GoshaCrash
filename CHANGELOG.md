@@ -1,3 +1,10 @@
+## 4.0.0 production hotfix — 2026-09-21 latest Mihomo + cache lock cleanup
+
+- Modern installs now resolve MetaCubeX/mihomo `releases/latest` at install time instead of pinning v1.19.30; current stable is v1.19.31.
+- `gc start` no longer runs the same `mihomo -t` validation twice.
+- A cache lock timeout produced only by `mihomo -t` while the live core already owns `cache.db` is filtered from the validation output; real startup cache lock warnings remain visible.
+- `kill_mihomo` now waits for orphan/manual Mihomo instances to exit before starting a replacement, preventing a real cache.db lock race.
+
 
 ## 2026-09-21 — installer/controller build sync fix
 

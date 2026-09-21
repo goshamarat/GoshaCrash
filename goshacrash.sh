@@ -4,7 +4,7 @@
 # Zashboard updates are triggered from the native button inside Zashboard.
 
 VERSION="4.0.0"
-BUILD_ID="2026-09-21-pcontrols-cache-3h-snapshots-menu-v4-enterfix"
+BUILD_ID="2026-09-21-latest-mihomo-cache-lockfix"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -741,7 +741,19 @@ kill_mihomo(){
         while kill -0 "$p" 2>/dev/null && [ "$n" -lt 10 ]; do sleep 1; n=$((n + 1)); done
         kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null || true
     fi
+
+    # Also terminate orphan/manual instances and WAIT for them. Previously the
+    # second pass only sent TERM and immediately returned, so a new core could
+    # race an old process that still held cache.db for a moment.
     for p in $(pidof mihomo 2>/dev/null); do kill "$p" 2>/dev/null || true; done
+    n=0
+    while [ "$n" -lt 5 ]; do
+        leftovers="$(pidof mihomo 2>/dev/null)"
+        [ -z "$leftovers" ] && break
+        sleep 1
+        n=$((n + 1))
+    done
+    for p in $(pidof mihomo 2>/dev/null); do kill -9 "$p" 2>/dev/null || true; done
     rm -f "$PIDFILE"
 }
 
@@ -927,7 +939,25 @@ check_config_with(){
         return 1
     fi
     required_config || return 1
-    "$mihomo_file" -t -d "$BASE" -f "$CONFIG"
+
+    # `mihomo -t -d $BASE` opens the same cache.db as the live core. If a healthy
+    # core is already running, Bolt's exclusive file lock makes the syntax test
+    # print a harmless `[CacheFile] ... timeout`. Preserve every other line and
+    # the real exit status. If no live core exists, do NOT hide this warning: then
+    # it can indicate an orphan process or another genuine cache-lock problem.
+    live_cache_lock=0
+    running_pid >/dev/null 2>&1 && live_cache_lock=1
+    test_log="$RUNTIME_ROOT/config-test.$$"
+    rm -f "$test_log" 2>/dev/null || true
+    "$mihomo_file" -t -d "$BASE" -f "$CONFIG" > "$test_log" 2>&1
+    test_rc=$?
+    if [ "$live_cache_lock" = 1 ]; then
+        sed '/\[CacheFile\].*timeout/d' "$test_log" 2>/dev/null || cat "$test_log" 2>/dev/null || true
+    else
+        cat "$test_log" 2>/dev/null || true
+    fi
+    rm -f "$test_log" 2>/dev/null || true
+    return "$test_rc"
 }
 check_config(){ check_config_with "$BIN"; }
 
@@ -1954,8 +1984,10 @@ start(){
     load_platform || return 1
     migrate_legacy_usb_runtime
     refresh_path
-    check_config || return 1
 
+    # start_runtime performs the authoritative config check. Do not run the same
+    # `mihomo -t` twice here; on an already-running core that only duplicates the
+    # expected cache-file lock warning and adds ~1s delay per test.
     rm -f "$MANUAL_STOP"
     control_lock_set || { fail "Другая операция GoshaCrash ещё выполняется"; return 1; }
 
