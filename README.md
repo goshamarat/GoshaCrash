@@ -87,13 +87,13 @@ echo 0 > /proc/sys/net/mptcp/mptcp_enabled
 ```
 
 
-### Mihomo `cache.db`: live в RAM, snapshot на USB раз в 3 часа
+### Mihomo `cache.db`: live в RAM, snapshot на USB + восстановление перед стартом
 
-Mihomo часто обновляет `cache.db` (в том числе runtime/profile/fake-IP state). Живой файл находится в `/tmp/goshacrash/cache.db`; `goshacrash/cache.db` на USB — только symlink на RAM. Поэтому обычные частые записи Mihomo не идут на флешку.
+Mihomo часто обновляет `cache.db` (в том числе выбранные proxy/group в Dashboard, runtime/profile/fake-IP state). Живой файл находится в `/tmp/goshacrash/cache.db`; `goshacrash/cache.db` на USB — только symlink на RAM. Поэтому обычные частые записи Mihomo не идут на флешку.
 
-Раз в 3 часа watchdog делает один rolling snapshot RAM-базы в `goshacrash/state/cache.db.snapshot`. Копия берётся в RAM с краткой приостановкой процесса Mihomo только на время RAM→RAM copy, после чего USB-запись выполняется уже при работающем Mihomo. После reboot RAM-cache восстанавливается из последнего snapshot, поэтому теряется максимум примерно 3 часа cache-state при внезапном отключении питания. При обновлении со старой сборки существующий обычный `goshacrash/cache.db` используется как начальный snapshot, а не выбрасывается.
+Раз в 3 часа watchdog делает rolling snapshot RAM-базы в `goshacrash/state/cache.db.snapshot`. Дополнительно перед каждой штатной остановкой/перезапуском ядра GoshaCrash сначала сохраняет свежий `cache.db` на USB. После успешного checkpoint RAM-копия удаляется, и перед следующим запуском snapshot обязательно копируется обратно в `/tmp` **до** первого `mihomo -t` и до запуска ядра. Это сохраняет выбор proxy/group в Dashboard при `gc restart`, service restart и обычной перезагрузке роутера.
 
-`gc doctor` показывает live RAM path и состояние 3-часового snapshot. Ручной snapshot: `gc cache-save`.
+При внезапном отключении питания остаётся последний периодический snapshot (в худшем случае примерно 3 часа давности). При обновлении со старой сборки существующий обычный `goshacrash/cache.db` используется как начальный snapshot, а не выбрасывается. `gc doctor` показывает live RAM path и состояние snapshot. Ручной snapshot: `gc cache-save`.
 
 Главный интерактивный экран также обновляет `MIHOMO`/`TUN` примерно раз в секунду, даже если пользователь не нажимает клавиши. Если RAM pidfile потерян, контроллер пытается заново найти именно свой процесс Mihomo по командной строке.
 
@@ -146,12 +146,14 @@ https://ghproxy.net/github.com/MetaCubeX/mihomo/releases/download/<VERSION>/miho
 
 Когда ASUS добавляет правила вида `FORWARD ... -j PControls`, GoshaCrash автоматически:
 
-- переносит **оригинальные правила ASUS `FORWARD -> PControls` без изменения их условий** в первые позиции `FORWARD`, то есть до generic `RELATED,ESTABLISHED` и до Mihomo;
+- создаёт ранний guard `GOSHACRASH_PCTRL_EARLY` в `mangle/PREROUTING` **перед Mihomo**. Он зеркалит активные штатные ASUS DROP-селекторы (MAC/source/time) и поэтому останавливает также уже установленные соединения;
+- сохраняет доступ к самому роутеру, DHCP и локальному multicast/broadcast — блокировка остаётся именно интернет-блокировкой, а не отключением клиента от LAN;
+- переносит **оригинальные правила ASUS `FORWARD -> PControls` без изменения их условий** в первые позиции `FORWARD` как второй уровень защиты;
 - держит `mihomo-forward` и собственный manual FORWARD hook после всех штатных `PControls`;
-- сохраняет точные селекторы ASUS: интерфейс, MAC и/или source IP. Правило вида `-s 192.168.1.x/32 -j PControls` больше не расширяется до всего `br0`;
-- для этих же селекторов добавляет ранний `RETURN` в `mihomo-prerouting`, чтобы native `auto-redirect` не уводил TCP в локальный Mihomo раньше штатного `FORWARD`;
-- watchdog отслеживает не только список клиентов, но и изменение самой политики/правил `PControls`;
-- при реальном изменении PControls один раз сбрасывает аппаратный flow-cache (по MAC, если это поддерживается, иначе общим `flush`) и один раз перезапускает Mihomo, чтобы уже активные/ускоренные соединения не продолжали жить по старому решению. Flow Cache/CTF постоянно не отключается.
+- сохраняет точные селекторы ASUS: интерфейс, MAC и/или source IP. Правило вида `-s 192.168.1.x/32 -j PControls` не расширяется до всего `br0`;
+- для native `auto-redirect` сохраняет ранний `RETURN` в `mihomo-prerouting` для тех же селекторов ASUS;
+- watchdog отслеживает список клиентов и изменение самой политики/правил `PControls`;
+- при изменении политики обновляет ранний guard без перезапуска Mihomo. Flow-cache при необходимости сбрасывается один раз как страховка для Broadcom-прошивок, но CTF/Flow Cache постоянно не отключается.
 
 Проверка вручную:
 
@@ -159,7 +161,7 @@ https://ghproxy.net/github.com/MetaCubeX/mihomo/releases/download/<VERSION>/miho
 gc pcontrols
 ```
 
-В норме при активном родительском контроле вывод содержит `PControls FORWARD priority: OK (FIRST, before ESTABLISHED/Mihomo)` и, при native auto-redirect, `PControls auto-redirect bypass: OK`. Если ASUS ещё не создал цепочку, `NOT PRESENT/NO CLIENTS` является нормальным состоянием. Watchdog проверяет PControls каждые 10 секунд по умолчанию.
+В норме при активном родительском контроле вывод содержит `PControls early PREROUTING guard: OK (before Mihomo)`, `PControls FORWARD priority: OK (FIRST, before ESTABLISHED/Mihomo)` и, при native auto-redirect, `PControls auto-redirect bypass: OK`. Если ASUS ещё не создал цепочку, `NOT PRESENT/NO CLIENTS` является нормальным состоянием. Watchdog проверяет PControls каждые 10 секунд по умолчанию.
 
 ### Native AUTO на BT10
 

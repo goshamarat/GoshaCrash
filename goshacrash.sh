@@ -4,7 +4,7 @@
 # Zashboard updates are triggered from the native button inside Zashboard.
 
 VERSION="4.0.0"
-BUILD_ID="2026-09-21-pcontrols-first-live-block"
+BUILD_ID="2026-09-24-cache-restore-before-start"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -111,6 +111,7 @@ DNS_OUT_CHAIN="GOSHACRASH_DNS_OUT"
 PCONTROLS_STATE="$VOLATILE_STATE/pcontrols"
 PCONTROLS_CLIENTS="$PCONTROLS_STATE/clients"
 PCONTROLS_POLICY="$PCONTROLS_STATE/policy"
+PCONTROLS_EARLY_CHAIN="GOSHACRASH_PCTRL_EARLY"
 
 REPO="${REPO:-goshamarat/GoshaCrash}"
 BRANCH="${BRANCH:-production}"
@@ -143,10 +144,11 @@ ensure_dirs(){
 }
 
 # Mihomo writes cache.db very frequently (selected proxies/fake-IP/profile state).
-# The live database stays in RAM. Once per three hours watchdog stores one rolling
-# point-in-time snapshot on USB; after reboot the RAM database is restored from it.
-# Therefore normal cache writes never hit flash, while at most ~3h of cache state
-# is lost after an abrupt power cut.
+# The live database stays in RAM. Watchdog stores a rolling snapshot on USB every
+# three hours, and every controlled Mihomo stop/restart first saves a fresh snapshot.
+# IMPORTANT: the snapshot must be restored BEFORE the first `mihomo -t`/core launch
+# after boot. Otherwise Mihomo's config test can create a new empty RAM cache through
+# the persistent symlink and make the restore code incorrectly think RAM is ready.
 mihomo_cache_ram_ready(){
     [ -L "$BASE/cache.db" ] || return 1
     target="$(readlink "$BASE/cache.db" 2>/dev/null)"
@@ -156,7 +158,11 @@ mihomo_cache_ram_ready(){
 restore_mihomo_cache_snapshot(){
     [ -f "$MIHOMO_CACHE_RAM" ] && return 0
     [ -s "$CACHE_SNAPSHOT" ] || return 0
-    cp "$CACHE_SNAPSHOT" "$MIHOMO_CACHE_RAM" 2>/dev/null || return 1
+    tmp="$MIHOMO_CACHE_RAM.restore.$$"
+    rm -f "$tmp" 2>/dev/null || true
+    cp "$CACHE_SNAPSHOT" "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 1; }
+    mv -f "$tmp" "$MIHOMO_CACHE_RAM" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 1; }
+    log_event INFO storage "Mihomo cache.db restored from USB snapshot to RAM before start"
     return 0
 }
 
@@ -941,6 +947,12 @@ check_config_with(){
     fi
     required_config || return 1
 
+    # Prepare/restore cache BEFORE invoking Mihomo. On a cold boot the persistent
+    # $BASE/cache.db symlink points into /tmp, whose target does not exist yet.
+    # Without this step `mihomo -t` can create an empty target and silently bypass
+    # the USB snapshot containing dashboard proxy/group selections.
+    ensure_mihomo_cache_ram || { fail "Не удалось подготовить/восстановить Mihomo cache.db перед проверкой конфига"; return 1; }
+
     # `mihomo -t -d $BASE` opens the same cache.db as the live core. If a healthy
     # core is already running, Bolt's exclusive file lock makes the syntax test
     # print a harmless `[CacheFile] ... timeout`. Preserve every other line and
@@ -1242,6 +1254,124 @@ pcontrols_move_target_after_stock(){
 }
 
 
+# Build an early parental-control guard in mangle/PREROUTING.  This is the
+# one hook that sees both new and already-established client traffic before
+# Mihomo auto-redirect/TUN policy can divert it away from stock FORWARD.
+#
+# Prefer selector-bearing DROP rules from ASUS' own PControls chain (they carry
+# MAC/source/time conditions on current firmware).  If ASUS uses a generic DROP
+# inside PControls, fall back to the exact FORWARD->PControls match expression.
+pcontrols_collect_early_specs(){
+    out="$1"
+    : > "$out" || return 1
+    ipt -t filter -S PControls >/dev/null 2>&1 || return 0
+
+    ipt -t filter -S PControls 2>/dev/null | awk '
+        $1=="-A" && $2=="PControls" {
+            drop=0; selector=0
+            for (i=3; i<=NF; i++) {
+                if (($i=="-j" || $i=="--jump") && i<NF && $(i+1)=="DROP") drop=1
+                if ($i=="--mac-source") selector=1
+                if (($i=="-s" || $i=="--source") && i<NF && $(i+1)!="0.0.0.0/0") selector=1
+            }
+            if (drop && selector) {
+                sub(/^-A[[:space:]]+PControls[[:space:]]+/, "")
+                sub(/[[:space:]]+(-j|--jump)[[:space:]]+DROP([[:space:]].*)?$/, "")
+                print
+            }
+        }
+    ' > "$out"
+    [ -s "$out" ] && return 0
+
+    # Older ASUSWRT can put client/time selectors on the FORWARD jump and keep
+    # PControls itself generic. Preserve those selectors rather than guessing.
+    pcontrols_collect_forward_specs "$out" || return 1
+    awk '
+        {
+            sub(/[[:space:]]+(-j|--jump)[[:space:]]+PControls([[:space:]].*)?$/, "")
+            print
+        }
+    ' "$out" > "$out.tmp" || { rm -f "$out.tmp"; return 1; }
+    mv -f "$out.tmp" "$out"
+}
+
+pcontrols_early_cleanup(){
+    [ -x "$IPTABLES" ] || return 0
+    ipt_init
+    remove_jump mangle PREROUTING -j "$PCONTROLS_EARLY_CHAIN"
+    delete_chain mangle "$PCONTROLS_EARLY_CHAIN"
+}
+
+pcontrols_early_hook_first(){
+    first="$(ipt -t mangle -S PREROUTING 2>/dev/null | sed -n '1p')"
+    [ "$first" = "-A PREROUTING -j $PCONTROLS_EARLY_CHAIN" ]
+}
+
+pcontrols_early_ensure(){
+    specs="$PCONTROLS_STATE/early.$$"
+    mkdir -p "$PCONTROLS_STATE" 2>/dev/null || return 1
+    pcontrols_collect_early_specs "$specs" || { rm -f "$specs"; return 1; }
+    if [ ! -s "$specs" ]; then
+        rm -f "$specs"
+        pcontrols_early_cleanup
+        return 0
+    fi
+
+    if ipt -t mangle -S "$PCONTROLS_EARLY_CHAIN" >/dev/null 2>&1; then
+        ipt -t mangle -F "$PCONTROLS_EARLY_CHAIN" >/dev/null 2>&1 || { rm -f "$specs"; return 1; }
+    else
+        ipt -t mangle -N "$PCONTROLS_EARLY_CHAIN" >/dev/null 2>&1 || { rm -f "$specs"; return 1; }
+    fi
+
+    # Stock PControls lives in FORWARD, so traffic addressed to the router never
+    # hits it. Keep that behavior: allow router-local management/DNS plus DHCP
+    # and link-local multicast/broadcast through to the normal ASUS stack.
+    lan_ip="$(nvram_get lan_ipaddr)"
+    if [ -n "$lan_ip" ] && [ "$lan_ip" != "0.0.0.0" ]; then
+        ipt -t mangle -A "$PCONTROLS_EARLY_CHAIN" -d "$lan_ip/32" -j RETURN >/dev/null 2>&1 || true
+    fi
+    ipt -t mangle -A "$PCONTROLS_EARLY_CHAIN" -p udp --sport 68 --dport 67 -j RETURN >/dev/null 2>&1 || true
+    ipt -t mangle -A "$PCONTROLS_EARLY_CHAIN" -d 224.0.0.0/4 -j RETURN >/dev/null 2>&1 || true
+    ipt -t mangle -A "$PCONTROLS_EARLY_CHAIN" -d 255.255.255.255/32 -j RETURN >/dev/null 2>&1 || true
+
+    added=0
+    while IFS= read -r spec; do
+        [ -n "$spec" ] || continue
+        # An output-interface match is not meaningful in PREROUTING. Skip such
+        # an unusual ASUS rule instead of broadening it and over-blocking.
+        case " $spec " in *" -o "*|*" --out-interface "*) continue;; esac
+        set -f
+        # ASUS-generated specs are whitespace-delimited, same constraint as the
+        # existing FORWARD promotion code above.
+        # shellcheck disable=SC2086
+        set -- $spec
+        set +f
+        if ipt -t mangle -A "$PCONTROLS_EARLY_CHAIN" "$@" -j DROP >/dev/null 2>&1; then
+            added=$((added + 1))
+        fi
+    done < "$specs"
+    rm -f "$specs"
+
+    if [ "$added" -eq 0 ]; then
+        pcontrols_early_cleanup
+        return 1
+    fi
+
+    # It must precede every ASUS/Mihomo PREROUTING hook. Existing conntrack
+    # entries still traverse mangle/PREROUTING, which is exactly what the live
+    # phone test demonstrated.
+    if ! pcontrols_early_hook_first; then
+        remove_jump mangle PREROUTING -j "$PCONTROLS_EARLY_CHAIN"
+        ipt -t mangle -I PREROUTING 1 -j "$PCONTROLS_EARLY_CHAIN" >/dev/null 2>&1 || return 1
+    fi
+    return 0
+}
+
+pcontrols_early_ok(){
+    pcontrols_early_hook_first || return 1
+    ipt -t mangle -S "$PCONTROLS_EARLY_CHAIN" 2>/dev/null | grep -q -- ' -j DROP$'
+}
+
 pcontrols_nat_delete_entry(){
     iface="$1"; mac="$2"; src="$3"
     [ -n "$src" ] || src="*"
@@ -1339,8 +1469,8 @@ pcontrols_nat_bypass_ok(){
 #   and keep Mihomo/GoshaCrash hooks after them;
 # - native auto-redirect: RETURN managed clients from mihomo-prerouting so they
 #   reach normal routing/FORWARD and ASUS can DROP them before TUN/proxy;
-# - mode=watchdog returns 2 when membership changed so the caller can restart
-#   Mihomo once and tear down already-redirected long-lived sessions (Telegram).
+# - mode=watchdog returns 2 when membership/policy changed so callers can log
+#   the transition. The early mangle guard makes a Mihomo restart unnecessary.
 pcontrols_sync(){
     mode="${1:-startup}"
     refresh_path >/dev/null 2>&1 || true
@@ -1368,10 +1498,15 @@ pcontrols_sync(){
     if [ -s "$current" ]; then
         # ASUS PControls must be the first FORWARD decision, including before
         # generic RELATED,ESTABLISHED accepts. Preserve ASUS rule conditions.
+        if [ "$changed" = 1 ] || [ "$policy_changed" = 1 ] || ! pcontrols_early_ok; then
+            pcontrols_early_ensure || log_event WARN pcontrols "early PREROUTING guard sync failed"
+        fi
         pcontrols_promote_stock_first || true
         pcontrols_move_target_after_stock mihomo-forward || true
         pcontrols_move_target_after_stock "$FORWARD_CHAIN" || true
         pcontrols_nat_ensure_file "$current" || true
+    else
+        pcontrols_early_cleanup >/dev/null 2>&1 || true
     fi
 
     # Flush accelerated flows only for an actual ASUS policy transition.  On
@@ -1406,6 +1541,7 @@ pcontrols_status(){
     fi
     count="$(wc -l < "$tmp" 2>/dev/null | tr -d ' ')"
     echo "PControls: PRESENT (${count:-?} selector(s))"
+    pcontrols_early_ok && echo "PControls early PREROUTING guard: OK (before Mihomo)" || echo "PControls early PREROUTING guard: NEEDS FIX"
     pcontrols_forward_priority_ok && echo "PControls FORWARD priority: OK (FIRST, before ESTABLISHED/Mihomo)" || echo "PControls FORWARD priority: NEEDS FIX"
     if ipt -t nat -S mihomo-prerouting >/dev/null 2>&1; then
         pcontrols_nat_bypass_ok && echo "PControls auto-redirect bypass: OK" || echo "PControls auto-redirect bypass: NEEDS FIX"
@@ -1846,6 +1982,8 @@ start_runtime(){
     load_platform || return 1
     repair_opt >/dev/null 2>&1 || true
     refresh_path
+    # Restore the persistent snapshot into /tmp before ANY Mihomo invocation.
+    ensure_mihomo_cache_ram || { fail "Не удалось подготовить/восстановить Mihomo cache.db в RAM"; return 1; }
     check_config || return 1
     ensure_tun || { fail "/dev/net/tun недоступен"; return 1; }
     if p="$(running_pid)"; then
@@ -1868,7 +2006,9 @@ start_runtime(){
 
     [ "$ROUTING_MODE" = manual ] && route_stop >/dev/null 2>&1 || true
     kill_mihomo
-    ensure_mihomo_cache_ram || { fail "Не удалось перенести Mihomo cache.db в RAM"; return 1; }
+    # cache.db was prepared before check_config and must stay the exact file that
+    # the real core opens; do not let a config test create a different empty DB.
+    ensure_mihomo_cache_ram || { fail "Не удалось подготовить Mihomo cache.db в RAM"; return 1; }
     cap_ram_log "$MIHOMO_LOG"
     log_event INFO runtime "starting $BIN with $CONFIG"
     nohup_bin="$(find_nohup 2>/dev/null)"
@@ -2028,11 +2168,32 @@ cleanup_stale_runtime_state(){
 }
 
 stop_runtime(){
+    # Persist dashboard selections/profile/fake-IP state immediately before every
+    # controlled core stop. This makes `gc restart`, service-stop and watchdog
+    # restarts independent of the 3h periodic snapshot window.
+    cache_saved=0
+    if [ -s "$MIHOMO_CACHE_RAM" ]; then
+        if flush_mihomo_cache_to_usb prestop; then
+            cache_saved=1
+        else
+            warn "Не удалось сохранить свежий cache.db на USB перед остановкой; RAM-копия будет сохранена в пределах текущей загрузки"
+        fi
+    fi
+
     # Remove only GoshaCrash PControls bypass rules while Mihomo's native chain
-    # still exists.  ASUS PControls itself is never touched.
+    # still exists. ASUS PControls itself is never touched.
     pcontrols_nat_cleanup_state >/dev/null 2>&1 || true
+    pcontrols_early_cleanup >/dev/null 2>&1 || true
     route_stop >/dev/null 2>&1 || true
     kill_mihomo
+
+    # If the checkpoint was safely committed to USB, deliberately remove the RAM
+    # copy. The next start MUST repopulate /tmp from CACHE_SNAPSHOT, exercising the
+    # same restore path used after a router reboot. If USB save failed, keep RAM so
+    # a same-boot restart does not lose newer selections.
+    if [ "$cache_saved" = 1 ] && [ -s "$CACHE_SNAPSHOT" ]; then
+        rm -f "$MIHOMO_CACHE_RAM" "$MIHOMO_CACHE_RAM-journal" "$MIHOMO_CACHE_RAM-wal" "$MIHOMO_CACHE_RAM-shm" 2>/dev/null || true
+    fi
     rm -rf "$START_LOCK" 2>/dev/null || true
 }
 
@@ -2122,12 +2283,7 @@ watchdog_check(){
     pc_rc=$?
     if [ "$pc_rc" = 2 ]; then
       cap_ram_log "$WATCHDOG_LOG"
-      printf '[%s] watchdog: ASUS PControls changed; restarting Mihomo once to close old redirected sessions\n' "$(now)" >> "$WATCHDOG_LOG" 2>/dev/null || true
-      stop_runtime
-      if ! with_start_lock start_runtime >> "$WATCHDOG_LOG" 2>&1; then
-        printf '[%s] watchdog: PControls-triggered restart failed\n' "$(now)" >> "$WATCHDOG_LOG" 2>/dev/null || true
-      fi
-      return 0
+      printf '[%s] watchdog: ASUS PControls changed; early PREROUTING guard refreshed (no Mihomo restart needed)\n' "$(now)" >> "$WATCHDOG_LOG" 2>/dev/null || true
     fi
     [ "$pc_rc" = 0 ] || printf '[%s] watchdog: PControls guard sync failed; will retry\n' "$(now)" >> "$WATCHDOG_LOG" 2>/dev/null || true
 
@@ -2790,25 +2946,30 @@ cache_ram_copy_consistent(){
 }
 
 flush_mihomo_cache_to_usb(){
+    snapshot_reason="${1:-periodic}"
     ensure_dirs || return 1
     [ -s "$MIHOMO_CACHE_RAM" ] || return 0
     refresh_storage_identity >/dev/null 2>&1 || true
-    storage_space_ok || { log_event WARN storage "3h cache.db snapshot skipped: USB free-space guard failed"; return 1; }
-    usb_kernel_fs_errors && { log_event WARN storage "3h cache.db snapshot skipped: kernel reports USB filesystem errors"; return 1; }
+    storage_space_ok || { log_event WARN storage "cache.db snapshot skipped ($snapshot_reason): USB free-space guard failed"; return 1; }
+    usb_kernel_fs_errors && { log_event WARN storage "cache.db snapshot skipped ($snapshot_reason): kernel reports USB filesystem errors"; return 1; }
 
     tmp="$RUNTIME_ROOT/cache-snapshot.$$"
     rm -f "$tmp" 2>/dev/null || true
-    cache_ram_copy_consistent "$tmp" || { rm -f "$tmp" 2>/dev/null || true; log_event WARN storage "3h cache.db RAM snapshot failed"; return 1; }
+    cache_ram_copy_consistent "$tmp" || { rm -f "$tmp" 2>/dev/null || true; log_event WARN storage "cache.db RAM snapshot failed ($snapshot_reason)"; return 1; }
 
     new="$CACHE_SNAPSHOT.new"
     rm -f "$new" 2>/dev/null || true
     if cp "$tmp" "$new" 2>/dev/null && mv -f "$new" "$CACHE_SNAPSHOT" 2>/dev/null; then
         rm -f "$tmp" 2>/dev/null || true
-        log_event INFO storage "Mihomo cache.db saved from RAM to rolling USB snapshot; next automatic save in 3h"
+        case "$snapshot_reason" in
+            prestop) log_event INFO storage "Mihomo cache.db checkpoint saved before core stop/restart" ;;
+            manual)  log_event INFO storage "Mihomo cache.db manual snapshot saved from RAM to USB" ;;
+            *)       log_event INFO storage "Mihomo cache.db saved from RAM to rolling USB snapshot; next automatic save in 3h" ;;
+        esac
         return 0
     fi
     rm -f "$tmp" "$new" 2>/dev/null || true
-    log_event WARN storage "3h cache.db USB snapshot write failed"
+    log_event WARN storage "cache.db USB snapshot write failed ($snapshot_reason)"
     return 1
 }
 
@@ -3622,9 +3783,9 @@ doctor(){
         echo "  Mihomo cache USB path: pending first start"
     fi
     if [ -s "$CACHE_SNAPSHOT" ]; then
-        echo "  Mihomo cache snapshot: $CACHE_SNAPSHOT (rolling, every 3h)"
+        echo "  Mihomo cache snapshot: $CACHE_SNAPSHOT (rolling 3h + checkpoint before controlled stop/restart)"
     else
-        echo "  Mihomo cache snapshot: not written yet (every 3h)"
+        echo "  Mihomo cache snapshot: not written yet (automatic 3h; also saved before controlled stop/restart)"
     fi
     tun_kernel_ready && echo "  kernel TUN (/dev/net/tun): OK" || echo "  kernel TUN (/dev/net/tun): FAIL"
     if running_pid >/dev/null 2>&1; then
@@ -3725,7 +3886,7 @@ doctor(){
         echo "  log snapshot: not written yet (every 3h)"
     fi
     if usb_noatime_ok; then echo "  USB noatime: OK"; else echo "  USB noatime: NOT SET (runtime attempts best-effort remount)"; fi
-    echo "  background USB writes by GoshaCrash: rolling log + cache snapshots once every 3h"
+    echo "  USB persistence: rolling log/cache every 3h + cache checkpoint before controlled Mihomo stop/restart"
 
     if usb_metadata_probe_runtime; then
         echo "  USB metadata probe: OK"
@@ -4070,15 +4231,13 @@ case "$GC_COMMAND" in
     pcontrols)
         pcontrols_sync watchdog
         pc_rc=$?
-        if [ "$pc_rc" = 2 ] && running_pid >/dev/null 2>&1; then
-            echo "PControls changed: restarting Mihomo once to close old redirected sessions"
-            stop_runtime
-            with_start_lock start_runtime || true
+        if [ "$pc_rc" = 2 ]; then
+            echo "PControls changed: early PREROUTING guard refreshed; Mihomo restart not required"
         fi
         pcontrols_status
         ;;
     cache-save)
-        if flush_mihomo_cache_to_usb; then
+        if flush_mihomo_cache_to_usb manual; then
             echo "Mihomo cache.db saved from RAM to USB snapshot"
         else
             echo "cache.db snapshot failed; check gc storage / gc doctor" >&2
@@ -4100,8 +4259,8 @@ case "$GC_COMMAND" in
         df -h "$USB_MOUNT" 2>/dev/null || true
         if dlna_kb="$(minidlna_size_kb 2>/dev/null)"; then echo ".minidlna: ${dlna_kb}KB"; else echo ".minidlna: not present"; fi
         if [ -s "$LOG_SNAPSHOT" ]; then echo "log snapshot: $LOG_SNAPSHOT (rolling, every 3h)"; elif [ -s "$LOG_SNAPSHOT_PLAIN" ]; then echo "log snapshot: $LOG_SNAPSHOT_PLAIN (rolling, every 3h)"; else echo "log snapshot: not written yet (every 3h)"; fi
-        if [ -s "$CACHE_SNAPSHOT" ]; then echo "cache.db snapshot: $CACHE_SNAPSHOT (rolling, every 3h)"; else echo "cache.db snapshot: not written yet (every 3h)"; fi
-        echo "background USB writes by GoshaCrash: one scheduled snapshot window every 3h"
+        if [ -s "$CACHE_SNAPSHOT" ]; then echo "cache.db snapshot: $CACHE_SNAPSHOT (rolling 3h + pre-stop checkpoint)"; else echo "cache.db snapshot: not written yet (automatic 3h + pre-stop checkpoint)"; fi
+        echo "USB persistence: scheduled snapshot every 3h; cache is also checkpointed before controlled Mihomo stop/restart"
         echo "RAM logs: $LOGS (max 10 MiB per log; truncated after successful 3h snapshot)"
         echo "RAM cache.db: $MIHOMO_CACHE_RAM (live writes stay in RAM)"
         echo "RAM available: $(ram_available_kb)KB"

@@ -1,3 +1,19 @@
+## 4.0.0 production — 2026-09-24 cache restore before start
+
+- Fixed a cold-boot ordering bug: `mihomo -t` could create an empty `/tmp/goshacrash/cache.db` through the persistent symlink before the USB snapshot was restored, causing the restore function to skip the real backup.
+- `state/cache.db.snapshot` is now restored into RAM before **any** Mihomo config test or core launch.
+- Before every controlled Mihomo stop/restart, GoshaCrash writes a fresh cache checkpoint to USB. After a successful checkpoint the RAM copy is removed so the next launch exercises the same USB→RAM restore path as a router reboot.
+- Dashboard proxy/group selections stored in `cache.db` now survive `gc restart`, service restart and normal reboot. If the pre-stop USB checkpoint fails, the current RAM cache is kept for same-boot recovery instead of being discarded.
+- The periodic 3-hour snapshot remains as protection for abrupt power loss.
+
+## 4.0.0 production hotfix — 2026-09-21 PControls early PREROUTING guard
+
+- Live router test confirmed that `mangle/PREROUTING` sees and can immediately stop traffic from an already-online blocked client before Mihomo.
+- Added `GOSHACRASH_PCTRL_EARLY` as the first mangle/PREROUTING hook. It mirrors ASUS selector-bearing PControls DROP rules; older generic-chain layouts fall back to the original FORWARD->PControls match expression.
+- Router-local traffic, DHCP and local multicast/broadcast are exempt so parental control does not break LAN management/services.
+- Existing FORWARD-first and native mihomo-prerouting RETURN guards are retained as defense in depth.
+- PControls policy changes no longer restart Mihomo; the early guard is refreshed in place. Flow-cache flush remains a one-shot compatibility fallback only.
+
 ## 4.0.0 production hotfix — 2026-09-21 PControls live block
 
 - ASUS' original `FORWARD -> PControls` rules are promoted unchanged to the first FORWARD positions, before generic `RELATED,ESTABLISHED` accepts and before Mihomo hooks.

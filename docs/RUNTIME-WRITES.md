@@ -1,6 +1,6 @@
 # Runtime write policy
 
-Production goal: high-churn runtime writes stay in RAM. GoshaCrash intentionally opens one rolling persistence window every 3 hours for log and Mihomo cache snapshots. The mount hook also attempts `noatime,nodiratime` so normal reads do not cause atime writes.
+Production goal: high-churn runtime writes stay in RAM. GoshaCrash opens one rolling persistence window every 3 hours for log/cache snapshots, and also checkpoints Mihomo `cache.db` immediately before a controlled core stop/restart so Dashboard proxy/group selections survive restarts. The mount hook also attempts `noatime,nodiratime` so normal reads do not cause atime writes.
 
 ## RAM-only paths
 
@@ -11,7 +11,7 @@ Production goal: high-churn runtime writes stay in RAM. GoshaCrash intentionally
 - `/tmp/goshacrash/cache.db` — live Mihomo runtime/profile/fake-IP cache; `<USB>/goshacrash/cache.db` is only a symlink to this RAM file.
 - `/tmp/goshacrash-opt` — Optware ABI overlay.
 
-Every `.log` is capped independently at 10 MiB by default. Once every 3 hours the watchdog writes one rolling log snapshot and one rolling `cache.db` snapshot to USB. After a successful log snapshot the RAM logs are truncated for the next interval. If available RAM drops below 32 MiB, RAM logs are cleared early.
+Every `.log` is capped independently at 10 MiB by default. Once every 3 hours the watchdog writes one rolling log snapshot and one rolling `cache.db` snapshot to USB. Before a controlled Mihomo stop/restart, the current RAM `cache.db` is checkpointed again; the next launch restores that snapshot into `/tmp` before any Mihomo process is invoked. After a successful log snapshot the RAM logs are truncated for the next interval. If available RAM drops below 32 MiB, RAM logs are cleared early.
 
 ## Persistent paths
 
@@ -21,7 +21,7 @@ Every `.log` is capped independently at 10 MiB by default. Once every 3 hours th
 
 ## Intentional USB writes
 
-Background runtime normally reads USB only, except for the scheduled rolling snapshot window once every 3 hours. Installation and user-requested modifications can also write persistent storage:
+Background runtime normally reads USB only, except for the scheduled rolling snapshot window once every 3 hours. A controlled Mihomo stop/restart also writes one cache checkpoint so persistent Dashboard selections are not lost. Installation and user-requested modifications can also write persistent storage:
 
 - `install.sh` / update;
 - editing `config.yaml`;
