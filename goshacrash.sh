@@ -4,7 +4,7 @@
 # Zashboard updates are triggered from the native button inside Zashboard.
 
 VERSION="4.0.0"
-BUILD_ID="2026-09-24-cache-restore-before-start"
+BUILD_ID="2026-09-26-pcontrols-early-only-schedule-safe"
 
 # Never inherit an Optware/uClibc loader path into stock firmware tools.
 unset LD_LIBRARY_PATH 2>/dev/null || true
@@ -1262,11 +1262,22 @@ pcontrols_move_target_after_stock(){
 # MAC/source/time conditions on current firmware).  If ASUS uses a generic DROP
 # inside PControls, fall back to the exact FORWARD->PControls match expression.
 pcontrols_collect_early_specs(){
-    out="$1"
-    : > "$out" || return 1
+    early_out="$1"
+    : > "$early_out" || return 1
     ipt -t filter -S PControls >/dev/null 2>&1 || return 0
 
-    ipt -t filter -S PControls 2>/dev/null | awk '
+    direct="$early_out.direct.$$"
+    generic="$early_out.generic.$$"
+    fwd="$early_out.forward.$$"
+    : > "$direct" || return 1
+    : > "$generic" || { rm -f "$direct"; return 1; }
+
+    # Split ASUS DROP rules into two layouts:
+    # 1) selector-bearing rules (source IP/MAC lives inside PControls) — copy the
+    #    complete match expression, including xt_time, verbatim;
+    # 2) generic PControls DROP rules — combine their match expression with the
+    #    exact FORWARD->PControls selector so we never widen a client rule to LAN.
+    ipt -t filter -S PControls 2>/dev/null | awk -v d="$direct" -v g="$generic" '
         $1=="-A" && $2=="PControls" {
             drop=0; selector=0
             for (i=3; i<=NF; i++) {
@@ -1274,25 +1285,46 @@ pcontrols_collect_early_specs(){
                 if ($i=="--mac-source") selector=1
                 if (($i=="-s" || $i=="--source") && i<NF && $(i+1)!="0.0.0.0/0") selector=1
             }
-            if (drop && selector) {
-                sub(/^-A[[:space:]]+PControls[[:space:]]+/, "")
-                sub(/[[:space:]]+(-j|--jump)[[:space:]]+DROP([[:space:]].*)?$/, "")
-                print
-            }
+            if (!drop) next
+            line=$0
+            sub(/^-A[[:space:]]+PControls[[:space:]]+/, "", line)
+            sub(/[[:space:]]+(-j|--jump)[[:space:]]+DROP([[:space:]].*)?$/, "", line)
+            if (selector) print line >> d
+            else print (line=="" ? "__ANY__" : line) >> g
         }
-    ' > "$out"
-    [ -s "$out" ] && return 0
+    '
 
-    # Older ASUSWRT can put client/time selectors on the FORWARD jump and keep
-    # PControls itself generic. Preserve those selectors rather than guessing.
-    pcontrols_collect_forward_specs "$out" || return 1
-    awk '
-        {
-            sub(/[[:space:]]+(-j|--jump)[[:space:]]+PControls([[:space:]].*)?$/, "")
-            print
-        }
-    ' "$out" > "$out.tmp" || { rm -f "$out.tmp"; return 1; }
-    mv -f "$out.tmp" "$out"
+    cat "$direct" >> "$early_out" 2>/dev/null || true
+
+    if [ -s "$generic" ]; then
+        pcontrols_collect_forward_specs "$fwd" || { rm -f "$direct" "$generic" "$fwd"; return 1; }
+        if [ -s "$fwd" ]; then
+            awk '
+                {
+                    sub(/[[:space:]]+(-j|--jump)[[:space:]]+PControls([[:space:]].*)?$/, "")
+                    print
+                }
+            ' "$fwd" > "$fwd.stripped" || { rm -f "$direct" "$generic" "$fwd" "$fwd.stripped"; return 1; }
+            while IFS= read -r fwd_spec; do
+                [ -n "$fwd_spec" ] || continue
+                while IFS= read -r chain_spec; do
+                    [ -n "$chain_spec" ] || continue
+                    if [ "$chain_spec" = "__ANY__" ]; then
+                        printf '%s\n' "$fwd_spec" >> "$early_out"
+                    else
+                        printf '%s %s\n' "$fwd_spec" "$chain_spec" >> "$early_out"
+                    fi
+                done < "$generic"
+            done < "$fwd.stripped"
+        fi
+    fi
+
+    # Stable de-duplication keeps policy signatures readable and avoids duplicate
+    # early DROP rules when ASUS emits equivalent Web/App entries.
+    awk 'NF && !seen[$0]++' "$early_out" > "$early_out.tmp" || { rm -f "$direct" "$generic" "$fwd" "$fwd.stripped" "$early_out.tmp"; return 1; }
+    mv -f "$early_out.tmp" "$early_out"
+    rm -f "$direct" "$generic" "$fwd" "$fwd.stripped"
+    return 0
 }
 
 pcontrols_early_cleanup(){
@@ -1372,65 +1404,56 @@ pcontrols_early_ok(){
     ipt -t mangle -S "$PCONTROLS_EARLY_CHAIN" 2>/dev/null | grep -q -- ' -j DROP$'
 }
 
-pcontrols_nat_delete_entry(){
-    iface="$1"; mac="$2"; src="$3"
-    [ -n "$src" ] || src="*"
-    ipt -t nat -S mihomo-prerouting >/dev/null 2>&1 || return 0
-    while :; do
-        set --
-        [ "$iface" = "*" ] || set -- "$@" -i "$iface"
-        [ "$src" = "*" ] || set -- "$@" -s "$src"
-        [ "$mac" = "*" ] || set -- "$@" -m mac --mac-source "$mac"
-        set -- "$@" -j RETURN
-        ipt -t nat -D mihomo-prerouting "$@" 2>/dev/null || break
-    done
+# Remove RETURN rules left by pre-2026-09-26 builds.  New builds never add
+# PControls selectors to mihomo-prerouting: doing so would bypass Mihomo even
+# outside an ASUS time schedule.  The cleanup is intentionally one-shot per
+# boot/update and only targets exact selectors recorded by the old build.
+pcontrols_legacy_nat_cleanup_once(){
+    marker="$PCONTROLS_STATE/legacy-nat-cleaned"
+    [ -e "$marker" ] && return 0
+    mkdir -p "$PCONTROLS_STATE" 2>/dev/null || return 0
+
+    legacy_src="$PCONTROLS_CLIENTS"
+    legacy_tmp=""
+    if [ ! -s "$legacy_src" ]; then
+        legacy_tmp="$PCONTROLS_STATE/legacy-clients.$$"
+        pcontrols_collect_clients "$legacy_tmp" >/dev/null 2>&1 || : > "$legacy_tmp"
+        legacy_src="$legacy_tmp"
+    fi
+
+    if [ -s "$legacy_src" ] && ipt -t nat -S mihomo-prerouting >/dev/null 2>&1; then
+        while IFS='|' read -r iface mac src; do
+            [ -n "$iface" ] && [ -n "$mac" ] || continue
+            [ -n "$src" ] || src="*"
+            while :; do
+                set --
+                [ "$iface" = "*" ] || set -- "$@" -i "$iface"
+                [ "$src" = "*" ] || set -- "$@" -s "$src"
+                [ "$mac" = "*" ] || set -- "$@" -m mac --mac-source "$mac"
+                set -- "$@" -j RETURN
+                ipt -t nat -D mihomo-prerouting "$@" 2>/dev/null || break
+            done
+        done < "$legacy_src"
+    fi
+    [ -n "$legacy_tmp" ] && rm -f "$legacy_tmp" 2>/dev/null || true
+    : > "$marker" 2>/dev/null || true
+    return 0
 }
 
-pcontrols_nat_entry_exists(){
-    iface="$1"; mac="$2"; src="$3"
-    [ -n "$src" ] || src="*"
-    ipt -t nat -S mihomo-prerouting >/dev/null 2>&1 || return 1
-    set --
-    [ "$iface" = "*" ] || set -- "$@" -i "$iface"
-    [ "$src" = "*" ] || set -- "$@" -s "$src"
-    [ "$mac" = "*" ] || set -- "$@" -m mac --mac-source "$mac"
-    set -- "$@" -j RETURN
-    ipt -t nat -C mihomo-prerouting "$@" >/dev/null 2>&1 && return 0
-    expected="-A mihomo-prerouting"
-    for arg in "$@"; do expected="$expected $arg"; done
-    ipt -t nat -S mihomo-prerouting 2>/dev/null | grep -Fqx -- "$expected"
-}
-
-pcontrols_nat_add_entry(){
-    iface="$1"; mac="$2"; src="$3"
-    [ -n "$src" ] || src="*"
-    ipt -t nat -S mihomo-prerouting >/dev/null 2>&1 || return 0
-    pcontrols_nat_entry_exists "$iface" "$mac" "$src" && return 0
-    set --
-    [ "$iface" = "*" ] || set -- "$@" -i "$iface"
-    [ "$src" = "*" ] || set -- "$@" -s "$src"
-    [ "$mac" = "*" ] || set -- "$@" -m mac --mac-source "$mac"
-    set -- "$@" -j RETURN
-    ipt -t nat -I mihomo-prerouting 1 "$@" >/dev/null 2>&1
-}
-
-pcontrols_nat_cleanup_state(){
-    [ -f "$PCONTROLS_CLIENTS" ] || return 0
-    while IFS='|' read -r iface mac src; do
-        [ -n "$iface" ] && [ -n "$mac" ] || continue
-        [ -n "$src" ] || src="*"
-        pcontrols_nat_delete_entry "$iface" "$mac" "$src"
-    done < "$PCONTROLS_CLIENTS"
-}
-
-pcontrols_nat_ensure_file(){
-    file="$1"
-    ipt -t nat -S mihomo-prerouting >/dev/null 2>&1 || return 0
-    while IFS='|' read -r iface mac src; do
-        [ -n "$iface" ] && [ -n "$mac" ] || continue
-        [ -n "$src" ] || src="*"
-        pcontrols_nat_add_entry "$iface" "$mac" "$src" || return 1
-    done < "$file"
+# Return success when ASUS currently has at least one effective DROP selector
+# that must be mirrored before Mihomo.  Time-qualified rules count even when
+# their time window is not active right now: xt_time itself will switch them on
+# and off without watchdog intervention.
+pcontrols_early_policy_present(){
+    tmp="$PCONTROLS_STATE/expected.$$"
+    mkdir -p "$PCONTROLS_STATE" 2>/dev/null || return 1
+    pcontrols_collect_early_specs "$tmp" || { rm -f "$tmp"; return 1; }
+    if [ -s "$tmp" ]; then
+        rm -f "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
 }
 
 pcontrols_forward_priority_ok(){
@@ -1446,37 +1469,21 @@ pcontrols_forward_priority_ok(){
     return 0
 }
 
-pcontrols_nat_bypass_ok(){
-    tmp="$PCONTROLS_STATE/check.$$"
-    mkdir -p "$PCONTROLS_STATE" 2>/dev/null || return 1
-    pcontrols_collect_clients "$tmp" || { rm -f "$tmp"; return 1; }
-    [ -s "$tmp" ] || { rm -f "$tmp"; return 0; }
-    # No native auto-redirect chain means there is nothing early to bypass.
-    ipt -t nat -S mihomo-prerouting >/dev/null 2>&1 || { rm -f "$tmp"; return 0; }
-    rc=0
-    while IFS='|' read -r iface mac src; do
-        [ -n "$iface" ] && [ -n "$mac" ] || continue
-        [ -n "$src" ] || src="*"
-        pcontrols_nat_entry_exists "$iface" "$mac" "$src" || rc=1
-    done < "$tmp"
-    rm -f "$tmp"
-    return "$rc"
-}
-
 # Synchronize compatibility with stock ASUSWRT PControls.
-# - no PControls: do nothing and remove stale bypass selectors;
-# - PControls present: promote the exact ASUS jumps to the first FORWARD positions
-#   and keep Mihomo/GoshaCrash hooks after them;
-# - native auto-redirect: RETURN managed clients from mihomo-prerouting so they
-#   reach normal routing/FORWARD and ASUS can DROP them before TUN/proxy;
-# - mode=watchdog returns 2 when membership/policy changed so callers can log
-#   the transition. The early mangle guard makes a Mihomo restart unnecessary.
+# - ASUS PControls remains the source of truth;
+# - mirror only its DROP policy into the first mangle/PREROUTING hook, preserving
+#   source IP/MAC/interface and xt_time schedule conditions verbatim;
+# - never bypass Mihomo merely because a client is managed by PControls: outside
+#   a schedule window the client must continue to use Mihomo normally;
+# - preserve/promote the original FORWARD->PControls rules as defense in depth;
+# - mode=watchdog returns 2 when membership/policy changed.
 pcontrols_sync(){
     mode="${1:-startup}"
     refresh_path >/dev/null 2>&1 || true
     [ -x "$IPTABLES" ] || return 0
     ipt_init
     mkdir -p "$PCONTROLS_STATE" 2>/dev/null || return 1
+    pcontrols_legacy_nat_cleanup_once >/dev/null 2>&1 || true
     current="$PCONTROLS_STATE/current.$$"
     policy="$PCONTROLS_STATE/policy.$$"
     pcontrols_collect_clients "$current" || { rm -f "$current" "$policy"; return 1; }
@@ -1491,22 +1498,23 @@ pcontrols_sync(){
     [ "$new_sig" = "$old_sig" ] || changed=1
     [ "$new_policy" = "$old_policy" ] || policy_changed=1
 
-    if [ "$changed" = 1 ]; then
-        pcontrols_nat_cleanup_state
-    fi
-
-    if [ -s "$current" ]; then
-        # ASUS PControls must be the first FORWARD decision, including before
-        # generic RELATED,ESTABLISHED accepts. Preserve ASUS rule conditions.
+    # The early guard follows the DROP policy itself, not mere PControls
+    # membership. This is what makes scheduled rules correct: a static xt_time
+    # rule is present all day but matches only inside ASUS' configured window.
+    if pcontrols_early_policy_present; then
         if [ "$changed" = 1 ] || [ "$policy_changed" = 1 ] || ! pcontrols_early_ok; then
             pcontrols_early_ensure || log_event WARN pcontrols "early PREROUTING guard sync failed"
         fi
+    else
+        pcontrols_early_cleanup >/dev/null 2>&1 || true
+    fi
+
+    if [ -s "$current" ]; then
+        # ASUS PControls remains the first FORWARD decision as a second layer.
+        # Preserve the stock rule expressions exactly, including time matches.
         pcontrols_promote_stock_first || true
         pcontrols_move_target_after_stock mihomo-forward || true
         pcontrols_move_target_after_stock "$FORWARD_CHAIN" || true
-        pcontrols_nat_ensure_file "$current" || true
-    else
-        pcontrols_early_cleanup >/dev/null 2>&1 || true
     fi
 
     # Flush accelerated flows only for an actual ASUS policy transition.  On
@@ -1531,24 +1539,35 @@ pcontrols_status(){
     refresh_path >/dev/null 2>&1 || true
     [ -x "$IPTABLES" ] || { echo "PControls: iptables unavailable"; return 1; }
     ipt_init
-    tmp="$PCONTROLS_STATE/status.$$"
     mkdir -p "$PCONTROLS_STATE" 2>/dev/null || true
-    pcontrols_collect_clients "$tmp" || { rm -f "$tmp"; echo "PControls: probe failed"; return 1; }
-    if [ ! -s "$tmp" ]; then
-        rm -f "$tmp"
-        echo "PControls: NOT PRESENT/NO CLIENTS"
+
+    if ! ipt -t filter -S PControls >/dev/null 2>&1; then
+        echo "PControls: NOT PRESENT"
         return 0
     fi
-    count="$(wc -l < "$tmp" 2>/dev/null | tr -d ' ')"
-    echo "PControls: PRESENT (${count:-?} selector(s))"
-    pcontrols_early_ok && echo "PControls early PREROUTING guard: OK (before Mihomo)" || echo "PControls early PREROUTING guard: NEEDS FIX"
-    pcontrols_forward_priority_ok && echo "PControls FORWARD priority: OK (FIRST, before ESTABLISHED/Mihomo)" || echo "PControls FORWARD priority: NEEDS FIX"
-    if ipt -t nat -S mihomo-prerouting >/dev/null 2>&1; then
-        pcontrols_nat_bypass_ok && echo "PControls auto-redirect bypass: OK" || echo "PControls auto-redirect bypass: NEEDS FIX"
+
+    clients="$PCONTROLS_STATE/status-clients.$$"
+    specs="$PCONTROLS_STATE/status-drops.$$"
+    pcontrols_collect_clients "$clients" >/dev/null 2>&1 || : > "$clients"
+    pcontrols_collect_early_specs "$specs" >/dev/null 2>&1 || : > "$specs"
+    client_count="$(wc -l < "$clients" 2>/dev/null | tr -d ' ')"
+    drop_count="$(wc -l < "$specs" 2>/dev/null | tr -d ' ')"
+    case "$client_count" in ''|*[!0-9]*) client_count=0;; esac
+    case "$drop_count" in ''|*[!0-9]*) drop_count=0;; esac
+
+    echo "PControls: PRESENT (${drop_count} mirrored DROP rule(s), ${client_count} FORWARD selector(s))"
+    if [ "$drop_count" -gt 0 ]; then
+        pcontrols_early_ok && echo "PControls early PREROUTING guard: OK (before Mihomo)" || echo "PControls early PREROUTING guard: NEEDS FIX"
     else
-        echo "PControls auto-redirect bypass: N/A"
+        echo "PControls early PREROUTING guard: N/A (no ASUS DROP policy)"
     fi
-    rm -f "$tmp"
+    if [ "$client_count" -gt 0 ]; then
+        pcontrols_forward_priority_ok && echo "PControls FORWARD priority: OK (FIRST, before ESTABLISHED/Mihomo)" || echo "PControls FORWARD priority: NEEDS FIX"
+    else
+        echo "PControls FORWARD priority: N/A (no FORWARD selector)"
+    fi
+    echo "PControls Mihomo NAT bypass: DISABLED (schedule-safe)"
+    rm -f "$clients" "$specs"
 }
 
 reserved_destinations(){
@@ -2180,9 +2199,9 @@ stop_runtime(){
         fi
     fi
 
-    # Remove only GoshaCrash PControls bypass rules while Mihomo's native chain
-    # still exists. ASUS PControls itself is never touched.
-    pcontrols_nat_cleanup_state >/dev/null 2>&1 || true
+    # Remove any one-time legacy NAT bypass from older builds and remove only
+    # GoshaCrash's early mirror. ASUS PControls itself is never touched.
+    pcontrols_legacy_nat_cleanup_once >/dev/null 2>&1 || true
     pcontrols_early_cleanup >/dev/null 2>&1 || true
     route_stop >/dev/null 2>&1 || true
     kill_mihomo
@@ -3797,23 +3816,34 @@ doctor(){
         && echo "  Mihomo DNS: OK" || echo "  Mihomo DNS: DOWN"
     echo "  MPTCP: $(mptcp_status)"
     pc_tmp="$PCONTROLS_STATE/doctor.$$"
+    pc_drop_tmp="$PCONTROLS_STATE/doctor-drops.$$"
     mkdir -p "$PCONTROLS_STATE" 2>/dev/null || true
-    pcontrols_collect_clients "$pc_tmp" >/dev/null 2>&1 || true
-    if [ -s "$pc_tmp" ]; then
+    if ipt -t filter -S PControls >/dev/null 2>&1; then
+        pcontrols_collect_clients "$pc_tmp" >/dev/null 2>&1 || : > "$pc_tmp"
+        pcontrols_collect_early_specs "$pc_drop_tmp" >/dev/null 2>&1 || : > "$pc_drop_tmp"
         pc_count="$(wc -l < "$pc_tmp" 2>/dev/null | tr -d ' ')"
-        echo "  ASUS PControls: PRESENT (${pc_count:-?} selector(s))"
-        pcontrols_forward_priority_ok && echo "  PControls before Mihomo: OK" || echo "  PControls before Mihomo: FAIL"
-        if ipt -t nat -S mihomo-prerouting >/dev/null 2>&1; then
-            pcontrols_nat_bypass_ok && echo "  PControls auto-redirect bypass: OK" || echo "  PControls auto-redirect bypass: FAIL"
+        pc_drop_count="$(wc -l < "$pc_drop_tmp" 2>/dev/null | tr -d ' ')"
+        case "$pc_count" in ''|*[!0-9]*) pc_count=0;; esac
+        case "$pc_drop_count" in ''|*[!0-9]*) pc_drop_count=0;; esac
+        echo "  ASUS PControls: PRESENT (${pc_drop_count} mirrored DROP rule(s), ${pc_count} FORWARD selector(s))"
+        if [ "$pc_count" -gt 0 ]; then
+            pcontrols_forward_priority_ok && echo "  PControls before Mihomo: OK" || echo "  PControls before Mihomo: FAIL"
         else
-            echo "  PControls auto-redirect bypass: N/A"
+            echo "  PControls before Mihomo: N/A (no FORWARD selector)"
         fi
+        if [ "$pc_drop_count" -gt 0 ]; then
+            pcontrols_early_ok && echo "  PControls early guard: OK" || echo "  PControls early guard: FAIL"
+        else
+            echo "  PControls early guard: N/A (no ASUS DROP policy)"
+        fi
+        echo "  PControls Mihomo NAT bypass: DISABLED (schedule-safe)"
     else
         echo "  ASUS PControls: NOT PRESENT"
         echo "  PControls before Mihomo: N/A"
-        echo "  PControls auto-redirect bypass: N/A"
+        echo "  PControls early guard: N/A"
+        echo "  PControls Mihomo NAT bypass: DISABLED (schedule-safe)"
     fi
-    rm -f "$pc_tmp" 2>/dev/null || true
+    rm -f "$pc_tmp" "$pc_drop_tmp" 2>/dev/null || true
     if [ "$ROUTING_MODE" = auto ]; then
         auto_route_policy_ok && echo "  auto-route policy: OK (native Mihomo)" || echo "  auto-route policy: FAIL"
         auto_redirect_ok && echo "  auto-redirect TCP: OK (native Mihomo)" || echo "  auto-redirect TCP: FAIL"

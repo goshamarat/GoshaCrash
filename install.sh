@@ -4,7 +4,7 @@
 # package tools through ASUS Download Master, configuration and autostart.
 
 INSTALLER_VERSION="4.0.0"
-EXPECTED_CONTROLLER_BUILD_ID="2026-09-24-cache-restore-before-start"
+EXPECTED_CONTROLLER_BUILD_ID="2026-09-26-pcontrols-early-only-schedule-safe"
 
 # Never let an old Optware/uClibc environment leak into stock ASUSWRT tools.
 # Any Optware compatibility environment is applied only to the exact command

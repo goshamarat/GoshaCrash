@@ -1,3 +1,12 @@
+## 4.0.0 production — 2026-09-26 PControls schedule-safe early-only
+
+- PControls integration now mirrors the ASUS `DROP` policy itself, not mere client membership. Full block, scheduled block, MAC selectors and source-IP selectors are preserved exactly.
+- `xt_time` options (`--timestart`, `--timestop`, `--weekdays`, `--kerneltz`) are copied into `GOSHACRASH_PCTRL_EARLY`, so schedules switch in-kernel without restarting Mihomo.
+- Removed PControls `RETURN` injection from `mihomo-prerouting`. That old bypass could keep a scheduled client outside Mihomo for the entire day even when the ASUS time window was inactive.
+- A one-shot compatibility cleanup removes exact legacy RETURN selectors recorded by older builds during an in-place upgrade.
+- Generic ASUS layouts are handled safely: when the client selector is on `FORWARD -> PControls` and the DROP/time condition is inside `PControls`, both match expressions are combined for the early guard.
+- `gc pcontrols` and `gc doctor` now report mirrored DROP-rule count and explicitly show that Mihomo NAT bypass is disabled (schedule-safe).
+
 ## 4.0.0 production — 2026-09-24 cache restore before start
 
 - Fixed a cold-boot ordering bug: `mihomo -t` could create an empty `/tmp/goshacrash/cache.db` through the persistent symlink before the USB snapshot was restored, causing the restore function to skip the real backup.

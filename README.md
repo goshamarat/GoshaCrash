@@ -144,16 +144,18 @@ https://ghproxy.net/github.com/MetaCubeX/mihomo/releases/download/<VERSION>/miho
 
 На stock ASUSWRT родительский контроль создаёт цепочку `PControls` динамически: если клиентов нет, цепочки может не быть вообще. GoshaCrash не создаёт и не переписывает саму цепочку `PControls` — содержимое и условия блокировки остаются штатными ASUS.
 
-Когда ASUS добавляет правила вида `FORWARD ... -j PControls`, GoshaCrash автоматически:
+GoshaCrash ориентируется не на сам факт присутствия клиента в PControls, а на реальные штатные ASUS `DROP`-правила:
 
-- создаёт ранний guard `GOSHACRASH_PCTRL_EARLY` в `mangle/PREROUTING` **перед Mihomo**. Он зеркалит активные штатные ASUS DROP-селекторы (MAC/source/time) и поэтому останавливает также уже установленные соединения;
+- создаёт ранний guard `GOSHACRASH_PCTRL_EARLY` в `mangle/PREROUTING` **перед Mihomo** и зеркалит туда только блокирующие правила ASUS;
+- сохраняет исходный тип селектора: `--mac-source` остаётся MAC, `-s <IP>/32` остаётся IP — ничего не преобразуется и не расширяется на всю LAN;
+- полностью сохраняет расписание ASUS (`-m time`, `--timestart`, `--timestop`, `--weekdays`, `--kerneltz`). Поэтому клиент использует Mihomo вне окна блокировки и автоматически блокируется ядром netfilter внутри окна без рестарта Mihomo и без действия watchdog в момент начала/конца расписания;
+- полная блокировка без `-m time` действует постоянно, пока ASUS держит соответствующий `DROP`;
+- если `PControls` существует, но в нём остался только служебный `TCPMSS` и нет `DROP`, ранний guard никого не блокирует;
 - сохраняет доступ к самому роутеру, DHCP и локальному multicast/broadcast — блокировка остаётся именно интернет-блокировкой, а не отключением клиента от LAN;
 - переносит **оригинальные правила ASUS `FORWARD -> PControls` без изменения их условий** в первые позиции `FORWARD` как второй уровень защиты;
 - держит `mihomo-forward` и собственный manual FORWARD hook после всех штатных `PControls`;
-- сохраняет точные селекторы ASUS: интерфейс, MAC и/или source IP. Правило вида `-s 192.168.1.x/32 -j PControls` не расширяется до всего `br0`;
-- для native `auto-redirect` сохраняет ранний `RETURN` в `mihomo-prerouting` для тех же селекторов ASUS;
-- watchdog отслеживает список клиентов и изменение самой политики/правил `PControls`;
-- при изменении политики обновляет ранний guard без перезапуска Mihomo. Flow-cache при необходимости сбрасывается один раз как страховка для Broadcom-прошивок, но CTF/Flow Cache постоянно не отключается.
+- **не добавляет `RETURN` в `mihomo-prerouting` для PControls**. Такой bypass был удалён, потому что при расписании он мог выключать Mihomo для клиента на весь день, даже когда ASUS-блокировка неактивна;
+- watchdog отслеживает изменение самой политики/правил `PControls` и при изменении перестраивает ранний guard без перезапуска Mihomo. Flow-cache при необходимости сбрасывается один раз как страховка для Broadcom-прошивок, но CTF/Flow Cache постоянно не отключается.
 
 Проверка вручную:
 
@@ -161,7 +163,7 @@ https://ghproxy.net/github.com/MetaCubeX/mihomo/releases/download/<VERSION>/miho
 gc pcontrols
 ```
 
-В норме при активном родительском контроле вывод содержит `PControls early PREROUTING guard: OK (before Mihomo)`, `PControls FORWARD priority: OK (FIRST, before ESTABLISHED/Mihomo)` и, при native auto-redirect, `PControls auto-redirect bypass: OK`. Если ASUS ещё не создал цепочку, `NOT PRESENT/NO CLIENTS` является нормальным состоянием. Watchdog проверяет PControls каждые 10 секунд по умолчанию.
+В норме при наличии блокирующих правил вывод содержит `PControls early PREROUTING guard: OK (before Mihomo)` и `PControls FORWARD priority: OK (FIRST, before ESTABLISHED/Mihomo)`. Строка `PControls Mihomo NAT bypass: DISABLED (schedule-safe)` является нормальным и намеренным состоянием. Если ASUS ещё не создал цепочку, `PControls: NOT PRESENT` нормально; если цепочка есть, но `DROP` отсутствует, ранний guard показывает `N/A (no ASUS DROP policy)`. Watchdog проверяет изменения PControls каждые 10 секунд по умолчанию.
 
 ### Native AUTO на BT10
 
